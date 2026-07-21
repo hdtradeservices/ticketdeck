@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# deck — open the herdr workspace with TicketDeck pinned to tab #1.
+#
+# Ensures a herdr server is running, launches TicketDeck as the 'deck' agent
+# (reusing a live one so its tab number stays stable), then attaches. The deck
+# is kept at tab #1 so "Ctrl+b 1" always jumps back to the ticket list.
+# Detaching/quitting herdr leaves the server + ticket sessions running.
+#
+# Env:
+#   TICKETDECK_ROOT   default working dir for new ticket sessions (default ~/Repos)
+#   LINEAR_API_KEY    required by ticketdeck (export in your shell rc)
+set -euo pipefail
+
+LAUNCH_ROOT="${TICKETDECK_ROOT:-$HOME/Repos}"
+SESSION_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/herdr/session.json"
+
+command -v herdr >/dev/null 2>&1      || { echo "deck: herdr not on PATH (see https://herdr.dev)" >&2; exit 1; }
+command -v ticketdeck >/dev/null 2>&1 || { echo "deck: ticketdeck not on PATH (go build -o ~/.local/bin/ticketdeck ./cmd/ticketdeck)" >&2; exit 1; }
+# The herdr server (and thus the deck's ticketdeck) inherits this shell's env, so
+# fail fast if the key is missing rather than crash-loop ticketdeck in the pane.
+[ -n "${LINEAR_API_KEY:-}" ] || { echo "deck: LINEAR_API_KEY not set — export it in your shell rc" >&2; exit 1; }
+
+server_running() { herdr status 2>/dev/null | grep -q 'status: running'; }
+
+# 1. On a COLD start (no server yet), reset the workspace to a clean slate.
+#    On restart herdr restores panes as bare SHELLS — it never re-runs a pane's
+#    launch command (the deck's `bash` respawn loop isn't a "supported agent",
+#    so it's never resumed; ticket claude panes only resume with
+#    resume_agents_on_restore and are re-openable from the deck anyway). Reusing
+#    that restored "deck" shell is exactly why the deck came up as a plain
+#    prompt. Clearing the persisted tabs + resetting the tab numbering yields a
+#    fresh workspace where the deck is recreated (with its respawn loop) as tab
+#    #1, so "Ctrl+b 1" always works. Ticket sessions are untouched — they live on
+#    disk and show as resumable in the deck. Sidebar prefs are preserved. Safe
+#    here because the server is stopped, so nothing else owns the file.
+if ! server_running && [ -f "$SESSION_JSON" ]; then
+  python3 - "$SESSION_JSON" <<'PY' || true
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        d = json.load(f)
+except Exception:
+    raise SystemExit
+for w in d.get("workspaces") or []:
+    w["public_tab_numbers"] = []
+    w["next_public_tab_number"] = 1
+    w["public_pane_numbers"] = {}
+    w["next_public_pane_number"] = 1
+    w["tabs"] = []
+    w["active_tab"] = 0
+with open(path, "w") as f:
+    json.dump(d, f)
+PY
+fi
+
+# 2. ensure a herdr server is running.
+if ! server_running; then
+  herdr server >/dev/null 2>&1 &
+  for _ in $(seq 1 50); do server_running && break; sleep 0.1; done
+fi
+
+deck_pane() {
+  herdr agent list 2>/dev/null | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: raise SystemExit
+for a in d.get("result", {}).get("agents", []):
+    if a.get("name") == "deck":
+        print(a.get("pane_id", "")); break' 2>/dev/null
+}
+
+# 3. reuse a live 'deck' agent if present (keeps its tab number stable); only
+#    start a fresh one when absent (fresh server / after a restart), where it
+#    becomes tab #1 as the first agent started. Do NOT close+recreate — that is
+#    what drifted the deck off tab #1.
+if [ -z "$(deck_pane)" ]; then
+  # Respawn loop: the deck is the persistent hub pinned to tab #1. If ticketdeck
+  # ever exits (Ctrl+c, a crash, a transient Linear error), bring it right back
+  # so tab #1 is never orphaned. The `sleep` avoids a tight loop on hard failure.
+  herdr agent start deck --cwd "$LAUNCH_ROOT" -- \
+    bash -c 'while true; do ticketdeck || sleep 1; done' >/dev/null 2>&1 || true
+fi
+
+# 3b. close any non-agent (default shell) panes so the workspace shows only the
+#     deck + ticket sessions. Never touches ticket panes (they are agents).
+AGENTS_JSON="$(herdr agent list 2>/dev/null)"
+PANES_JSON="$(herdr pane list 2>/dev/null)"
+for p in $(AGENTS="$AGENTS_JSON" PANES="$PANES_JSON" python3 - <<'PY' 2>/dev/null
+import os, json
+try:
+    panes = json.loads(os.environ.get("PANES", "") or "{}").get("result", {}).get("panes", [])
+    agents = json.loads(os.environ.get("AGENTS", "") or "{}").get("result", {}).get("agents", [])
+except Exception:
+    panes, agents = [], []
+agent_panes = {a.get("pane_id") for a in agents}
+print("\n".join(p["pane_id"] for p in panes if p.get("pane_id") not in agent_panes))
+PY
+); do
+  herdr pane close "$p" >/dev/null 2>&1 || true
+done
+
+# 4. focus the deck so attach lands on the ticket list, then attach (foreground;
+#    detach leaves everything running).
+herdr agent focus deck >/dev/null 2>&1 || true
+exec herdr

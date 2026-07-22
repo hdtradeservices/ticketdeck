@@ -311,11 +311,17 @@ func TestResumableBadgeFromDisk(t *testing.T) {
 
 type writeFetcher struct {
 	fakeFetcher
-	moved []string
+	moved       []string
+	prioritized []string
 }
 
 func (w *writeFetcher) MoveState(_ context.Context, issue linear.Issue, target string) error {
 	w.moved = append(w.moved, issue.Identifier+"→"+target)
+	return nil
+}
+
+func (w *writeFetcher) SetPriority(_ context.Context, issue linear.Issue, p int) error {
+	w.prioritized = append(w.prioritized, fmt.Sprintf("%s→%d", issue.Identifier, p))
 	return nil
 }
 
@@ -502,6 +508,68 @@ func TestAssignPicker(t *testing.T) {
 	cmd()
 	if af.assignedTo != "ZEN-9:" {
 		t.Errorf("expected ZEN-9 unassigned (empty id), got %q", af.assignedTo)
+	}
+}
+
+func TestOpenHintGatingAndDismiss(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // isolate the dismiss marker from the real home
+	m := New(fakeFetcher{fixture()}, "", false, fakeBackend{})
+	next, _ := m.Update(refreshedMsg{issues: fixture()})
+	m = next.(Model) // cursor on ZEN-9
+
+	// Enter shows the hint first (launch deferred).
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.openHintSpec == nil || cmd != nil {
+		t.Fatal("Enter should show the open hint and defer the launch")
+	}
+	if !strings.Contains(m.View(), "Ctrl+b 1") {
+		t.Errorf("hint should explain how to get back:\n%s", m.View())
+	}
+	// Enter proceeds without persisting the dont-show flag.
+	next, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.openHintSpec != nil || cmd == nil || m.hideOpenHint {
+		t.Fatal("Enter should launch and keep the hint enabled")
+	}
+	// It shows again next open.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.openHintSpec == nil {
+		t.Fatal("hint should reappear on the next open")
+	}
+	// 'd' dismisses permanently.
+	next, _ = m.Update(runes("d"))
+	m = next.(Model)
+	if !m.hideOpenHint {
+		t.Fatal("'d' should persist the dont-show flag")
+	}
+	// After dismissal, opening launches directly.
+	next, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.openHintSpec != nil || cmd == nil {
+		t.Fatal("after dismissal the hint must not show; Enter launches directly")
+	}
+}
+
+func TestPriorityChange(t *testing.T) {
+	wf := &writeFetcher{fakeFetcher: fakeFetcher{fixture()}}
+	m := New(wf, "", true, fakeBackend{})
+	next, _ := m.Update(refreshedMsg{issues: fixture()})
+	m = next.(Model) // ZEN-9
+	next, _ = m.Update(runes("P"))
+	m = next.(Model)
+	if !m.priorityMenu {
+		t.Fatal("P should open the priority menu")
+	}
+	next, cmd := m.Update(runes("h")) // High = 2
+	m = next.(Model)
+	if m.priorityMenu || cmd == nil {
+		t.Fatal("picking a priority should close the menu and write")
+	}
+	cmd()
+	if len(wf.prioritized) != 1 || wf.prioritized[0] != "ZEN-9→2" {
+		t.Errorf("expected ZEN-9→2 (High), got %v", wf.prioritized)
 	}
 }
 

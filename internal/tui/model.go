@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,6 +18,27 @@ import (
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
 )
+
+// hideOpenHintPath is the marker file that suppresses the "how to get back"
+// reminder shown when opening a ticket session.
+func hideOpenHintPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	return filepath.Join(home, ".ticketdeck", "hide-open-hint")
+}
+
+func openHintDismissed() bool {
+	_, err := os.Stat(hideOpenHintPath())
+	return err == nil
+}
+
+func dismissOpenHint() {
+	p := hideOpenHintPath()
+	_ = os.MkdirAll(filepath.Dir(p), 0o755)
+	_ = os.WriteFile(p, []byte("1\n"), 0o644)
+}
 
 // debugLog is a no-op until SetLog points it at a writer (see --log). Bubble Tea
 // owns stdout, so all diagnostics go to a file.
@@ -36,6 +58,7 @@ type Fetcher interface {
 // not, so status changes are simply unavailable there.
 type statusWriter interface {
 	MoveState(ctx context.Context, issue linear.Issue, target string) error
+	SetPriority(ctx context.Context, issue linear.Issue, priority int) error
 }
 
 // assigner is the optional write capability to change an issue's assignee. Live
@@ -108,6 +131,13 @@ type statusWriteMsg struct {
 	err    error
 }
 
+// priorityWriteMsg is the result of a SetPriority write.
+type priorityWriteMsg struct {
+	key   string
+	label string
+	err   error
+}
+
 // usersMsg carries the fetched workspace users for the assignee picker.
 type usersMsg struct {
 	users []linear.User
@@ -138,16 +168,20 @@ type Model struct {
 	detail        *linear.Issue             // non-nil = showing the description overlay
 	detailOffset  int                       // scroll offset within the detail overlay
 	loading       bool
-	underHerdr    bool          // running as a herdr pane (the persistent deck) — q must not kill it
-	writer        statusWriter  // non-nil when the backing Fetcher can write status (live Linear)
-	assigner      assigner      // non-nil when the backing Fetcher can change assignee (live Linear)
-	statusMenu    bool          // status-change overlay is open
-	statusPend    string        // chosen target awaiting y/n confirm ("" = still choosing)
-	assignMenu    bool          // assignee-picker overlay is open
-	assignIssue   linear.Issue  // ticket being reassigned (captured when the picker opens)
-	assignQuery   string        // filter text in the assignee picker
-	assignCursor  int           // index into the filtered picker options (0 = Unassign)
-	users         []linear.User // cached workspace users for the picker
+	underHerdr    bool                // running as a herdr pane (the persistent deck) — q must not kill it
+	writer        statusWriter        // non-nil when the backing Fetcher can write status (live Linear)
+	assigner      assigner            // non-nil when the backing Fetcher can change assignee (live Linear)
+	statusMenu    bool                // status-change overlay is open
+	statusPend    string              // chosen target awaiting y/n confirm ("" = still choosing)
+	priorityMenu  bool                // priority-change overlay is open
+	assignMenu    bool                // assignee-picker overlay is open
+	assignIssue   linear.Issue        // ticket being reassigned (captured when the picker opens)
+	assignQuery   string              // filter text in the assignee picker
+	assignCursor  int                 // index into the filtered picker options (0 = Unassign)
+	users         []linear.User       // cached workspace users for the picker
+	hideOpenHint  bool                // user chose "don't show again" for the open-session hint
+	openHintSpec  *session.LaunchSpec // pending launch awaiting the open-session hint
+	openHintLabel string              // ticket key for the pending launch
 	err           error
 	notice        string // transient status line (e.g. dry-run launch plan)
 	lastSync      time.Time
@@ -182,6 +216,7 @@ func New(f Fetcher, root string, dry bool, backend Backend) Model {
 	if a, ok := f.(assigner); ok {
 		m.assigner = a
 	}
+	m.hideOpenHint = openHintDismissed()
 	if backend != nil {
 		debugLog.Printf("start: backend=%s root=%q dry=%v", backend.Bin(), root, dry)
 	}
@@ -357,6 +392,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
+	case priorityWriteMsg:
+		if msg.err != nil {
+			debugLog.Printf("priority %s → %s failed: %v", msg.key, msg.label, msg.err)
+			m.err = fmt.Errorf("priority %s: %v", msg.key, msg.err)
+			m.notice = ""
+			return m, nil
+		}
+		m.notice = fmt.Sprintf("%s → %s ✓", msg.key, msg.label)
+		m.err = nil
+		// The ticket regroups into its new priority section on refresh.
+		return m, tea.Batch(m.refresh(), m.refreshStatuses())
+
 	case usersMsg:
 		if msg.err != nil {
 			debugLog.Printf("users fetch error: %v", msg.err)
@@ -390,8 +437,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.statusMenu {
 			return m.updateStatus(msg)
 		}
+		if m.priorityMenu {
+			return m.updatePriority(msg)
+		}
 		if m.assignMenu {
 			return m.updateAssign(msg)
+		}
+		if m.openHintSpec != nil {
+			return m.updateOpenHint(msg)
 		}
 		switch msg.String() {
 		case "q":
@@ -436,6 +489,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.statusMenu = true
 			m.statusPend = ""
+		case "P":
+			// Open the priority-change menu (write). Unavailable in --demo.
+			if _, ok := m.selected(); !ok {
+				break
+			}
+			if m.writer == nil {
+				m.notice = "priority changes need a live Linear connection"
+				break
+			}
+			m.priorityMenu = true
 		case "a":
 			// Open the assignee picker (write). Unavailable in --demo.
 			is, ok := m.selected()
@@ -524,7 +587,38 @@ func (m Model) launchIssue(is linear.Issue) (tea.Model, tea.Cmd) {
 		m.err = err
 		return m, nil
 	}
+	// Opening in a herdr tab switches focus away from the deck; show a one-time
+	// (dismissable) reminder of how to get back before launching. Skipped for
+	// foreground (claude) launches and in --dry mode.
+	if !m.dry && !spec.Foreground && !m.hideOpenHint {
+		s := spec
+		m.openHintSpec = &s
+		m.openHintLabel = is.Identifier
+		return m, nil
+	}
 	return m.runSpec(spec, is.Identifier)
+}
+
+// updateOpenHint handles the "how to get back" reminder shown before a session
+// opens: Enter proceeds (and keeps showing it next time), "d" proceeds and never
+// shows it again, Esc cancels the open.
+func (m Model) updateOpenHint(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	spec := *m.openHintSpec
+	label := m.openHintLabel
+	switch msg.String() {
+	case "enter":
+		m.openHintSpec = nil
+		return m.runSpec(spec, label)
+	case "d":
+		dismissOpenHint()
+		m.hideOpenHint = true
+		m.openHintSpec = nil
+		return m.runSpec(spec, label)
+	case "esc", "q":
+		m.openHintSpec = nil
+		m.notice = "canceled"
+	}
+	return m, nil
 }
 
 // runSpec executes a LaunchSpec (ticket, scratch, or focus): dry-prints it,
@@ -729,6 +823,44 @@ func (m Model) updateAssign(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// updatePriority handles the priority-change menu: a single keypress picks a
+// priority and writes it (low-risk and reversible, so no separate confirm).
+func (m Model) updatePriority(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	is, ok := m.selected()
+	if !ok {
+		m.priorityMenu = false
+		return m, nil
+	}
+	var p int
+	var label string
+	switch msg.String() {
+	case "u":
+		p, label = 1, "Urgent"
+	case "h":
+		p, label = 2, "High"
+	case "m":
+		p, label = 3, "Medium"
+	case "l":
+		p, label = 4, "Low"
+	case "0", "n":
+		p, label = 0, "No priority"
+	case "esc", "q", "P":
+		m.priorityMenu = false
+		return m, nil
+	default:
+		return m, nil // ignore other keys; stay in the menu
+	}
+	m.priorityMenu = false
+	m.notice = fmt.Sprintf("setting %s → %s…", is.Identifier, label)
+	w := m.writer
+	return m, func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		err := w.SetPriority(ctx, is, p)
+		return priorityWriteMsg{key: is.Identifier, label: label, err: err}
+	}
 }
 
 // keystrokes are the guard against an accidental write.
@@ -1257,6 +1389,9 @@ func (m Model) View() string {
 	if m.assignMenu {
 		return m.renderAssign()
 	}
+	if m.openHintSpec != nil {
+		return m.renderOpenHint()
+	}
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "%s%s\n", titleStyle.Render("TicketDeck"), dimStyle.Render(m.titleMeta()))
@@ -1438,6 +1573,20 @@ func sessionStyle(s session.Status) (glyph, label string, color lipgloss.Color) 
 }
 
 // renderDetail draws the description overlay for the selected ticket.
+// renderOpenHint draws the "how to get back" reminder shown before a ticket
+// session opens in its own tab.
+func (m Model) renderOpenHint() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s\n\n", titleStyle.Render("Opening"), idStyle.Render(m.openHintLabel))
+	fmt.Fprintf(&b, "%s opens in its own tab. To come back to this ticket list:\n\n", m.openHintLabel)
+	fmt.Fprintf(&b, "    %s  — jump straight to the deck (tab 1)\n", noticeStyle.Render("Ctrl+b 1"))
+	fmt.Fprintf(&b, "    %s  — search all tabs by name\n\n", noticeStyle.Render("Ctrl+b g"))
+	fmt.Fprintf(&b, "%s\n", selStyle.Render(" ⏎  OK "))
+	fmt.Fprintf(&b, "%s\n", "  d  OK, don't show this again")
+	fmt.Fprintf(&b, "\n%s", dimStyle.Render("esc  cancel"))
+	return b.String()
+}
+
 // renderAssign draws the assignee picker overlay: a filter line, an Unassign
 // option, then the matching workspace users, windowed to the viewport.
 func (m Model) renderAssign() string {
@@ -1584,6 +1733,10 @@ func (m Model) footer() string {
 		}
 		return noticeStyle.Render(fmt.Sprintf("  move %s → %s?   y confirm · esc cancel", is.Identifier, m.statusPend))
 	}
+	if m.priorityMenu {
+		is, _ := m.selected()
+		return noticeStyle.Render(fmt.Sprintf("  priority %s →  u Urgent · h High · m Medium · l Low · 0 None · esc", is.Identifier))
+	}
 	sync := "never"
 	if !m.lastSync.IsZero() {
 		sync = m.lastSync.Format("15:04:05")
@@ -1598,7 +1751,7 @@ func (m Model) footer() string {
 	}
 	statusHint := ""
 	if m.writer != nil {
-		statusHint = "s status · "
+		statusHint = "s status · P prio · "
 	}
 	if m.assigner != nil {
 		statusHint += "a assign · "

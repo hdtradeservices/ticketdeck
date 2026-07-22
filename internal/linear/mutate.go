@@ -89,6 +89,43 @@ mutation Assign($id: String!, $assigneeId: String) {
   issueUpdate(id: $id, input: { assigneeId: $assigneeId }) { success }
 }`
 
+// SetPriority sets an issue's priority (0=None, 1=Urgent, 2=High, 3=Medium,
+// 4=Low).
+func (c *Client) SetPriority(ctx context.Context, issue Issue, priority int) error {
+	if issue.ID == "" {
+		return fmt.Errorf("missing issue id for %s (refresh and retry)", issue.Identifier)
+	}
+	raw, err := c.postGraphQL(ctx, issuePriorityMutation, map[string]any{"id": issue.ID, "priority": priority})
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Data struct {
+			IssueUpdate struct {
+				Success bool `json:"success"`
+			} `json:"issueUpdate"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return fmt.Errorf("decode issueUpdate: %w", err)
+	}
+	if len(resp.Errors) > 0 {
+		return fmt.Errorf("%s (a write-scoped LINEAR_API_KEY is required)", resp.Errors[0].Message)
+	}
+	if !resp.Data.IssueUpdate.Success {
+		return fmt.Errorf("linear rejected the priority change")
+	}
+	return nil
+}
+
+const issuePriorityMutation = `
+mutation SetPriority($id: String!, $priority: Int!) {
+  issueUpdate(id: $id, input: { priority: $priority }) { success }
+}`
+
 // Users lists active workspace members for the assignee picker.
 func (c *Client) Users(ctx context.Context) ([]User, error) {
 	raw, err := c.postGraphQL(ctx, usersQuery, map[string]any{})

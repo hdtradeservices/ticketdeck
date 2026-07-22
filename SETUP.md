@@ -63,11 +63,12 @@ running in their background tabs.
 | goal | key |
 |---|---|
 | move / page / top-bottom | `↑`/`↓` (`j`/`k`) · `PgUp`/`PgDn` · `g`/`G` |
-| open the ticket (launch/attach its session) | `Enter` |
+| open the ticket (launch/attach its session) | `Enter` — the first time, a reminder shows how to get back (`Ctrl+b 1`); `⏎` proceeds, `d` proceeds and never shows it again |
 | show the ticket's **description** | `d` (in the overlay: `Enter` opens the session, `o` browser, `p` PR, `↑`/`↓` scroll, `esc` closes) |
 | open the ticket in the **web browser** | `o` |
 | open the ticket's **linked PR** in the browser | `p` (shown with a `⇄` icon, colored by PR state) |
 | **change status** → Done / Validate / Monitoring / Blocked / Cancel | `s`, then `d`/`v`/`m`/`b`/`c`, then `y` to confirm — **writes to Linear; needs a write-scoped `LINEAR_API_KEY`**. Moving to a terminal state (**Done / Cancel**) also **closes that ticket's Claude session** if one is running (transcript persists — resumable). |
+| **change priority** → Urgent / High / Medium / Low / None | `P`, then `u`/`h`/`m`/`l`/`0` — **write; write-scoped key** |
 | **assign / reassign / unassign** | `a` opens a picker — type to filter people, `↑`/`↓` select, `⏎` assign (top row = **Unassign**), `esc` cancel — **writes to Linear; write-scoped key** (reassigning away from you drops the ticket off the list) |
 | open an **ad-hoc Claude session** not tied to any ticket (own tab) | `n` |
 | **send `/triage`** to the highlighted session without switching to it | `t` (fires a message into the running session — **runs a Claude turn**; needs a live session, herdr backend) |

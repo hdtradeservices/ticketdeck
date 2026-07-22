@@ -45,6 +45,7 @@ ticketdeck --demo --dump        # plain-text grouped list
 | open ticket / linked PR in browser | `o` / `p` |
 | send `/triage` to the ticket's session | `t` |
 | change status (Done/Validate/Monitoring/Blocked/Cancel) | `s` → key → `y` |
+| change priority (Urgent/High/Medium/Low/None) | `P` → key |
 | assign / reassign / unassign | `a` |
 | open an ad-hoc (non-ticket) session | `n` |
 | fold/unfold a priority section | `Space` · `←`/`→` |

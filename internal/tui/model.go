@@ -13,6 +13,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
@@ -1672,6 +1673,23 @@ func sessionStyle(s session.Status) (glyph, label string, color lipgloss.Color) 
 	}
 }
 
+// renderMarkdown renders a ticket's markdown description to styled, word-wrapped
+// ANSI via glamour. Falls back to the raw text if rendering fails.
+func renderMarkdown(md string, width int) string {
+	if width < 20 {
+		width = 20
+	}
+	r, err := glamour.NewTermRenderer(glamour.WithAutoStyle(), glamour.WithWordWrap(width))
+	if err != nil {
+		return md
+	}
+	out, err := r.Render(md)
+	if err != nil {
+		return md
+	}
+	return out
+}
+
 // renderDetail draws the description overlay for the selected ticket.
 // renderOpenHint draws the "how to get back" reminder shown before a ticket
 // session opens in its own tab.
@@ -1785,15 +1803,17 @@ func (m Model) renderDetail() string {
 	fmt.Fprint(&b, "\n")
 
 	desc := strings.TrimSpace(is.Description)
-	if desc == "" {
-		desc = "(no description)"
-	}
 	width := m.width
 	if width <= 0 {
 		width = 80
 	}
-	wrapped := lipgloss.NewStyle().Width(width - 2).Render(desc)
-	lines := strings.Split(wrapped, "\n")
+	var wrapped string
+	if desc == "" {
+		wrapped = dimStyle.Render("(no description)")
+	} else {
+		wrapped = renderMarkdown(desc, width-2)
+	}
+	lines := strings.Split(strings.TrimRight(wrapped, "\n"), "\n")
 
 	// window the body to the available height (header: title, meta, session,
 	// url, PR lines, blank; plus the blank+footer at the bottom)

@@ -271,18 +271,18 @@ func TestCollapseGroupShowsCountAndHidesTickets(t *testing.T) {
 	}
 }
 
-func TestStartsWithOnlyHighestGroupExpanded(t *testing.T) {
-	v := loaded(t).View() // fixture: Urgent (highest), High, Low
-	// Highest non-empty group (Urgent) is expanded → its ticket is visible.
-	if !strings.Contains(v, "ZEN-9") {
-		t.Errorf("highest group should start expanded:\n%s", v)
+func TestEveryNonEmptyPriorityStartsExpanded(t *testing.T) {
+	// Fixture spans Urgent, High, Low (Medium/No-priority are empty). Every
+	// priority that has tickets should be expanded by default; empty ones aren't
+	// shown at all.
+	v := loaded(t).View()
+	for _, want := range []string{"ZEN-9", "ZEN-1", "ZEN-2", "ZEN-5"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("ticket %s should be visible (its priority open by default):\n%s", want, v)
+		}
 	}
-	// Lower groups start collapsed → header shows a count, tickets hidden.
-	if !strings.Contains(v, "HIGH · 2") {
-		t.Errorf("High should start collapsed with a count:\n%s", v)
-	}
-	if strings.Contains(v, "ZEN-1") || strings.Contains(v, "ZEN-2") {
-		t.Errorf("collapsed lower groups should hide their tickets:\n%s", v)
+	if strings.Contains(v, "MEDIUM") || strings.Contains(v, "NO PRIORITY") {
+		t.Errorf("empty priority levels should not be shown:\n%s", v)
 	}
 }
 

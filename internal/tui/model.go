@@ -167,8 +167,7 @@ type Model struct {
 	rows          []row
 	cursor        int             // index into rows; a cursorable row (issue, or collapsed header)
 	offset        int             // index of the first visible row (scroll position)
-	collapsed     map[string]bool // priority label → collapsed
-	collapseInit  bool            // whether the start-up default collapse has been applied
+	collapsed     map[string]bool // priority label → manually collapsed (empty = all expanded)
 	backend       Backend
 	sessions      map[string]session.Status // ticket key → session status
 	statusSince   map[string]time.Time      // ticket key → when its current status was first seen
@@ -395,7 +394,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case detachedDoneMsg:
 		if msg.err != nil {
 			debugLog.Printf("%s failed: %v — output: %s", msg.action, msg.err, msg.output)
-			m.err = fmt.Errorf("%s failed: %s", msg.action, firstLine(msg.output))
+			// Prefer the command's output; fall back to the error itself so we
+			// never surface a useless "(no output)" (e.g. "no running session").
+			detail := strings.TrimSpace(msg.output)
+			if detail == "" {
+				detail = msg.err.Error()
+			}
+			m.err = fmt.Errorf("%s failed: %s", msg.action, firstLine(detail))
 			m.notice = ""
 		} else {
 			debugLog.Printf("%s ok — output: %s", msg.action, msg.output)
@@ -983,7 +988,6 @@ func (m *Model) rebuild(issues []linear.Issue) {
 	prevID, _ := m.selectedID()
 	prevIdx := m.cursor
 	m.allIssues = issues
-	m.applyInitialCollapse()
 	m.regroup()
 
 	// Demo statuses resolve synchronously so --preview shows badges; real
@@ -1034,23 +1038,6 @@ func (m Model) nearestCursorable(idx int) int {
 		}
 	}
 	return m.firstCursorable()
-}
-
-// applyInitialCollapse folds every priority group except the highest non-empty
-// one on the first load, so the deck opens focused on top-priority work. Runs
-// once (collapseInit guard) so later refreshes and manual toggles stick.
-func (m *Model) applyInitialCollapse() {
-	if m.collapseInit {
-		return
-	}
-	groups := linear.GroupByPriorityThenStatus(linear.FilterVisible(m.allIssues))
-	if len(groups) == 0 {
-		return // nothing to base the default on yet; try again next load
-	}
-	for i, g := range groups {
-		m.collapsed[g.PrioLabel] = i != 0
-	}
-	m.collapseInit = true
 }
 
 // regroup rebuilds the visible rows from allIssues, honoring collapsed groups.

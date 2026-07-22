@@ -12,9 +12,24 @@ import (
 	"github.com/hdtradeservices/ticketdeck/internal/herd"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/tui"
+	"github.com/hdtradeservices/ticketdeck/internal/update"
 )
 
+// version is stamped at build time via -ldflags "-X main.version=<tag>"
+// (see the Makefile / release workflow). "dev" for local `go build`.
+var version = "dev"
+
 func main() {
+	// Subcommand: `ticketdeck update` self-updates to the latest release.
+	if len(os.Args) > 1 && os.Args[1] == "update" {
+		if err := update.Run(); err != nil {
+			fmt.Fprintln(os.Stderr, "ticketdeck: update failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	showVersion := flag.Bool("version", false, "print the TicketDeck version and exit")
 	demo := flag.Bool("demo", false, "use canned data instead of the Linear API (no key needed)")
 	dump := flag.Bool("dump", false, "print the grouped ticket list and exit (no TUI)")
 	preview := flag.Bool("preview", false, "render one styled TUI frame and exit (no event loop)")
@@ -24,6 +39,12 @@ func main() {
 	backendName := flag.String("backend", "auto", "launch backend: claude | herdr | auto (herdr if installed, else claude)")
 	logPath := flag.String("log", "", "debug log file (default ~/.ticketdeck/ticketdeck.log; 'off' disables)")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("ticketdeck", version)
+		return
+	}
+	tui.Version = version
 
 	if closeLog := setupLog(*logPath); closeLog != nil {
 		defer closeLog()

@@ -1,0 +1,31 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Build cross-platform binaries
+        run: |
+          set -eu
+          mkdir -p dist
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${t%/*}; arch=${t#*/}
+            case "$os" in linux) hos=linux;; darwin) hos=macos;; esac
+            case "$arch" in amd64) harch=x86_64;; arm64) harch=aarch64;; esac
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+              go build -ldflags "-X main.version=${GITHUB_REF_NAME}" \
+              -o "dist/ticketdeck-${hos}-${harch}" ./cmd/ticketdeck
+          done
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

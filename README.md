@@ -27,6 +27,24 @@ Prefer to clone first? `git clone https://github.com/hdtradeservices/ticketdeck 
 `deck` opens the herdr workspace with the ticket list pinned to tab 1. See
 [`SETUP.md`](SETUP.md) for the full setup, keybindings, and how the `deck` launcher works.
 
+## Staying up to date
+
+The deck checks for a newer release on startup (cached daily, non-blocking) and shows a
+`⬆ vX.Y available` banner when you're behind. To update:
+
+```sh
+ticketdeck update      # pulls the latest release (re-runs the installer)
+```
+
+`ticketdeck --version` prints the running build. Releases are cut by tagging (`vX.Y.Z`), which
+builds prebuilt binaries for Linux/macOS — so teammates install and update without needing Go.
+
+**Maintainers — cut a release:**
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0    # GitHub Actions builds binaries + publishes the release
+```
+
 ## Try it without a key
 
 ```sh

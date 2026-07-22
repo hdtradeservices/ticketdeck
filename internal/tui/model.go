@@ -17,7 +17,12 @@ import (
 
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
+	"github.com/hdtradeservices/ticketdeck/internal/update"
 )
+
+// Version is the running build's version, set by main (via -ldflags). Used for
+// the startup "newer release available" check.
+var Version = "dev"
 
 // hideOpenHintPath is the marker file that suppresses the "how to get back"
 // reminder shown when opening a ticket session.
@@ -124,6 +129,9 @@ type detachedDoneMsg struct {
 
 type tickMsg struct{}
 
+// updateAvailableMsg carries a newer release tag found by the startup check.
+type updateAvailableMsg struct{ latest string }
+
 // statusWriteMsg is the result of a MoveState write.
 type statusWriteMsg struct {
 	key    string
@@ -183,6 +191,7 @@ type Model struct {
 	hideOpenHint  bool                // user chose "don't show again" for the open-session hint
 	openHintSpec  *session.LaunchSpec // pending launch awaiting the open-session hint
 	openHintLabel string              // ticket key for the pending launch
+	updateLatest  string              // newer release tag, if the startup check found one
 	err           error
 	notice        string // transient status line (e.g. dry-run launch plan)
 	lastSync      time.Time
@@ -242,7 +251,17 @@ func Preview(f Fetcher, height int) (string, error) {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refresh(), tick())
+	return tea.Batch(m.refresh(), tick(), checkUpdate())
+}
+
+// checkUpdate runs the cached, non-blocking "newer release available" check.
+func checkUpdate() tea.Cmd {
+	return func() tea.Msg {
+		if latest := update.Check(Version, time.Now()); latest != "" {
+			return updateAvailableMsg{latest: latest}
+		}
+		return nil
+	}
 }
 
 func (m Model) refresh() tea.Cmd {
@@ -314,6 +333,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		return m, tea.Batch(m.refresh(), m.refreshStatuses(), m.refreshSessions(), tick())
+
+	case updateAvailableMsg:
+		m.updateLatest = msg.latest
 
 	case refreshedMsg:
 		m.loading = false
@@ -1406,7 +1428,11 @@ func (m Model) View() string {
 	}
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "%s%s\n", titleStyle.Render("TicketDeck"), dimStyle.Render(m.titleMeta()))
+	upd := ""
+	if m.updateLatest != "" {
+		upd = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(fmt.Sprintf("  ⬆ %s available · ticketdeck update", m.updateLatest))
+	}
+	fmt.Fprintf(&b, "%s%s%s\n", titleStyle.Render("TicketDeck"), dimStyle.Render(m.titleMeta()), upd)
 
 	if m.loading && len(m.rows) == 0 {
 		fmt.Fprint(&b, dimStyle.Render("\n  loading tickets…\n"))

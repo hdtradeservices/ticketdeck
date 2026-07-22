@@ -40,13 +40,24 @@ if [ "${NO_HERDR:-0}" != "1" ]; then
 fi
 
 # ── ticketdeck ──────────────────────────────────────────────────────────────
-command -v go >/dev/null 2>&1 || die "Go is required to build ticketdeck (https://go.dev/dl)"
-if [ -f "./cmd/ticketdeck/main.go" ]; then
-  say "building ticketdeck from source"
-  go build -o "$BIN_DIR/ticketdeck" ./cmd/ticketdeck
+# Prefer the prebuilt release binary (no Go needed); fall back to building from
+# source. Set FROM_SOURCE=1 to force a source build.
+tmp=$(mktemp)
+tdurl="https://github.com/${REPO}/releases/latest/download/ticketdeck-${hos}-${harch}"
+if [ "${FROM_SOURCE:-0}" != "1" ] && curl -fsSL "$tdurl" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+  install -m 0755 "$tmp" "$BIN_DIR/ticketdeck"; rm -f "$tmp"
+  say "installed ticketdeck release binary ($hos-$harch)"
 else
-  say "installing ticketdeck via 'go install'"
-  GOBIN="$BIN_DIR" go install "github.com/${REPO}/cmd/ticketdeck@latest"
+  rm -f "$tmp"
+  command -v go >/dev/null 2>&1 || die "no release binary for ${hos}-${harch} yet and Go isn't installed (https://go.dev/dl)"
+  ver=$(git describe --tags --always 2>/dev/null || echo dev)
+  if [ -f "./cmd/ticketdeck/main.go" ]; then
+    say "building ticketdeck from source ($ver)"
+    go build -ldflags "-X main.version=${ver}" -o "$BIN_DIR/ticketdeck" ./cmd/ticketdeck
+  else
+    say "installing ticketdeck via 'go install'"
+    GOBIN="$BIN_DIR" go install "github.com/${REPO}/cmd/ticketdeck@latest"
+  fi
 fi
 
 # ── deck launcher ────────────────────────────────────────────────────────────

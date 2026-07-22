@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
+	"github.com/hdtradeservices/ticketdeck/internal/quota"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
 	"github.com/hdtradeservices/ticketdeck/internal/update"
 )
@@ -133,6 +134,12 @@ type tickMsg struct{}
 // updateAvailableMsg carries a newer release tag found by the startup check.
 type updateAvailableMsg struct{ latest string }
 
+// quotaMsg carries the latest Claude usage limits (5h / 7d windows).
+type quotaMsg struct {
+	u  quota.Usage
+	ok bool
+}
+
 // statusWriteMsg is the result of a MoveState write.
 type statusWriteMsg struct {
 	key    string
@@ -192,6 +199,7 @@ type Model struct {
 	openHintSpec  *session.LaunchSpec // pending launch awaiting the open-session hint
 	openHintLabel string              // ticket key for the pending launch
 	updateLatest  string              // newer release tag, if the startup check found one
+	usage         *quota.Usage        // Claude 5h/7d rate-limit usage, if available
 	err           error
 	notice        string // transient status line (e.g. dry-run launch plan)
 	lastSync      time.Time
@@ -251,7 +259,24 @@ func Preview(f Fetcher, height int) (string, error) {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refresh(), tick(), checkUpdate())
+	return tea.Batch(m.refresh(), tick(), checkUpdate(), m.fetchQuota())
+}
+
+// fetchQuota reads Claude's usage limits (metadata only — no token spend).
+// Skipped in --demo. Fails silently.
+func (m Model) fetchQuota() tea.Cmd {
+	if m.demoStatuses != nil {
+		return nil
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		u, err := quota.Fetch(ctx)
+		if err != nil {
+			return quotaMsg{ok: false}
+		}
+		return quotaMsg{u: u, ok: true}
+	}
 }
 
 // checkUpdate runs the cached, non-blocking "newer release available" check.
@@ -332,10 +357,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ensureVisible()
 
 	case tickMsg:
-		return m, tea.Batch(m.refresh(), m.refreshStatuses(), m.refreshSessions(), tick())
+		return m, tea.Batch(m.refresh(), m.refreshStatuses(), m.refreshSessions(), m.fetchQuota(), tick())
 
 	case updateAvailableMsg:
 		m.updateLatest = msg.latest
+
+	case quotaMsg:
+		if msg.ok {
+			u := msg.u
+			m.usage = &u
+		}
 
 	case refreshedMsg:
 		m.loading = false
@@ -1463,7 +1494,7 @@ func (m Model) View() string {
 	if m.updateLatest != "" {
 		upd = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(fmt.Sprintf("  ⬆ %s available · ticketdeck update", m.updateLatest))
 	}
-	fmt.Fprintf(&b, "%s%s%s\n", titleStyle.Render("TicketDeck"), dimStyle.Render(m.titleMeta()), upd)
+	fmt.Fprintf(&b, "%s%s%s%s\n", titleStyle.Render("TicketDeck"), dimStyle.Render(m.titleMeta()), m.quotaSegment(), upd)
 
 	if m.loading && len(m.rows) == 0 {
 		fmt.Fprint(&b, dimStyle.Render("\n  loading tickets…\n"))
@@ -1515,6 +1546,55 @@ func (m Model) window() (int, int) {
 		end = len(m.rows)
 	}
 	return start, end
+}
+
+// quotaSegment renders the Claude 5h/7d usage limits for the title bar,
+// color-coded by utilization, with a coarse "resets in" hint.
+func (m Model) quotaSegment() string {
+	if m.usage == nil {
+		return ""
+	}
+	seg := func(label string, pct float64, reset time.Time) string {
+		s := fmt.Sprintf("%s %.0f%%", label, pct)
+		if r := resetsIn(reset); r != "" {
+			s += " " + r
+		}
+		return lipgloss.NewStyle().Foreground(quotaColor(pct)).Render(s)
+	}
+	return dimStyle.Render("  ◷ ") + seg("5h", m.usage.FiveHourPct, m.usage.FiveHourReset) +
+		dimStyle.Render(" · ") + seg("7d", m.usage.SevenDayPct, m.usage.SevenDayReset)
+}
+
+func quotaColor(pct float64) lipgloss.Color {
+	switch {
+	case pct >= 90:
+		return lipgloss.Color("203") // red
+	case pct >= 70:
+		return lipgloss.Color("214") // orange
+	case pct >= 50:
+		return lipgloss.Color("220") // yellow
+	default:
+		return lipgloss.Color("42") // green
+	}
+}
+
+// resetsIn is a coarse "(2h)" / "(45m)" / "(5d)" until t; empty if unknown/past.
+func resetsIn(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := time.Until(t)
+	if d <= 0 {
+		return ""
+	}
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf("(%dm)", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("(%dh)", int(d.Hours()))
+	default:
+		return fmt.Sprintf("(%dd)", int(d.Hours())/24)
+	}
 }
 
 func (m Model) titleMeta() string {

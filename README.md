@@ -86,6 +86,10 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
 - **Enter** launches `claude` bound to a deterministic per-ticket session id (resumes if one
   exists), seeding the ticket's identity via `--append-system-prompt` — **no auto-submitted
   prompt and no model turn**: the first token spend is always your first message.
+- **Claude usage** — the title bar shows your Claude 5-hour and 7-day rate-limit
+  utilization (`◷ 5h 52% · 7d 42%`), color-coded, with a rough reset countdown. Same source
+  as Claude Code's status line (the OAuth usage endpoint); it's a metadata read, so it does
+  **not** spend model tokens. Shown only for OAuth logins (not API-key setups).
 - **Backends** (`--backend claude|herdr|auto`, default `auto`): `herdr` gives the
   detach/re-attach + tab-per-ticket workflow; `claude` drives the `claude` CLI directly
   (foreground per ticket). `auto` uses herdr when it's installed.

@@ -81,8 +81,9 @@ func (fakeBackend) FocusSpec(ref session.SessionRef) session.LaunchSpec {
 
 func (fakeBackend) CloseSession(session.SessionRef) (string, error) { return "", nil }
 
-func (fakeBackend) Send(name, text string) (string, error)  { return "", nil }
-func (fakeBackend) CloseByName(name string) (string, error) { return "", nil }
+func (fakeBackend) Send(name, text string) (string, error)        { return "", nil }
+func (fakeBackend) CloseByName(name string) (string, error)       { return "", nil }
+func (fakeBackend) Triage(session.Ticket, string) (string, error) { return "", nil }
 
 func fixture() []linear.Issue {
 	return []linear.Issue{
@@ -162,6 +163,28 @@ func manyIssues(n int) []linear.Issue {
 		})
 	}
 	return out
+}
+
+func TestFoldsSectionsWithoutTopTickets(t *testing.T) {
+	// 16 tickets, 4 per priority (round-robin). Global order is Urgent×4, High×4,
+	// Medium×4, Low×4 → the top 10 are all Urgent + all High + 2 Medium, so Low
+	// (rank 13-16) has none of the top 10 and should auto-fold.
+	m := New(fakeFetcher{}, "", true, fakeBackend{})
+	next, _ := m.Update(refreshedMsg{issues: manyIssues(16)})
+	m = next.(Model)
+	if !m.collapsed["Low"] {
+		t.Errorf("Low (no top-10 ticket) should be folded; collapsed=%v", m.collapsed)
+	}
+	for _, open := range []string{"Urgent", "High", "Medium"} {
+		if m.collapsed[open] {
+			t.Errorf("%s has a top-10 ticket and should stay expanded; collapsed=%v", open, m.collapsed)
+		}
+	}
+	// With few tickets (<10), nothing folds.
+	next, _ = m.Update(refreshedMsg{issues: fixture()})
+	if len(next.(Model).collapsed) != 0 {
+		t.Errorf("with <10 tickets nothing should auto-fold, got %v", next.(Model).collapsed)
+	}
 }
 
 func TestViewportStartsAtTopAndScrolls(t *testing.T) {
@@ -413,6 +436,12 @@ type recBackend struct {
 	closed       string
 	sent         string // "name:text"
 	closedByName string
+	triaged      string // ticket key
+}
+
+func (r *recBackend) Triage(t session.Ticket, cwd string) (string, error) {
+	r.triaged = t.Key
+	return "", nil
 }
 
 func (r *recBackend) CloseSession(ref session.SessionRef) (string, error) {
@@ -602,19 +631,38 @@ func TestPriorityChange(t *testing.T) {
 	}
 }
 
-func TestSendTriageToTicket(t *testing.T) {
+func TestTriageTicketInBackground(t *testing.T) {
 	rec := &recBackend{}
 	m := New(fakeFetcher{fixture()}, "", true, rec)
 	next, _ := m.Update(refreshedMsg{issues: fixture()})
 	m = next.(Model) // cursor on ZEN-9
 	next, cmd := m.Update(runes("t"))
-	m = next.(Model)
 	if cmd == nil {
-		t.Fatal("t should return a send command")
+		t.Fatal("t should return a triage command")
 	}
-	cmd() // executes Send
-	if rec.sent != "ZEN-9:/triage" {
-		t.Errorf("t should send /triage to ZEN-9, got %q", rec.sent)
+	cmd() // executes Triage
+	if rec.triaged != "ZEN-9" {
+		t.Errorf("t on a ticket should triage ZEN-9 in the background, got %q", rec.triaged)
+	}
+	// On an "other session" row, t submits /triage to that session instead.
+	rec = &recBackend{}
+	m = New(fakeFetcher{fixture()}, "", true, rec)
+	next, _ = m.Update(refreshedMsg{issues: fixture()})
+	m = next.(Model)
+	next, _ = m.Update(sessionsMsg{sessions: []session.SessionRef{{Name: "ZEN-2990", Ref: "w1:p9"}}})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}}) // jump to the session row
+	m = next.(Model)
+	if _, ok := m.selectedSession(); !ok {
+		t.Fatal("cursor should be on the session row")
+	}
+	next, cmd = m.Update(runes("t"))
+	if cmd == nil {
+		t.Fatal("t on a session row should send /triage")
+	}
+	cmd()
+	if rec.sent != "ZEN-2990:/triage" {
+		t.Errorf("t on a session row should send /triage, got %q", rec.sent)
 	}
 }
 

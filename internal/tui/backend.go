@@ -38,6 +38,10 @@ type Backend interface {
 	// Send types text into a running session named `name` and submits it, without
 	// switching to it (fire-and-return). Used to fire a message at a session.
 	Send(name, text string) (string, error)
+	// Triage runs "/triage" against a ticket's session in the background —
+	// starting the session (unfocused) if it isn't running — without leaving the
+	// deck.
+	Triage(t session.Ticket, cwd string) (string, error)
 	// CloseByName closes the session named `name` if it is running; a missing
 	// session is not an error. Used to tear down a ticket's session when it moves
 	// to a terminal state.
@@ -106,6 +110,11 @@ func (ClaudeBackend) Send(name, text string) (string, error) {
 
 // CloseByName is a no-op for the built-in backend (no daemon to stop a session).
 func (ClaudeBackend) CloseByName(name string) (string, error) { return "", nil }
+
+// Triage (background) needs the herdr multiplexer.
+func (ClaudeBackend) Triage(t session.Ticket, cwd string) (string, error) {
+	return "", fmt.Errorf("background triage requires the herdr backend")
+}
 
 // HerdBackend drives herdr (agent multiplexer) — start/attach/list.
 type HerdBackend struct{}
@@ -177,6 +186,14 @@ func (HerdBackend) CloseByName(name string) (string, error) {
 		return "", err
 	}
 	return herd.CloseByName(agents, name)
+}
+
+func (HerdBackend) Triage(t session.Ticket, cwd string) (string, error) {
+	agents, err := herd.List()
+	if err != nil {
+		return "", err
+	}
+	return herd.Triage(agents, t, cwd)
 }
 
 func agentSummary(agents []herd.Agent) string {

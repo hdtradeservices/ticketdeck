@@ -189,19 +189,61 @@ func CloseByName(agents []Agent, name string) (string, error) {
 func Send(agents []Agent, name, text string) (string, error) {
 	for _, a := range agents {
 		if strings.EqualFold(a.Name, name) {
-			if out, err := exec.Command(herdrBin, "agent", "send", a.Name, text).CombinedOutput(); err != nil {
-				return string(out), fmt.Errorf("agent send: %w: %s", err, strings.TrimSpace(string(out)))
-			}
-			if a.PaneID == "" {
-				return "", fmt.Errorf("no pane id to submit %s", name)
-			}
-			if out, err := exec.Command(herdrBin, "pane", "send-keys", a.PaneID, "Enter").CombinedOutput(); err != nil {
-				return string(out), fmt.Errorf("submit Enter: %w: %s", err, strings.TrimSpace(string(out)))
-			}
-			return "sent + Enter", nil
+			return sendAndEnter(a.Name, a.PaneID, text)
 		}
 	}
 	return "", fmt.Errorf("no running session for %s", name)
+}
+
+// sendAndEnter writes literal text to a named agent then submits it with Enter.
+func sendAndEnter(name, paneID, text string) (string, error) {
+	if out, err := exec.Command(herdrBin, "agent", "send", name, text).CombinedOutput(); err != nil {
+		return string(out), fmt.Errorf("agent send: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if paneID == "" {
+		return "", fmt.Errorf("no pane id to submit %s", name)
+	}
+	if out, err := exec.Command(herdrBin, "pane", "send-keys", paneID, "Enter").CombinedOutput(); err != nil {
+		return string(out), fmt.Errorf("submit Enter: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return "sent + Enter", nil
+}
+
+// Triage runs "/triage" against a ticket's session in the background, without
+// leaving the deck. If the session is already running it just submits /triage;
+// otherwise it starts the session in its own new (unfocused) tab, waits for
+// Claude to be ready, submits /triage, and refocuses the deck — so it works
+// while you keep triaging other tickets.
+func Triage(agents []Agent, t session.Ticket, cwd string) (string, error) {
+	for _, a := range agents {
+		if strings.EqualFold(a.Name, t.Key) {
+			return sendAndEnter(a.Name, a.PaneID, "/triage")
+		}
+	}
+	// Not running → start it in the background.
+	inner := claudeInner(t, cwd)
+	startArgs := append([]string{"agent", "start", t.Key, "--cwd", cwd, "--no-focus", "--"}, inner...)
+	startOut, err := exec.Command(herdrBin, startArgs...).CombinedOutput()
+	if err != nil {
+		return string(startOut), fmt.Errorf("agent start: %w: %s", err, strings.TrimSpace(string(startOut)))
+	}
+	paneID := parsePaneID(startOut)
+	if paneID == "" {
+		return string(startOut), fmt.Errorf("could not parse pane id from agent start")
+	}
+	// Own tab, but do not steal focus from the deck.
+	if out, err := exec.Command(herdrBin, "pane", "move", paneID, "--new-tab", "--label", t.Key).CombinedOutput(); err != nil {
+		return string(out), fmt.Errorf("pane move: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	// Wait until Claude is up and idle (ready for input), then submit /triage.
+	_ = exec.Command(herdrBin, "agent", "wait", t.Key, "--status", "idle", "--timeout", "60000").Run()
+	out, err := sendAndEnter(t.Key, paneID, "/triage")
+	// Make sure focus is back on the deck regardless of what the new tab did.
+	_ = exec.Command(herdrBin, "agent", "focus", "deck").Run()
+	if err != nil {
+		return out, err
+	}
+	return "started + /triage (background)", nil
 }
 
 // claudeInner is the claude argv for a ticket: resume if a transcript already

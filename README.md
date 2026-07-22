@@ -61,7 +61,7 @@ ticketdeck --demo --dump        # plain-text grouped list
 | open / attach the ticket's session | `Enter` |
 | description overlay | `d` (in it: `Enter` opens the session · `o` browser · `p` PR) |
 | open ticket / linked PR in browser | `o` / `p` |
-| send `/triage` to the ticket's session | `t` |
+| `/triage` a ticket in the background (starts its session if needed) | `t` |
 | change status (Done/Validate/Monitoring/Blocked/Cancel) | `s` → key → `y` |
 | change priority (Urgent/High/Medium/Low/None) | `P` → key |
 | assign / reassign / unassign | `a` |
@@ -75,7 +75,9 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
 
 - Fetches **assigned + open** issues (hides `completed`/`canceled`/`duplicate` — Done,
   Cancelled, Duplicate — but keeps `Validate`, a completed-type QA gate that's still
-  actionable). Groups **priority → status**, newest-updated first.
+  actionable). Groups **priority → status**, newest-updated first, and auto-folds priority
+  sections that hold none of your **top 10** tickets so the view stays focused (re-applied on
+  refresh).
 - Refreshes every ~60s with jitter and keeps the last good list on API error.
 - **Session badges** per ticket: `●` working · `◆` needs input · `○` idle · `✓` done ·
   `↻` resumable (an on-disk session you can reattach) · `·` none. Working tickets are dimmed

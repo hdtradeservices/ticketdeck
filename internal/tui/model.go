@@ -565,17 +565,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.closeSession(s)
 			}
 		case "t":
-			// Fire a message (default "/triage") at the highlighted session
-			// without switching to it. This runs a Claude turn — a user action,
-			// so it is consistent with BR-1 (the app itself never spends tokens).
-			name := ""
+			// Triage the highlighted ticket in the background: start its session
+			// (unfocused) if needed and submit /triage, staying on the deck. On an
+			// "other session" row, just submit /triage to it. Runs a Claude turn —
+			// a user action, consistent with BR-1 (the app never spends on its own).
 			if is, ok := m.selected(); ok {
-				name = is.Identifier
-			} else if sr, ok := m.selectedSession(); ok {
-				name = sr.Name
+				return m.triageTicket(is)
 			}
-			if name != "" {
-				return m.sendToSession(name, triageCmd)
+			if sr, ok := m.selectedSession(); ok {
+				return m.sendToSession(sr.Name, triageCmd)
 			}
 		case "pgup", "ctrl+u":
 			m.page(-1)
@@ -702,6 +700,19 @@ func (m Model) sendToSession(name, text string) (tea.Model, tea.Cmd) {
 	return m, func() tea.Msg {
 		out, err := backend.Send(name, text)
 		return detachedDoneMsg{action: fmt.Sprintf("sent %s to %s", text, name), err: err, output: strings.TrimSpace(out)}
+	}
+}
+
+// triageTicket runs /triage against a ticket's session in the background,
+// starting the session (unfocused) if it isn't running, without leaving the deck.
+func (m Model) triageTicket(is linear.Issue) (tea.Model, tea.Cmd) {
+	m.notice = "triaging " + is.Identifier + " in the background…"
+	backend := m.backend
+	t := toTicket(is)
+	root := m.root
+	return m, func() tea.Msg {
+		out, err := backend.Triage(t, root)
+		return detachedDoneMsg{action: "triage " + is.Identifier, err: err, output: strings.TrimSpace(out)}
 	}
 }
 
@@ -988,6 +999,7 @@ func (m *Model) rebuild(issues []linear.Issue) {
 	prevID, _ := m.selectedID()
 	prevIdx := m.cursor
 	m.allIssues = issues
+	m.reconcileCollapse()
 	m.regroup()
 
 	// Demo statuses resolve synchronously so --preview shows badges; real
@@ -1038,6 +1050,37 @@ func (m Model) nearestCursorable(idx int) int {
 		}
 	}
 	return m.firstCursorable()
+}
+
+// topFocus is how many top tickets stay in focus; priority sections holding
+// none of them are auto-folded.
+const topFocus = 10
+
+// reconcileCollapse auto-folds priority sections that contain none of the top
+// `topFocus` tickets (in the global priority→status→recency order), so the deck
+// stays focused on your highest-priority work. Re-run on every refresh, so as
+// tickets close/move the folding follows. A section holding at least one top
+// ticket stays expanded; empty sections aren't shown at all.
+func (m *Model) reconcileCollapse() {
+	groups := linear.GroupByPriorityThenStatus(linear.FilterVisible(m.allIssues))
+	inFocus := map[string]bool{}
+	n := 0
+	for _, g := range groups {
+		for _, sb := range g.Statuses {
+			for range sb.Issues {
+				if n < topFocus {
+					inFocus[g.PrioLabel] = true
+				}
+				n++
+			}
+		}
+	}
+	m.collapsed = map[string]bool{}
+	for _, g := range groups {
+		if !inFocus[g.PrioLabel] {
+			m.collapsed[g.PrioLabel] = true
+		}
+	}
 }
 
 // regroup rebuilds the visible rows from allIssues, honoring collapsed groups.

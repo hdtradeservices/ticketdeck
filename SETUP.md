@@ -86,6 +86,7 @@ transcript persists, so it stays resumable).
 - **Priority** group headers are color-coded: Urgent (red) · High (orange) · Medium (yellow) · Low (blue) · No priority (gray), always showing a `(count)`.
 - **Session** badge per ticket: `●` working (green) · `◆` needs input (amber) · `○` idle (cyan) · `✓` done · `↻` **resumable** (an on-disk session you can reattach — shown even right after a fresh start, before any agent is running) · `·` none yet.
 - **Working tickets are dimmed** — a ticket whose session is actively `working` renders in faint gray (no bright id/title), so your eye is drawn to the tickets that still need you (needs-input, idle, resumable, untouched) rather than the ones already in progress. Move the cursor onto one and it still highlights normally.
+- **Time-in-state** — live sessions (working / needs-input / idle) show how long they've held that state once it's been ≥1 minute, e.g. `◆ needs input 20m` or `● working 45m`. Useful for spotting a session parked a while (waiting on CI, or one that's needed input for a bit). The detail view (`d`) spells it out. Note: it's measured from when the deck first saw the state, not necessarily the session's true start.
 - **PR** `⇄` marks a ticket with a linked pull request, colored by state: merged (violet) · open (green) · closed (red) · draft/unknown (gray). Press `p` to open it.
 - **Validation flags** trail the title when a ticket carries a validation label: `⚑ validation failed` (red, `validation-failed`) or `⚑ inconclusive` (amber, `validation-inconclusive`); also shown in the `d` detail view.
 
@@ -94,6 +95,7 @@ transcript persists, so it stays resumable).
 | goal | key |
 |---|---|
 | **back to the deck** (ticket list) | **`Ctrl+b` then `1`** — the deck is pinned to tab 1 |
+| back to the deck (alias) | **`Ctrl+b` then `d`** — custom binding running `herdr agent focus deck` (config.toml `[[keys.command]]`) |
 | jump to any ticket/the deck **by name** (searchable navigator) | `Ctrl+b` then `g`, type a key, `Enter` |
 | pick another tab | `Ctrl+b` then `2`…`9`, or `Ctrl+b p`/`Ctrl+b n` (prev/next) |
 | **detach** the whole workspace — everything keeps running in the background | `Ctrl+b` then `q` |

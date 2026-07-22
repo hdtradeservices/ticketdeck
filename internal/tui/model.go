@@ -163,6 +163,7 @@ type Model struct {
 	collapseInit  bool            // whether the start-up default collapse has been applied
 	backend       Backend
 	sessions      map[string]session.Status // ticket key → session status
+	statusSince   map[string]time.Time      // ticket key → when its current status was first seen
 	otherSessions []session.SessionRef      // live sessions not tied to a visible ticket
 	demoStatuses  map[string]session.Status // --demo override; nil in real use
 	detail        *linear.Issue             // non-nil = showing the description overlay
@@ -203,7 +204,7 @@ type demoOtherSessioner interface {
 }
 
 func New(f Fetcher, root string, dry bool, backend Backend) Model {
-	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, sessions: map[string]session.Status{}, collapsed: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != ""}
+	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, collapsed: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != ""}
 	if ds, ok := f.(demoSessioner); ok {
 		m.demoStatuses = ds.DemoSessions()
 	}
@@ -329,6 +330,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			debugLog.Printf("status refresh error: %v", msg.err)
 		} else {
+			now := time.Now()
+			for k, v := range msg.statuses {
+				if prev, ok := m.sessions[k]; !ok || prev != v {
+					m.statusSince[k] = now // status is new or changed → reset the timer
+				}
+			}
+			for k := range m.statusSince { // forget keys no longer reported
+				if _, ok := msg.statuses[k]; !ok {
+					delete(m.statusSince, k)
+				}
+			}
 			m.sessions = msg.statuses
 		}
 
@@ -1458,11 +1470,40 @@ func (m Model) titleMeta() string {
 
 // sessionCol is the fixed width of the badge+label column, sized to the widest
 // label ("needs input").
-const sessionCol = 13
+const sessionCol = 17 // fits "◆ needs input 20m" (badge + label + elapsed)
+
+// elapsedLabel formats how long a session has been in its current state, or ""
+// for under a minute (so fresh/transient states stay uncluttered).
+func elapsedLabel(since time.Time) string {
+	if since.IsZero() {
+		return ""
+	}
+	d := time.Since(since)
+	switch {
+	case d < time.Minute:
+		return ""
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours())/24)
+	}
+}
+
+// elapsedInStatus returns the how-long-in-current-state label for a ticket's
+// live session (working/idle/needs-input), so long waits (e.g. a session parked
+// waiting on CI, or one needing input a while) are visible. Empty otherwise.
+func (m Model) elapsedInStatus(key string, st session.Status) string {
+	if !isRunning(st) {
+		return ""
+	}
+	return elapsedLabel(m.statusSince[key])
+}
 
 func (m Model) renderIssue(is linear.Issue, selected bool) string {
 	st := m.sessions[is.Identifier]
-	cell, color := sessionCellText(st)
+	cell, color := sessionCellText(st, m.elapsedInStatus(is.Identifier, st))
 	id := fmt.Sprintf("%-9s", is.Identifier)
 	prG, prC := prMark(is.PRs)
 	tagText, tagColor := validationTag(is.Labels)
@@ -1526,7 +1567,7 @@ func validationTag(labels []string) (string, lipgloss.Color) {
 
 // renderSession renders an "other sessions" row: its status badge + name.
 func (m Model) renderSession(ref session.SessionRef, selected bool) string {
-	cell, color := sessionCellText(ref.Status)
+	cell, color := sessionCellText(ref.Status, "")
 	name := ref.Name
 	avail := m.rowWidth() - (2 + sessionCol + 1)
 	if avail > 0 && len([]rune(name)) > avail {
@@ -1542,11 +1583,14 @@ func (m Model) renderSession(ref session.SessionRef, selected bool) string {
 // sessionCellText returns the badge + status label as plain text padded to
 // sessionCol (so the id column stays aligned), plus its color. Splitting text
 // from color lets selected rows render a clean full-width highlight.
-func sessionCellText(s session.Status) (string, lipgloss.Color) {
+func sessionCellText(s session.Status, elapsed string) (string, lipgloss.Color) {
 	glyph, label, color := sessionStyle(s)
 	text := glyph
 	if label != "" {
 		text += " " + label
+	}
+	if elapsed != "" {
+		text += " " + elapsed
 	}
 	if pad := sessionCol - len([]rune(text)); pad > 0 {
 		text += strings.Repeat(" ", pad)
@@ -1654,8 +1698,12 @@ func (m Model) renderDetail() string {
 	}
 	fmt.Fprintf(&b, "%s\n", line)
 
-	glyph, label, color := sessionStyle(m.sessions[is.Identifier])
+	st := m.sessions[is.Identifier]
+	glyph, label, color := sessionStyle(st)
 	sess := lipgloss.NewStyle().Foreground(color).Render(glyph + " " + label)
+	if e := m.elapsedInStatus(is.Identifier, st); e != "" {
+		sess += dimStyle.Render(" · " + e + " in this state")
+	}
 	if label == "" {
 		sess = dimStyle.Render("· no session yet — press ⏎ to start one")
 	}

@@ -5,12 +5,41 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
 )
+
+func TestElapsedInStatus(t *testing.T) {
+	if elapsedLabel(time.Time{}) != "" {
+		t.Error("zero time should format empty")
+	}
+	if got := elapsedLabel(time.Now().Add(-30 * time.Second)); got != "" {
+		t.Errorf("<1m should be empty, got %q", got)
+	}
+	if got := elapsedLabel(time.Now().Add(-90 * time.Second)); got != "1m" {
+		t.Errorf("90s → 1m, got %q", got)
+	}
+	if got := elapsedLabel(time.Now().Add(-3 * time.Hour)); got != "3h" {
+		t.Errorf("3h, got %q", got)
+	}
+	m := loaded(t)
+	m.statusSince = map[string]time.Time{"ZEN-9": time.Now().Add(-5 * time.Minute)}
+	if got := m.elapsedInStatus("ZEN-9", session.NeedsInput); got != "5m" {
+		t.Errorf("needs-input 5m, got %q", got)
+	}
+	if got := m.elapsedInStatus("ZEN-9", session.Stopped); got != "" {
+		t.Errorf("non-running state should not show elapsed, got %q", got)
+	}
+	// statusesMsg stamps a since-time for a newly-seen status.
+	next, _ := loaded(t).Update(statusesMsg{statuses: map[string]session.Status{"ZEN-9": session.Working}})
+	if next.(Model).statusSince["ZEN-9"].IsZero() {
+		t.Error("statusesMsg should record when a status was first seen")
+	}
+}
 
 type fakeFetcher struct{ issues []linear.Issue }
 

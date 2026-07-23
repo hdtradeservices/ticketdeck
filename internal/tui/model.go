@@ -1753,17 +1753,29 @@ func sessionStyle(s session.Status) (glyph, label string, color lipgloss.Color) 
 	}
 }
 
+// mdRenderer caches the glamour renderer by width. It is created once (not per
+// frame) and uses a fixed style — never glamour.WithAutoStyle, which does a
+// BLOCKING terminal background-color query that deadlocks with Bubble Tea's
+// input reader under a herdr PTY (the overlay would hang, ignoring all keys).
+var (
+	mdRenderer *glamour.TermRenderer
+	mdWidth    int
+)
+
 // renderMarkdown renders a ticket's markdown description to styled, word-wrapped
 // ANSI via glamour. Falls back to the raw text if rendering fails.
 func renderMarkdown(md string, width int) string {
 	if width < 20 {
 		width = 20
 	}
-	r, err := glamour.NewTermRenderer(glamour.WithAutoStyle(), glamour.WithWordWrap(width))
-	if err != nil {
-		return md
+	if mdRenderer == nil || mdWidth != width {
+		r, err := glamour.NewTermRenderer(glamour.WithStandardStyle("dark"), glamour.WithWordWrap(width))
+		if err != nil {
+			return md
+		}
+		mdRenderer, mdWidth = r, width
 	}
-	out, err := r.Render(md)
+	out, err := mdRenderer.Render(md)
 	if err != nil {
 		return md
 	}

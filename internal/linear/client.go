@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -63,42 +64,75 @@ query AssignedOpen($after: String) {
   }
 }`
 
+// issueNode is the shared GraphQL node shape for the issue fields TicketDeck
+// reads — used by both the assigned-issues list and the single-issue lookup.
+type issueNode struct {
+	ID            string `json:"id"`
+	Identifier    string `json:"identifier"`
+	Title         string `json:"title"`
+	Description   string `json:"description"`
+	Priority      int    `json:"priority"`
+	PriorityLabel string `json:"priorityLabel"`
+	BranchName    string `json:"branchName"`
+	URL           string `json:"url"`
+	State         struct {
+		Name string `json:"name"`
+		Type string `json:"type"`
+	} `json:"state"`
+	Team struct {
+		ID   string `json:"id"`
+		Key  string `json:"key"`
+		Name string `json:"name"`
+	} `json:"team"`
+	UpdatedAt   string `json:"updatedAt"`
+	Attachments struct {
+		Nodes []struct {
+			URL      string `json:"url"`
+			Title    string `json:"title"`
+			Subtitle string `json:"subtitle"`
+		} `json:"nodes"`
+	} `json:"attachments"`
+	Labels struct {
+		Nodes []struct {
+			Name string `json:"name"`
+		} `json:"nodes"`
+	} `json:"labels"`
+}
+
+// toIssue maps a GraphQL node to the Issue TicketDeck renders.
+func (n issueNode) toIssue() Issue {
+	issue := Issue{
+		ID:          n.ID,
+		TeamID:      n.Team.ID,
+		Identifier:  n.Identifier,
+		Title:       n.Title,
+		Description: n.Description,
+		Priority:    n.Priority,
+		PrioLabel:   n.PriorityLabel,
+		Branch:      n.BranchName,
+		URL:         n.URL,
+		StateName:   n.State.Name,
+		StateType:   n.State.Type,
+		TeamKey:     n.Team.Key,
+		TeamName:    n.Team.Name,
+		UpdatedAt:   n.UpdatedAt,
+	}
+	for _, a := range n.Attachments.Nodes {
+		if isPRURL(a.URL) {
+			issue.PRs = append(issue.PRs, PR{URL: a.URL, Title: a.Title, State: prState(a.Subtitle)})
+		}
+	}
+	for _, l := range n.Labels.Nodes {
+		issue.Labels = append(issue.Labels, l.Name)
+	}
+	return issue
+}
+
 type gqlResponse struct {
 	Data struct {
 		Viewer struct {
 			AssignedIssues struct {
-				Nodes []struct {
-					ID            string `json:"id"`
-					Identifier    string `json:"identifier"`
-					Title         string `json:"title"`
-					Description   string `json:"description"`
-					Priority      int    `json:"priority"`
-					PriorityLabel string `json:"priorityLabel"`
-					BranchName    string `json:"branchName"`
-					URL           string `json:"url"`
-					State         struct {
-						Name string `json:"name"`
-						Type string `json:"type"`
-					} `json:"state"`
-					Team struct {
-						ID   string `json:"id"`
-						Key  string `json:"key"`
-						Name string `json:"name"`
-					} `json:"team"`
-					UpdatedAt   string `json:"updatedAt"`
-					Attachments struct {
-						Nodes []struct {
-							URL      string `json:"url"`
-							Title    string `json:"title"`
-							Subtitle string `json:"subtitle"`
-						} `json:"nodes"`
-					} `json:"attachments"`
-					Labels struct {
-						Nodes []struct {
-							Name string `json:"name"`
-						} `json:"nodes"`
-					} `json:"labels"`
-				} `json:"nodes"`
+				Nodes    []issueNode `json:"nodes"`
 				PageInfo struct {
 					HasNextPage bool   `json:"hasNextPage"`
 					EndCursor   string `json:"endCursor"`
@@ -123,30 +157,7 @@ func (c *Client) FetchAssignedOpen(ctx context.Context) ([]Issue, error) {
 		}
 		ai := resp.Data.Viewer.AssignedIssues
 		for _, n := range ai.Nodes {
-			issue := Issue{
-				ID:          n.ID,
-				TeamID:      n.Team.ID,
-				Identifier:  n.Identifier,
-				Title:       n.Title,
-				Description: n.Description,
-				Priority:    n.Priority,
-				PrioLabel:   n.PriorityLabel,
-				Branch:      n.BranchName,
-				URL:         n.URL,
-				StateName:   n.State.Name,
-				StateType:   n.State.Type,
-				TeamKey:     n.Team.Key,
-				TeamName:    n.Team.Name,
-				UpdatedAt:   n.UpdatedAt,
-			}
-			for _, a := range n.Attachments.Nodes {
-				if isPRURL(a.URL) {
-					issue.PRs = append(issue.PRs, PR{URL: a.URL, Title: a.Title, State: prState(a.Subtitle)})
-				}
-			}
-			for _, l := range n.Labels.Nodes {
-				issue.Labels = append(issue.Labels, l.Name)
-			}
+			issue := n.toIssue()
 			// Client-side guard in case the server filter is ever loosened.
 			if IsHidden(issue) {
 				continue
@@ -159,6 +170,76 @@ func (c *Client) FetchAssignedOpen(ctx context.Context) ([]Issue, error) {
 		after = ai.PageInfo.EndCursor
 	}
 	return out, nil
+}
+
+// issueByKeyQuery fetches a single issue by its human key (team key + number),
+// so `ticketdeck describe` can show any ticket — including Done ones that the
+// assigned-open list wouldn't return. Read-only (BR-2b).
+const issueByKeyQuery = `
+query IssueByKey($team: String!, $number: Float!) {
+  issues(first: 1, filter: { team: { key: { eq: $team } }, number: { eq: $number } }) {
+    nodes {
+      id
+      identifier
+      title
+      description
+      priority
+      priorityLabel
+      branchName
+      url
+      state { name type }
+      team { id key name }
+      updatedAt
+      attachments { nodes { url title subtitle } }
+      labels { nodes { name } }
+    }
+  }
+}`
+
+// FetchIssue returns a single issue by its key (e.g. "ZEN-3309").
+func (c *Client) FetchIssue(ctx context.Context, key string) (Issue, error) {
+	team, number, err := splitKey(key)
+	if err != nil {
+		return Issue{}, err
+	}
+	raw, err := c.postGraphQL(ctx, issueByKeyQuery, map[string]any{"team": team, "number": number})
+	if err != nil {
+		return Issue{}, err
+	}
+	var parsed struct {
+		Data struct {
+			Issues struct {
+				Nodes []issueNode `json:"nodes"`
+			} `json:"issues"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return Issue{}, fmt.Errorf("linear: decode: %w", err)
+	}
+	if len(parsed.Errors) > 0 {
+		return Issue{}, fmt.Errorf("linear: %s", parsed.Errors[0].Message)
+	}
+	if len(parsed.Data.Issues.Nodes) == 0 {
+		return Issue{}, fmt.Errorf("linear: no issue %s", strings.ToUpper(key))
+	}
+	return parsed.Data.Issues.Nodes[0].toIssue(), nil
+}
+
+// splitKey parses a ticket key ("ZEN-3309") into its team key and number.
+func splitKey(key string) (string, int, error) {
+	key = strings.TrimSpace(strings.ToUpper(key))
+	i := strings.LastIndex(key, "-")
+	if i <= 0 || i == len(key)-1 {
+		return "", 0, fmt.Errorf("bad ticket key %q (want e.g. ZEN-3309)", key)
+	}
+	n, err := strconv.Atoi(key[i+1:])
+	if err != nil {
+		return "", 0, fmt.Errorf("bad ticket key %q (want e.g. ZEN-3309)", key)
+	}
+	return key[:i], n, nil
 }
 
 func (c *Client) query(ctx context.Context, query string, vars map[string]any) (*gqlResponse, error) {

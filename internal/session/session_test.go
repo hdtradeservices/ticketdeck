@@ -14,6 +14,27 @@ const realAgentsJSON = `[
   {"pid":1679520,"id":"b2fa649b","cwd":"/home/matthew/Repos/walmart","kind":"background","startedAt":1784205580420,"sessionId":"b2fa649b-5830-42ba-ade7-8dab6ec0f72d","name":"ZEN-3175","status":"busy","state":"working"}
 ]`
 
+func TestTabLabel(t *testing.T) {
+	cases := []struct {
+		key, title, want string
+	}{
+		{"ZEN-42", "fix the thing", "ZEN-42  fix the thing"},
+		{"ZEN-42", "", "ZEN-42"},
+		{"DOPS-1", "   ", "DOPS-1"},
+		// 32-rune cap with ellipsis (agent name stays the bare key elsewhere).
+		{"ZEN-3309", "a really long ticket title that overflows the tab", "ZEN-3309  a really long ticket…"},
+	}
+	for _, c := range cases {
+		got := TabLabel(Ticket{Key: c.key, Title: c.title})
+		if got != c.want {
+			t.Errorf("TabLabel(%q,%q) = %q, want %q", c.key, c.title, got, c.want)
+		}
+		if r := []rune(got); len(r) > 32 {
+			t.Errorf("TabLabel(%q,%q) = %q is %d runes, want ≤32", c.key, c.title, got, len(r))
+		}
+	}
+}
+
 func TestDeterministicIDStableAndValid(t *testing.T) {
 	a := DeterministicID("ZEN-3175")
 	b := DeterministicID("ZEN-3175")

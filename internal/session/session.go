@@ -229,6 +229,30 @@ func LaunchArgs(t Ticket) []string {
 	return []string{"--append-system-prompt", SystemPrompt(t)}
 }
 
+// TabLabel is the herdr tab title for a ticket: the key plus a short slice of
+// the title, so a tab reads "ZEN-3309  fix shipworks sweep" instead of a bare
+// id. The agent name stays the bare key (that's the identity everything matches
+// on) — only the visible tab label carries the title.
+func TabLabel(t Ticket) string {
+	title := strings.TrimSpace(t.Title)
+	if title == "" {
+		return t.Key
+	}
+	return truncRunes(t.Key+"  "+title, 32)
+}
+
+// truncRunes shortens s to at most max runes, appending an ellipsis when cut.
+func truncRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	if max <= 1 {
+		return string(r[:max])
+	}
+	return strings.TrimRight(string(r[:max-1]), " ") + "…"
+}
+
 // Plan resolves what should happen when a ticket is selected, given the current
 // session list and a default working directory (the repos-root fallback).
 func Plan(t Ticket, infos []Info, defaultCwd string) (LaunchSpec, error) {

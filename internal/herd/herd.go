@@ -16,11 +16,17 @@ package herd
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	"github.com/hdtradeservices/ticketdeck/internal/session"
 )
+
+// ticketKeyRE matches a Linear-style ticket key ("ZEN-3309", "DOPS-12"), used to
+// pick out ticket sessions from herdr's agent list.
+var ticketKeyRE = regexp.MustCompile(`^[A-Z][A-Z0-9]*-[0-9]+$`)
 
 var herdrBin = "herdr" // overridable in tests
 
@@ -40,6 +46,7 @@ type Agent struct {
 	Cwd         string `json:"cwd"`
 	AgentStatus string `json:"agent_status"` // idle | working | blocked | unknown
 	PaneID      string `json:"pane_id"`
+	TabID       string `json:"tab_id"`
 }
 
 // agentListResp is the envelope herdr wraps agent list results in.
@@ -108,10 +115,13 @@ func Plan(t session.Ticket, agents []Agent, defaultCwd string) (session.LaunchSp
 	for _, a := range agents {
 		if strings.EqualFold(a.Name, t.Key) {
 			// Existing pane → just switch the workspace focus to it. Fire-and-
-			// return; herdr owns the pane.
+			// return; herdr owns the pane. Carry the label so Run can freshen the
+			// tab title (panes opened before the title feature show a bare key).
 			return session.LaunchSpec{
 				Args:   []string{"agent", "focus", t.Key},
 				Cwd:    firstNonEmpty(a.Cwd, defaultCwd),
+				Name:   t.Key,
+				Label:  session.TabLabel(t),
 				Action: "focus",
 			}, nil
 		}
@@ -119,7 +129,7 @@ func Plan(t session.Ticket, agents []Agent, defaultCwd string) (session.LaunchSp
 	// No herdr pane → start one. Args here are the representative command shown in
 	// --dry-launch; Run() performs the real (multi-step) new-tab launch.
 	args := append([]string{"agent", "start", t.Key, "--cwd", defaultCwd, "--"}, claudeInner(t, defaultCwd)...)
-	return session.LaunchSpec{Args: args, Cwd: defaultCwd, Name: t.Key, Label: t.Key, Action: "start"}, nil
+	return session.LaunchSpec{Args: args, Cwd: defaultCwd, Name: t.Key, Label: session.TabLabel(t), Action: "start"}, nil
 }
 
 // ScratchSpec builds a launch for an ad-hoc Claude session not tied to any
@@ -175,10 +185,79 @@ func CloseByName(agents []Agent, name string) (string, error) {
 				return "", nil
 			}
 			out, err := exec.Command(herdrBin, "pane", "close", a.PaneID).CombinedOutput()
+			// Closing a ticket's own tab makes herdr focus the neighbor tab; pull
+			// focus back to the deck so a Done/Cancel from the list lands on the
+			// ticket list rather than on some adjacent session.
+			if err == nil && hasAgent(agents, "deck") {
+				_ = exec.Command(herdrBin, "agent", "focus", "deck").Run()
+			}
 			return string(out), err
 		}
 	}
 	return "", nil
+}
+
+// hasAgent reports whether an agent named `name` is in the list.
+func hasAgent(agents []Agent, name string) bool {
+	for _, a := range agents {
+		if strings.EqualFold(a.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// CurrentTicketKey best-effort resolves the ticket key of the pane that invoked
+// a command (e.g. a popup keybind bound to `ticketdeck describe`), so the user
+// can view the description of the ticket they're working in without naming it.
+// It tries, in order: the active pane herdr exports to custom commands
+// (HERDR_ACTIVE_PANE_ID), the currently focused pane (`pane current`), and — if
+// exactly one ticket-shaped session is running — that one. Returns "" when it
+// can't decide.
+func CurrentTicketKey() string {
+	agents, err := List()
+	if err != nil {
+		return ""
+	}
+	byPane := map[string]string{}
+	var tickets []string
+	for _, a := range agents {
+		if ticketKeyRE.MatchString(a.Name) {
+			if a.PaneID != "" {
+				byPane[a.PaneID] = a.Name
+			}
+			tickets = append(tickets, a.Name)
+		}
+	}
+	if k, ok := byPane[os.Getenv("HERDR_ACTIVE_PANE_ID")]; ok {
+		return k
+	}
+	if k, ok := byPane[currentPaneID()]; ok {
+		return k
+	}
+	if len(tickets) == 1 {
+		return tickets[0]
+	}
+	return ""
+}
+
+// currentPaneID returns the focused pane's id via `herdr pane current`, or "".
+func currentPaneID() string {
+	out, err := exec.Command(herdrBin, "pane", "current").Output()
+	if err != nil {
+		return ""
+	}
+	var r struct {
+		Result struct {
+			Pane struct {
+				PaneID string `json:"pane_id"`
+			} `json:"pane"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(out, &r) == nil {
+		return r.Result.Pane.PaneID
+	}
+	return ""
 }
 
 // Send types text into the named session and submits it, without switching to
@@ -232,7 +311,7 @@ func Triage(agents []Agent, t session.Ticket, cwd string) (string, error) {
 		return string(startOut), fmt.Errorf("could not parse pane id from agent start")
 	}
 	// Own tab, but do not steal focus from the deck.
-	if out, err := exec.Command(herdrBin, "pane", "move", paneID, "--new-tab", "--label", t.Key).CombinedOutput(); err != nil {
+	if out, err := exec.Command(herdrBin, "pane", "move", paneID, "--new-tab", "--label", session.TabLabel(t)).CombinedOutput(); err != nil {
 		return string(out), fmt.Errorf("pane move: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	// Wait until Claude is up and idle (ready for input), then submit /triage.
@@ -268,6 +347,19 @@ func claudeInner(t session.Ticket, cwd string) []string {
 func Run(spec session.LaunchSpec) (string, error) {
 	if len(spec.Args) >= 2 && spec.Args[0] == "agent" && spec.Args[1] == "focus" {
 		out, err := exec.Command(herdrBin, spec.Args...).CombinedOutput()
+		// Best-effort: give the tab a nice title if we have one (upgrades tabs
+		// opened before the title feature). Renaming the tab doesn't touch the
+		// agent name, so name-based matching is unaffected.
+		if err == nil && spec.Label != "" && spec.Label != spec.Name {
+			if agents, e := List(); e == nil {
+				for _, a := range agents {
+					if strings.EqualFold(a.Name, spec.Name) && a.TabID != "" {
+						_ = exec.Command(herdrBin, "tab", "rename", a.TabID, spec.Label).Run()
+						break
+					}
+				}
+			}
+		}
 		return string(out), err
 	}
 

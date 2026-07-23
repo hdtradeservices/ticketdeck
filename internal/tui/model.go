@@ -1782,6 +1782,44 @@ func renderMarkdown(md string, width int) string {
 	return out
 }
 
+// RenderMarkdown renders markdown to styled, word-wrapped ANSI at the given
+// width, reusing the cached renderer. Exported for the `ticketdeck describe`
+// subcommand (which shares the deck's description rendering).
+func RenderMarkdown(md string, width int) string { return renderMarkdown(md, width) }
+
+// DescribeText formats a ticket's header (key, title, status, priority, links)
+// followed by its rendered markdown description, for `ticketdeck describe`. It
+// mirrors the deck's `d` overlay but as plain output suitable for a pager/popup.
+func DescribeText(is linear.Issue, width int) string {
+	var b strings.Builder
+	title := lipgloss.NewStyle().Bold(true).Render(is.Identifier + "  " + is.Title)
+	b.WriteString(title + "\n")
+
+	meta := is.StateName
+	if is.PrioLabel != "" {
+		meta += " · " + is.PrioLabel
+	}
+	if is.TeamName != "" {
+		meta += " · " + is.TeamName
+	}
+	b.WriteString(lipgloss.NewStyle().Faint(true).Render(meta) + "\n")
+	if is.URL != "" {
+		b.WriteString(is.URL + "\n")
+	}
+	for _, pr := range is.PRs {
+		b.WriteString("PR: " + pr.URL + "\n")
+	}
+	b.WriteString("\n")
+
+	body := strings.TrimSpace(is.Description)
+	if body == "" {
+		b.WriteString("(no description)\n")
+		return b.String()
+	}
+	b.WriteString(renderMarkdown(body, width))
+	return b.String()
+}
+
 // renderDetail draws the description overlay for the selected ticket.
 // renderOpenHint draws the "how to get back" reminder shown before a ticket
 // session opens in its own tab.

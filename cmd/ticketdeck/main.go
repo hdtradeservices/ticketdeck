@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"golang.org/x/term"
 
 	"github.com/hdtradeservices/ticketdeck/internal/herd"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
@@ -24,6 +27,17 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "update" {
 		if err := update.Run(); err != nil {
 			fmt.Fprintln(os.Stderr, "ticketdeck: update failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Subcommand: `ticketdeck describe [KEY]` prints a ticket's rendered
+	// description. With no KEY it resolves the ticket from the current herdr pane
+	// — so a popup keybind inside a ticket's session shows that ticket.
+	if len(os.Args) > 1 && os.Args[1] == "describe" {
+		if err := runDescribe(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "ticketdeck:", err)
 			os.Exit(1)
 		}
 		return
@@ -145,6 +159,60 @@ func resolveRoot(flagVal string) string {
 		return cwd
 	}
 	return "."
+}
+
+// runDescribe implements `ticketdeck describe [KEY]`: resolve the ticket key
+// (explicit arg → $TICKETDECK_TICKET → the current herdr pane), fetch the issue
+// read-only, and print its rendered description. Piped to a pager by the popup
+// keybind (see SETUP.md).
+func runDescribe(args []string) error {
+	key := ""
+	if len(args) > 0 {
+		key = args[0]
+	}
+	if key == "" {
+		key = os.Getenv("TICKETDECK_TICKET")
+	}
+	if key == "" {
+		key = herd.CurrentTicketKey()
+	}
+	if key == "" {
+		return fmt.Errorf("couldn't tell which ticket — run e.g. `ticketdeck describe ZEN-3309`")
+	}
+	apiKey := os.Getenv("LINEAR_API_KEY")
+	if apiKey == "" {
+		return fmt.Errorf("LINEAR_API_KEY not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	is, err := linear.NewClient(apiKey).FetchIssue(ctx, key)
+	if err != nil {
+		return err
+	}
+	fmt.Print(tui.DescribeText(is, describeWidth()))
+	return nil
+}
+
+// describeWidth is the word-wrap width for `describe` output: the terminal width
+// (minus a small margin), from $COLUMNS or the tty, clamped to a sane range.
+func describeWidth() int {
+	w := 0
+	if c, err := strconv.Atoi(os.Getenv("COLUMNS")); err == nil && c > 0 {
+		w = c
+	} else if tw, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && tw > 0 {
+		w = tw
+	}
+	if w <= 0 {
+		w = 80
+	}
+	w -= 2
+	if w < 40 {
+		w = 40
+	}
+	if w > 120 {
+		w = 120
+	}
+	return w
 }
 
 func buildFetcher(demo bool) (tui.Fetcher, error) {

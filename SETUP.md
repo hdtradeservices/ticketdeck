@@ -67,7 +67,7 @@ running in their background tabs.
 | show the ticket's **description** (rendered markdown) | `d` (in the overlay: `Enter` opens the session, `o` browser, `p` PR, `↑`/`↓` scroll, `esc` closes) |
 | open the ticket in the **web browser** | `o` |
 | open the ticket's **linked PR** in the browser | `p` (shown with a `⇄` icon, colored by PR state) |
-| **change status** → Done / Validate / Monitoring / Blocked / Cancel | `s`, then `d`/`v`/`m`/`b`/`c`, then `y` to confirm — **writes to Linear; needs a write-scoped `LINEAR_API_KEY`**. Moving to a terminal state (**Done / Cancel**) also **closes that ticket's Claude session** if one is running (transcript persists — resumable). |
+| **change status** → Done / Validate / Monitoring / Blocked / Cancel | `s`, then `d`/`v`/`m`/`b`/`c`, then `y` to confirm — **writes to Linear; needs a write-scoped `LINEAR_API_KEY`**. Moving to a terminal state (**Done / Cancel**) also **closes that ticket's Claude session** if one is running (transcript persists — resumable), then returns focus to the deck (not the neighbor tab). |
 | **change priority** → Urgent / High / Medium / Low / None | `P`, then `u`/`h`/`m`/`l`/`0` — **write; write-scoped key** |
 | **assign / reassign / unassign** | `a` opens a picker — type to filter people, `↑`/`↓` select, `⏎` assign (top row = **Unassign**), `esc` cancel — **writes to Linear; write-scoped key** (reassigning away from you drops the ticket off the list) |
 | open an **ad-hoc Claude session** not tied to any ticket (own tab) | `n` |
@@ -96,6 +96,7 @@ transcript persists, so it stays resumable).
 | goal | key |
 |---|---|
 | **back to the deck** (ticket list) | **`Ctrl+b` then `1`** — the deck is pinned to tab 1 |
+| **show this ticket's description** (from inside its session) | **`Ctrl+b` then `i`** — a popup runs `ticketdeck describe`, which resolves the ticket from the pane you're in (`HERDR_ACTIVE_PANE_ID`), fetches it read-only, and renders the markdown; `q` closes the popup. Installed by `install.sh` as a `[[keys.command]]` with `type = "popup"`. |
 | back to the deck (alias) | **`Ctrl+b` then `d`** — custom binding running `herdr agent focus deck` (config.toml `[[keys.command]]`) |
 | jump to any ticket/the deck **by name** (searchable navigator) | `Ctrl+b` then `g`, type a key, `Enter` |
 | pick another tab | `Ctrl+b` then `2`…`9`, or `Ctrl+b p`/`Ctrl+b n` (prev/next) |

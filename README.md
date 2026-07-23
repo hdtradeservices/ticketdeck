@@ -61,6 +61,7 @@ ticketdeck --demo --dump        # plain-text grouped list
 | open / attach the ticket's session | `Enter` |
 | description overlay | `d` (in it: `Enter` opens the session · `o` browser · `p` PR) |
 | open ticket / linked PR in browser | `o` / `p` |
+| show the ticket's description **from inside its session** | `Ctrl+b` then `i` (popup) |
 | `/triage` a ticket in the background (starts its session if needed) | `t` |
 | change status (Done/Validate/Monitoring/Blocked/Cancel) | `s` → key → `y` |
 | change priority (Urgent/High/Medium/Low/None) | `P` → key |
@@ -85,7 +86,12 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   `⚑` flag.
 - **Enter** launches `claude` bound to a deterministic per-ticket session id (resumes if one
   exists), seeding the ticket's identity via `--append-system-prompt` — **no auto-submitted
-  prompt and no model turn**: the first token spend is always your first message.
+  prompt and no model turn**: the first token spend is always your first message. Each ticket
+  opens in its own tab titled `KEY  short title` (not a bare id).
+- **Description from inside a session** — `Ctrl+b i` opens a popup with the current ticket's
+  rendered description, resolved from whichever ticket pane you invoked it in (so you don't have
+  to jump back to the deck). It's a read-only Linear fetch — no model turn. The deck's own `d`
+  overlay shows the same for the cursor ticket.
 - **Claude usage** — the title bar shows your Claude 5-hour and 7-day rate-limit
   utilization (`◷ 5h 52% · 7d 42%`), color-coded, with a rough reset countdown. Same source
   as Claude Code's status line (the OAuth usage endpoint); it's a metadata read, so it does

@@ -37,6 +37,29 @@ if [ "${NO_HERDR:-0}" != "1" ]; then
   fi
   # Let herdr detect Claude working/blocked/idle (reversible, no-op outside herdr).
   "$BIN_DIR/herdr" integration install claude >/dev/null 2>&1 || true
+
+  # Add the "Ctrl+b i" popup that shows the current ticket's description from
+  # inside its session (idempotent; skipped if you already bind prefix+i).
+  cfg="${XDG_CONFIG_HOME:-$HOME/.config}/herdr/config.toml"
+  if ! { [ -f "$cfg" ] && { grep -q 'ticketdeck: describe keybind' "$cfg" || grep -qE 'key *= *"prefix\+i"' "$cfg"; }; }; then
+    mkdir -p "$(dirname "$cfg")"
+    cat >> "$cfg" <<'TOML'
+
+# >>> ticketdeck: describe keybind — view the current ticket's description in a
+# popup (Ctrl+b then i). `ticketdeck describe` resolves the ticket from the pane
+# you invoked it from (HERDR_ACTIVE_PANE_ID), so it works inside a ticket session.
+[[keys.command]]
+key = "prefix+i"
+command = "bash -lc 'ticketdeck describe | less -R'"
+type = "popup"
+width = "80%"
+height = "80%"
+description = "TicketDeck: show this ticket's description"
+# <<< ticketdeck
+TOML
+    say "added Ctrl+b i (ticketdeck describe) keybind to herdr config"
+    "$BIN_DIR/herdr" server reload-config >/dev/null 2>&1 || true
+  fi
 fi
 
 # ── ticketdeck ──────────────────────────────────────────────────────────────

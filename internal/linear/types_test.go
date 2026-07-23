@@ -108,3 +108,26 @@ func TestValidateShownDoneHidden(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitKey(t *testing.T) {
+	ok := []struct {
+		in   string
+		team string
+		num  int
+	}{
+		{"ZEN-3309", "ZEN", 3309},
+		{"dops-12", "DOPS", 12},
+		{"  sma-7 ", "SMA", 7},
+	}
+	for _, c := range ok {
+		team, num, err := splitKey(c.in)
+		if err != nil || team != c.team || num != c.num {
+			t.Errorf("splitKey(%q) = (%q,%d,%v), want (%q,%d,nil)", c.in, team, num, err, c.team, c.num)
+		}
+	}
+	for _, bad := range []string{"", "ZEN", "ZEN-", "-5", "ZEN-abc"} {
+		if _, _, err := splitKey(bad); err == nil {
+			t.Errorf("splitKey(%q) should error", bad)
+		}
+	}
+}

@@ -123,3 +123,17 @@ func TestPlanFocusesExistingAgent(t *testing.T) {
 		t.Errorf("focus should reuse agent cwd, got %s", spec.Cwd)
 	}
 }
+
+func TestTicketKeyRE(t *testing.T) {
+	match := []string{"ZEN-3309", "DOPS-1", "A-9", "ABC123-42"}
+	for _, s := range match {
+		if !ticketKeyRE.MatchString(s) {
+			t.Errorf("ticketKeyRE should match %q", s)
+		}
+	}
+	for _, s := range []string{"deck", "scratch-1", "zen-3309", "ZEN", "ZEN-", "-5", "ZEN 3309"} {
+		if ticketKeyRE.MatchString(s) {
+			t.Errorf("ticketKeyRE should not match %q", s)
+		}
+	}
+}

@@ -67,7 +67,7 @@ running in their background tabs.
 | show the ticket's **description** (rendered markdown) | `d` (in the overlay: `Enter` opens the session, `o` browser, `p` PR, `↑`/`↓` scroll, `esc` closes) |
 | open the ticket in the **web browser** | `o` |
 | open the ticket's **linked PR** in the browser | `p` (shown with a `⇄` icon, colored by PR state) |
-| **change status** → Done / Validate / Monitoring / Blocked / Cancel | `s`, then `d`/`v`/`m`/`b`/`c`, then `y` to confirm — **writes to Linear; needs a write-scoped `LINEAR_API_KEY`**. Moving to a terminal state (**Done / Cancel**) also **closes that ticket's Claude session** if one is running (transcript persists — resumable), then returns focus to the deck (not the neighbor tab). |
+| **change status** → Done / Validate / Monitoring / Blocked / Cancel | `s`, then `d`/`v`/`m`/`b`/`c`, then `y` to confirm — **writes to Linear; needs a write-scoped `LINEAR_API_KEY`**. Moving to a terminal state (**Done / Cancel**) also **closes that ticket's Claude session** if one is running (transcript persists — resumable), then returns focus to the deck (not the neighbor tab). Moving to **Done** also runs the **unblock cascade**: every still-open ticket this one was *blocking* is moved to its team's **Triage** state. |
 | **change priority** → Urgent / High / Medium / Low / None | `P`, then `u`/`h`/`m`/`l`/`0` — **write; write-scoped key** |
 | **assign / reassign / unassign** | `a` opens a picker — type to filter people, `↑`/`↓` select, `⏎` assign (top row = **Unassign**), `esc` cancel — **writes to Linear; write-scoped key** (reassigning away from you drops the ticket off the list) |
 | open an **ad-hoc Claude session** not tied to any ticket (own tab) | `n` |
@@ -89,6 +89,8 @@ transcript persists, so it stays resumable).
 - **Working tickets are dimmed** — a ticket whose session is actively `working` renders in faint gray (no bright id/title), so your eye is drawn to the tickets that still need you (needs-input, idle, resumable, untouched) rather than the ones already in progress. Move the cursor onto one and it still highlights normally.
 - **Time-in-state** — live sessions (working / needs-input / idle) show how long they've held that state once it's been ≥1 minute, e.g. `◆ needs input 20m` or `● working 45m`. Useful for spotting a session parked a while (waiting on CI, or one that's needed input for a bit). The detail view (`d`) spells it out. Note: it's measured from when the deck first saw the state, not necessarily the session's true start.
 - **PR** `⇄` marks a ticket with a linked pull request, colored by state: merged (violet) · open (green) · closed (red) · draft/unknown (gray). Press `p` to open it.
+- **Blocked-by** `⛔ ZEN-1234, …` (red) trails a **Blocked** ticket's title, listing the still-open tickets it's blocked by (up to 3, then `+N`); the `d` detail view spells them all out.
+- **Recently done** tickets stay on the deck for 12h after they're completed, rendered **struck-through** and dimmed, then drop off. They don't consume top-10 focus slots, so a lower priority section holding only done tickets still folds.
 - **Validation flags** trail the title when a ticket carries a validation label: `⚑ validation failed` (red, `validation-failed`) or `⚑ inconclusive` (amber, `validation-inconclusive`); also shown in the `d` detail view.
 
 **herdr keys** (prefix `Ctrl+b`):

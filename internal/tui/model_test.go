@@ -365,11 +365,17 @@ type writeFetcher struct {
 	fakeFetcher
 	moved       []string
 	prioritized []string
+	unblocked   []string // identifiers passed to UnblockToTriage
 }
 
 func (w *writeFetcher) MoveState(_ context.Context, issue linear.Issue, target string) error {
 	w.moved = append(w.moved, issue.Identifier+"→"+target)
 	return nil
+}
+
+func (w *writeFetcher) UnblockToTriage(_ context.Context, issue linear.Issue) ([]string, error) {
+	w.unblocked = append(w.unblocked, issue.Identifier)
+	return nil, nil
 }
 
 func (w *writeFetcher) SetPriority(_ context.Context, issue linear.Issue, p int) error {
@@ -808,4 +814,69 @@ func TestCursorSkipsHeaders(t *testing.T) {
 			t.Fatalf("cursor landed on a non-issue row at step %d", i)
 		}
 	}
+}
+
+func TestBlockedNote(t *testing.T) {
+	// only for Blocked status
+	notBlocked := linear.Issue{StateName: "In Progress", BlockedBy: []linear.Relation{{Identifier: "ZEN-1", StateType: "started"}}}
+	if got := blockedNote(notBlocked); got != "" {
+		t.Errorf("non-Blocked note = %q, want empty", got)
+	}
+	blocked := linear.Issue{StateName: "Blocked", BlockedBy: []linear.Relation{
+		{Identifier: "ZEN-1", StateType: "started"},
+		{Identifier: "ZEN-2", StateType: "completed"}, // filtered
+	}}
+	if got := blockedNote(blocked); got != "⛔ ZEN-1" {
+		t.Errorf("note = %q, want \"⛔ ZEN-1\"", got)
+	}
+	many := linear.Issue{StateName: "Blocked", BlockedBy: []linear.Relation{
+		{Identifier: "A-1", StateType: "started"}, {Identifier: "A-2", StateType: "started"},
+		{Identifier: "A-3", StateType: "started"}, {Identifier: "A-4", StateType: "started"},
+		{Identifier: "A-5", StateType: "started"},
+	}}
+	if got := blockedNote(many); got != "⛔ A-1, A-2, A-3 +2" {
+		t.Errorf("note = %q, want \"⛔ A-1, A-2, A-3 +2\"", got)
+	}
+}
+
+// drainCmd executes a (possibly batched) command tree, returning all leaf msgs.
+func drainCmd(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		var out []tea.Msg
+		for _, c := range batch {
+			out = append(out, drainCmd(c)...)
+		}
+		return out
+	}
+	return []tea.Msg{msg}
+}
+
+func TestDoneTriggersUnblockCascade(t *testing.T) {
+	wf := &writeFetcher{fakeFetcher: fakeFetcher{fixture()}}
+	m := New(wf, "", true, fakeBackend{})
+	next, _ := m.Update(refreshedMsg{issues: fixture()})
+	m = next.(Model)
+
+	// A successful Done write should fan out an UnblockToTriage for that ticket.
+	next, cmd := m.Update(statusWriteMsg{key: "ZEN-9", target: "Done"})
+	if cmd == nil {
+		t.Fatal("Done write should return follow-up commands")
+	}
+	msgs := drainCmd(cmd)
+	if len(wf.unblocked) != 1 || wf.unblocked[0] != "ZEN-9" {
+		t.Fatalf("Done should trigger UnblockToTriage(ZEN-9), got %v", wf.unblocked)
+	}
+	// A non-terminal move must NOT cascade.
+	wf.unblocked = nil
+	next2, cmd2 := next.(Model).Update(statusWriteMsg{key: "ZEN-9", target: "Blocked"})
+	_ = next2
+	_ = drainCmd(cmd2)
+	if len(wf.unblocked) != 0 {
+		t.Fatalf("Blocked move should not cascade, got %v", wf.unblocked)
+	}
+	_ = msgs
 }

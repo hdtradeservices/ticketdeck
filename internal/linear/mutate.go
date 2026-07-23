@@ -49,6 +49,99 @@ mutation Move($id: String!, $stateId: String!) {
   issueUpdate(id: $id, input: { stateId: $stateId }) { success }
 }`
 
+const issueDependentsQuery = `
+query Dependents($id: String!) {
+  issue(id: $id) {
+    relations {
+      nodes {
+        type
+        relatedIssue { id identifier team { id } state { name type } }
+      }
+    }
+  }
+}`
+
+// FetchBlocking returns the issues this one blocks (its "blocks" relations) — the
+// dependents that may become unblocked when it closes. Read-only.
+func (c *Client) FetchBlocking(ctx context.Context, key string) ([]Relation, error) {
+	raw, err := c.postGraphQL(ctx, issueDependentsQuery, map[string]any{"id": strings.ToUpper(strings.TrimSpace(key))})
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Data struct {
+			Issue struct {
+				Relations struct {
+					Nodes []struct {
+						Type         string `json:"type"`
+						RelatedIssue struct {
+							ID         string `json:"id"`
+							Identifier string `json:"identifier"`
+							Team       struct {
+								ID string `json:"id"`
+							} `json:"team"`
+							State struct {
+								Name string `json:"name"`
+								Type string `json:"type"`
+							} `json:"state"`
+						} `json:"relatedIssue"`
+					} `json:"nodes"`
+				} `json:"relations"`
+			} `json:"issue"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode dependents: %w", err)
+	}
+	if len(resp.Errors) > 0 {
+		return nil, fmt.Errorf("%s", resp.Errors[0].Message)
+	}
+	var out []Relation
+	for _, r := range resp.Data.Issue.Relations.Nodes {
+		if r.Type != "blocks" {
+			continue
+		}
+		out = append(out, Relation{
+			ID:         r.RelatedIssue.ID,
+			Identifier: r.RelatedIssue.Identifier,
+			TeamID:     r.RelatedIssue.Team.ID,
+			StateName:  r.RelatedIssue.State.Name,
+			StateType:  r.RelatedIssue.State.Type,
+		})
+	}
+	return out, nil
+}
+
+// UnblockToTriage moves every still-open ticket that `issue` was blocking to its
+// team's Triage state — the unblock cascade run when a blocker is completed.
+// Returns the identifiers actually moved. Dependents already done/cancelled or
+// already in Triage are skipped; a per-dependent write failure is returned as
+// err but doesn't stop the others.
+func (c *Client) UnblockToTriage(ctx context.Context, issue Issue) ([]string, error) {
+	deps, err := c.FetchBlocking(ctx, issue.Identifier)
+	if err != nil {
+		return nil, err
+	}
+	var moved []string
+	var firstErr error
+	for _, d := range deps {
+		if d.blockingDone() || strings.EqualFold(d.StateName, "Triage") {
+			continue
+		}
+		if err := c.MoveState(ctx, Issue{ID: d.ID, TeamID: d.TeamID, Identifier: d.Identifier}, "Triage"); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		moved = append(moved, d.Identifier)
+	}
+	return moved, firstErr
+}
+
 // Assign sets an issue's assignee. An empty assigneeID unassigns (sets null).
 func (c *Client) Assign(ctx context.Context, issue Issue, assigneeID string) error {
 	if issue.ID == "" {

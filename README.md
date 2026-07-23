@@ -84,6 +84,13 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   `↻` resumable (an on-disk session you can reattach) · `·` none. Working tickets are dimmed
   so your eye goes to what needs you. Linked PRs show a `⇄` flag; validation labels show a
   `⚑` flag.
+- **Blocked tickets** show what's holding them up: a red `⛔ ZEN-1234, …` note lists the open
+  tickets a Blocked ticket is blocked by (also in the `d` detail view).
+- **Recently-done tickets linger**: a ticket moved to Done stays in the deck for 12h,
+  rendered struck-through and dimmed, then drops off. It doesn't count toward the top-10 focus.
+- **Unblock cascade**: marking a ticket **Done** sends every still-open ticket it was
+  *blocking* to its team's **Triage** state, so newly-unblocked work resurfaces (a Linear
+  write; needs a write-scoped key).
 - **Enter** launches `claude` bound to a deterministic per-ticket session id (resumes if one
   exists), seeding the ticket's identity via `--append-system-prompt` — **no auto-submitted
   prompt and no model turn**: the first token spend is always your first message. Each ticket

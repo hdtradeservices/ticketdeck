@@ -30,17 +30,22 @@ func NewClient(apiKey string) *Client {
 
 // assignedOpenQuery fetches the current viewer's assigned issues, excluding
 // completed/canceled workflow states server-side (BR-2a). Paginated.
+// $since is now − DoneVisibleFor: recently-completed issues (Done in that window)
+// are fetched back in so the deck can show them struck-through. Page size is 50
+// (not 100) to stay under Linear's query-complexity cap now that each node also
+// pulls its blocking relations.
 const assignedOpenQuery = `
-query AssignedOpen($after: String) {
+query AssignedOpen($after: String, $since: DateTimeOrDuration) {
   viewer {
     assignedIssues(
-      first: 100
+      first: 50
       after: $after
       orderBy: updatedAt
       filter: {
         or: [
           { state: { type: { nin: ["completed", "canceled", "duplicate"] } } }
           { state: { name: { eq: "Validate" } } }
+          { and: [ { state: { type: { eq: "completed" } } } { completedAt: { gt: $since } } ] }
         ]
       }
     ) {
@@ -53,11 +58,13 @@ query AssignedOpen($after: String) {
         priorityLabel
         branchName
         url
+        completedAt
         state { name type }
         team { id key name }
         updatedAt
         attachments { nodes { url title subtitle } }
         labels { nodes { name } }
+        inverseRelations { nodes { type issue { identifier state { name type } } } }
       }
       pageInfo { hasNextPage endCursor }
     }
@@ -75,6 +82,7 @@ type issueNode struct {
 	PriorityLabel string `json:"priorityLabel"`
 	BranchName    string `json:"branchName"`
 	URL           string `json:"url"`
+	CompletedAt   string `json:"completedAt"`
 	State         struct {
 		Name string `json:"name"`
 		Type string `json:"type"`
@@ -97,6 +105,18 @@ type issueNode struct {
 			Name string `json:"name"`
 		} `json:"nodes"`
 	} `json:"labels"`
+	InverseRelations struct {
+		Nodes []struct {
+			Type  string `json:"type"`
+			Issue struct {
+				Identifier string `json:"identifier"`
+				State      struct {
+					Name string `json:"name"`
+					Type string `json:"type"`
+				} `json:"state"`
+			} `json:"issue"`
+		} `json:"nodes"`
+	} `json:"inverseRelations"`
 }
 
 // toIssue maps a GraphQL node to the Issue TicketDeck renders.
@@ -116,6 +136,7 @@ func (n issueNode) toIssue() Issue {
 		TeamKey:     n.Team.Key,
 		TeamName:    n.Team.Name,
 		UpdatedAt:   n.UpdatedAt,
+		CompletedAt: parseTS(n.CompletedAt),
 	}
 	for _, a := range n.Attachments.Nodes {
 		if isPRURL(a.URL) {
@@ -125,7 +146,31 @@ func (n issueNode) toIssue() Issue {
 	for _, l := range n.Labels.Nodes {
 		issue.Labels = append(issue.Labels, l.Name)
 	}
+	// inverseRelations of type "blocks": the other issue blocks this one, i.e.
+	// this issue is blocked by it.
+	for _, r := range n.InverseRelations.Nodes {
+		if r.Type == "blocks" {
+			issue.BlockedBy = append(issue.BlockedBy, Relation{
+				Identifier: r.Issue.Identifier,
+				StateName:  r.Issue.State.Name,
+				StateType:  r.Issue.State.Type,
+			})
+		}
+	}
 	return issue
+}
+
+// parseTS parses a Linear RFC3339 timestamp (with fractional seconds), returning
+// the zero time on empty/parse error.
+func parseTS(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 type gqlResponse struct {
@@ -150,8 +195,9 @@ type gqlResponse struct {
 func (c *Client) FetchAssignedOpen(ctx context.Context) ([]Issue, error) {
 	var out []Issue
 	var after string
+	since := time.Now().Add(-DoneVisibleFor).UTC().Format(time.RFC3339)
 	for {
-		resp, err := c.query(ctx, assignedOpenQuery, map[string]any{"after": nullable(after)})
+		resp, err := c.query(ctx, assignedOpenQuery, map[string]any{"after": nullable(after), "since": since})
 		if err != nil {
 			return nil, err
 		}

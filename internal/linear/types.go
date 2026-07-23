@@ -3,7 +3,12 @@ package linear
 import (
 	"sort"
 	"strings"
+	"time"
 )
+
+// DoneVisibleFor is how long a completed ticket stays on the deck (rendered
+// struck-through) after it's finished, so recently-closed work stays in view.
+const DoneVisibleFor = 12 * time.Hour
 
 // isPRURL reports whether a Linear attachment URL points at a code-review PR/MR
 // (GitHub, Bitbucket, or GitLab).
@@ -47,8 +52,49 @@ type Issue struct {
 	TeamKey     string // "ZEN", "SMA", "DOPS"
 	TeamName    string
 	UpdatedAt   string
-	PRs         []PR     // linked pull/merge requests (from Linear attachments)
-	Labels      []string // issue label names (e.g. "validation-inconclusive")
+	PRs         []PR       // linked pull/merge requests (from Linear attachments)
+	Labels      []string   // issue label names (e.g. "validation-inconclusive")
+	CompletedAt time.Time  // when a completed-type issue was finished (zero if not)
+	BlockedBy   []Relation // issues blocking this one (inverseRelations, type "blocks")
+}
+
+// Relation is a linked issue (a "blocks" dependency in either direction). ID and
+// TeamID are populated only where a downstream write needs them (the dependents
+// fetched for the unblock-cascade); the blocked-by note needs just Identifier +
+// state.
+type Relation struct {
+	ID         string
+	Identifier string
+	TeamID     string
+	StateName  string
+	StateType  string
+}
+
+// blockingDone reports whether a related issue is itself finished (so it no
+// longer blocks / no longer needs re-triage).
+func (r Relation) blockingDone() bool {
+	return r.StateType == "completed" || r.StateType == "canceled"
+}
+
+// IsDone reports whether the issue is in a completed-type workflow state.
+func (is Issue) IsDone() bool { return is.StateType == "completed" }
+
+// RecentlyDone reports whether a completed issue finished within DoneVisibleFor
+// of now — the window it stays visible (struck-through) on the deck.
+func (is Issue) RecentlyDone(now time.Time) bool {
+	return is.IsDone() && !is.CompletedAt.IsZero() && now.Sub(is.CompletedAt) < DoneVisibleFor
+}
+
+// OpenBlockers returns the issues blocking this one that aren't themselves
+// done/cancelled — the ones still actually holding it up.
+func (is Issue) OpenBlockers() []Relation {
+	var out []Relation
+	for _, r := range is.BlockedBy {
+		if !r.blockingDone() {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // PR is a pull/merge request linked to an issue via a Linear attachment.
@@ -98,9 +144,14 @@ func ShownStateNameList() []string {
 }
 
 // IsHidden reports whether an issue should be filtered from the view (BR-2a).
-// A state name in shownStateNames overrides the type hide (e.g. Validate).
+// A state name in shownStateNames overrides the type hide (e.g. Validate); a
+// completed ticket also stays visible for DoneVisibleFor after it's done (shown
+// struck-through) so recently-closed work lingers in the deck.
 func IsHidden(is Issue) bool {
 	if shownStateNames[strings.ToLower(is.StateName)] {
+		return false
+	}
+	if is.RecentlyDone(time.Now()) {
 		return false
 	}
 	return hiddenStateTypes[is.StateType]

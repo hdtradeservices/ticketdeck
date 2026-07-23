@@ -66,6 +66,9 @@ type Fetcher interface {
 type statusWriter interface {
 	MoveState(ctx context.Context, issue linear.Issue, target string) error
 	SetPriority(ctx context.Context, issue linear.Issue, priority int) error
+	// UnblockToTriage moves the tickets `issue` was blocking to their team's
+	// Triage state (the unblock cascade on Done), returning those moved.
+	UnblockToTriage(ctx context.Context, issue linear.Issue) ([]string, error)
 }
 
 // assigner is the optional write capability to change an issue's assignee. Live
@@ -145,6 +148,14 @@ type statusWriteMsg struct {
 	key    string
 	target string
 	err    error
+}
+
+// triageCascadeMsg reports the result of the unblock cascade after a ticket is
+// marked Done (the tickets it was blocking, moved to Triage).
+type triageCascadeMsg struct {
+	key   string
+	moved []string
+	err   error
 }
 
 // priorityWriteMsg is the result of a SetPriority write.
@@ -461,7 +472,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return detachedDoneMsg{action: "closed " + key, err: err, output: strings.TrimSpace(out)}
 			})
 		}
+		// Unblock cascade: finishing a ticket sends the tickets it was blocking to
+		// Triage so they get picked back up.
+		if msg.target == "Done" && m.writer != nil {
+			if is, ok := m.issueByKey(msg.key); ok {
+				w := m.writer
+				cmds = append(cmds, func() tea.Msg {
+					ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+					defer cancel()
+					moved, err := w.UnblockToTriage(ctx, is)
+					return triageCascadeMsg{key: msg.key, moved: moved, err: err}
+				})
+			}
+		}
 		return m, tea.Batch(cmds...)
+
+	case triageCascadeMsg:
+		if msg.err != nil {
+			debugLog.Printf("unblock cascade %s: moved %v err %v", msg.key, msg.moved, msg.err)
+		}
+		switch {
+		case len(msg.moved) > 0:
+			m.notice = fmt.Sprintf("%s done · → Triage: %s", msg.key, strings.Join(msg.moved, ", "))
+		case msg.err != nil:
+			m.err = fmt.Errorf("triage cascade for %s: %v", msg.key, msg.err)
+		}
+		if len(msg.moved) > 0 {
+			return m, tea.Batch(m.refresh(), m.refreshStatuses())
+		}
+		return m, nil
 
 	case priorityWriteMsg:
 		if msg.err != nil {
@@ -1013,6 +1052,16 @@ func firstLine(s string) string {
 	return s
 }
 
+// issueByKey finds a fetched issue by its identifier (the list is small).
+func (m Model) issueByKey(key string) (linear.Issue, bool) {
+	for _, is := range m.allIssues {
+		if is.Identifier == key {
+			return is, true
+		}
+	}
+	return linear.Issue{}, false
+}
+
 func toTicket(is linear.Issue) session.Ticket {
 	return session.Ticket{
 		Key:       is.Identifier,
@@ -1099,7 +1148,12 @@ func (m *Model) reconcileCollapse() {
 	n := 0
 	for _, g := range groups {
 		for _, sb := range g.Statuses {
-			for range sb.Issues {
+			for _, is := range sb.Issues {
+				// Recently-done tickets linger for visibility but shouldn't consume
+				// focus slots or hold a section open on their own.
+				if is.IsDone() {
+					continue
+				}
 				if n < topFocus {
 					inFocus[g.PrioLabel] = true
 				}
@@ -1393,6 +1447,10 @@ var (
 	sectionStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("245"))
 	// working tickets recede: uniform faint gray so attention goes elsewhere.
 	workingRowStyle = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("240"))
+	// recently-done tickets linger struck-through, dimmer still.
+	doneRowStyle = lipgloss.NewStyle().Faint(true).Strikethrough(true).Foreground(lipgloss.Color("240"))
+	// blocked-by note (why a Blocked ticket is stuck).
+	blockedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 )
 
 // prioColor maps a priority label to a scannable color: red→amber→yellow→blue,
@@ -1644,13 +1702,17 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 	id := fmt.Sprintf("%-9s", is.Identifier)
 	prG, prC := prMark(is.PRs)
 	tagText, tagColor := validationTag(is.Labels)
+	note := blockedNote(is) // "⛔ ZEN-1, ZEN-2" on a Blocked ticket, else ""
 
 	// Truncate the title to what's left after the fixed columns:
 	// indent(2) + badge + space + id(9) + space + prmark(1) + space, minus the
-	// trailing validation tag (with its leading space) when present.
+	// trailing validation tag and blocked-by note (each with a leading space).
 	avail := m.rowWidth() - (2 + sessionCol + 1 + 9 + 1 + 1 + 1)
 	if tagText != "" {
 		avail -= len([]rune(tagText)) + 1
+	}
+	if note != "" {
+		avail -= len([]rune(note)) + 1
 	}
 	if avail < 12 {
 		avail = 12
@@ -1666,21 +1728,64 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 		if tagText != "" {
 			content += " " + tagText
 		}
-		return selStyle.Width(m.rowWidth()).Render(content)
+		if note != "" {
+			content += " " + note
+		}
+		style := selStyle
+		if is.IsDone() {
+			style = style.Strikethrough(true)
+		}
+		return style.Width(m.rowWidth()).Render(content)
 	}
 	tag := ""
 	if tagText != "" {
 		tag = " " + lipgloss.NewStyle().Foreground(tagColor).Render(tagText)
 	}
+	noteR := ""
+	if note != "" {
+		noteR = " " + blockedStyle.Render(note)
+	}
+	// Recently-done tickets linger struck-through so finished work stays visible
+	// for a while without drawing the eye.
+	if is.IsDone() {
+		return doneRowStyle.Render(fmt.Sprintf("  %s %s %s %s", cell, id, prG, title)) + tag
+	}
 	// Working tickets are already being handled — de-emphasize the whole row
 	// (uniform dim, no cyan id / bright title) so the eye is drawn to the
 	// tickets that still need attention.
 	if st == session.Working {
-		return workingRowStyle.Render(fmt.Sprintf("  %s %s %s %s", cell, id, prG, title)) + tag
+		return workingRowStyle.Render(fmt.Sprintf("  %s %s %s %s", cell, id, prG, title)) + tag + noteR
 	}
 	badge := lipgloss.NewStyle().Foreground(color).Render(cell)
 	pr := lipgloss.NewStyle().Foreground(prC).Render(prG)
-	return fmt.Sprintf("  %s %s %s %s", badge, idStyle.Render(id), pr, title) + tag
+	return fmt.Sprintf("  %s %s %s %s", badge, idStyle.Render(id), pr, title) + tag + noteR
+}
+
+// blockedNote returns a compact "⛔ blocker keys" note for a Blocked ticket that
+// has open blockers (up to 3 keys, then "+N"), else "". This is the display of
+// "which tickets it's blocked by".
+func blockedNote(is linear.Issue) string {
+	if !strings.EqualFold(is.StateName, "Blocked") {
+		return ""
+	}
+	blockers := is.OpenBlockers()
+	if len(blockers) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(blockers))
+	for _, b := range blockers {
+		keys = append(keys, b.Identifier)
+	}
+	extra := 0
+	if len(keys) > 3 {
+		extra = len(keys) - 3
+		keys = keys[:3]
+	}
+	note := "⛔ " + strings.Join(keys, ", ")
+	if extra > 0 {
+		note += fmt.Sprintf(" +%d", extra)
+	}
+	return note
 }
 
 // validationTag returns a compact flag + color for a ticket carrying a
@@ -1914,6 +2019,13 @@ func (m Model) renderDetail() string {
 	fmt.Fprintf(&b, "%s\n", sess)
 	if tagText, tagColor := validationTag(is.Labels); tagText != "" {
 		fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(tagColor).Render(tagText))
+	}
+	if blockers := is.OpenBlockers(); len(blockers) > 0 {
+		keys := make([]string, 0, len(blockers))
+		for _, r := range blockers {
+			keys = append(keys, r.Identifier)
+		}
+		fmt.Fprintf(&b, "%s\n", blockedStyle.Render("⛔ blocked by "+strings.Join(keys, ", ")))
 	}
 	if is.URL != "" {
 		fmt.Fprintf(&b, "%s\n", dimStyle.Render(is.URL))

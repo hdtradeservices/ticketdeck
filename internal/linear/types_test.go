@@ -1,6 +1,9 @@
 package linear
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestIsHiddenExcludesDoneCancelledDuplicate(t *testing.T) {
 	cases := []struct {
@@ -129,5 +132,37 @@ func TestSplitKey(t *testing.T) {
 		if _, _, err := splitKey(bad); err == nil {
 			t.Errorf("splitKey(%q) should error", bad)
 		}
+	}
+}
+
+func TestRecentlyDoneAndHidden(t *testing.T) {
+	now := time.Now()
+	recent := Issue{StateName: "Done", StateType: "completed", CompletedAt: now.Add(-2 * time.Hour)}
+	old := Issue{StateName: "Done", StateType: "completed", CompletedAt: now.Add(-13 * time.Hour)}
+	nots := Issue{StateName: "Done", StateType: "completed"} // no timestamp
+	if !recent.RecentlyDone(now) {
+		t.Error("2h-old Done should be recently done")
+	}
+	if old.RecentlyDone(now) {
+		t.Error("13h-old Done should not be recently done")
+	}
+	if IsHidden(recent) {
+		t.Error("recently-done should stay visible")
+	}
+	if !IsHidden(old) || !IsHidden(nots) {
+		t.Error("old / timestamp-less Done should be hidden")
+	}
+}
+
+func TestOpenBlockers(t *testing.T) {
+	is := Issue{BlockedBy: []Relation{
+		{Identifier: "ZEN-1", StateType: "started"},
+		{Identifier: "ZEN-2", StateType: "completed"}, // done → not blocking
+		{Identifier: "ZEN-3", StateType: "canceled"},  // cancelled → not blocking
+		{Identifier: "ZEN-4", StateType: "unstarted"},
+	}}
+	open := is.OpenBlockers()
+	if len(open) != 2 || open[0].Identifier != "ZEN-1" || open[1].Identifier != "ZEN-4" {
+		t.Errorf("OpenBlockers = %+v, want ZEN-1, ZEN-4", open)
 	}
 }

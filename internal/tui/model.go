@@ -1744,7 +1744,7 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 			content += " " + note
 		}
 		style := selStyle
-		if is.IsDone() {
+		if is.IsDone() && !is.IsValidate() {
 			style = style.Strikethrough(true)
 		}
 		return style.Width(m.rowWidth()).Render(content)
@@ -1758,9 +1758,19 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 		noteR = " " + blockedStyle.Render(note)
 	}
 	// Recently-done tickets linger struck-through so finished work stays visible
-	// for a while without drawing the eye.
-	if is.IsDone() {
-		return doneRowStyle.Render(fmt.Sprintf("  %s %s %s %s", cell, id, prG, title)) + tag
+	// for a while without drawing the eye. Strike only the text tokens, not the
+	// column gaps or id padding, so the strikethrough tracks the words. Validate
+	// is a completed-type state but an active gate, so it's exempt.
+	if is.IsDone() && !is.IsValidate() {
+		strike := doneRowStyle
+		gap := doneRowStyle.Strikethrough(false)
+		idText := strings.TrimRight(id, " ")
+		idPad := id[len(idText):]
+		row := "  " + strike.Render(cell) + gap.Render(" ") +
+			strike.Render(idText) + gap.Render(idPad+" ") +
+			strike.Render(prG) + gap.Render(" ") +
+			strike.Render(title)
+		return row + tag
 	}
 	// Working tickets are already being handled — de-emphasize the whole row
 	// (uniform dim, no cyan id / bright title) so the eye is drawn to the

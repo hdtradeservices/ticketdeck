@@ -79,6 +79,11 @@ func (r Relation) blockingDone() bool {
 // IsDone reports whether the issue is in a completed-type workflow state.
 func (is Issue) IsDone() bool { return is.StateType == "completed" }
 
+// IsValidate reports whether the issue sits in the Validate gate — a
+// completed-type state that stays active on the deck rather than reading as
+// finished work.
+func (is Issue) IsValidate() bool { return strings.EqualFold(is.StateName, "Validate") }
+
 // RecentlyDone reports whether a completed issue finished within DoneVisibleFor
 // of now — the window it stays visible (struck-through) on the deck.
 func (is Issue) RecentlyDone(now time.Time) bool {
@@ -206,6 +211,25 @@ type StatusBucket struct {
 	Issues []Issue
 }
 
+// statusOrder is the fixed display order of status buckets within a priority
+// group. Unlisted statuses sort after these (then alphabetically), except Done
+// which always sorts last.
+var statusOrder = []string{"Validate", "In Review", "Planned", "Triage", "Blocked"}
+
+// statusRank returns the sort key for a status name (case-insensitive); lower
+// sorts first. Done is pinned last so finished work sinks to the bottom.
+func statusRank(name string) int {
+	for i, s := range statusOrder {
+		if strings.EqualFold(name, s) {
+			return i
+		}
+	}
+	if strings.EqualFold(name, "Done") {
+		return len(statusOrder) + 1
+	}
+	return len(statusOrder) // unlisted, non-Done: between the known set and Done
+}
+
 // GroupByPriorityThenStatus implements BR-2a: primary grouping by priority
 // (Urgent first, No priority last), secondary by status within each priority.
 // Issues within a status bucket are ordered by most-recently-updated.
@@ -232,7 +256,13 @@ func GroupByPriorityThenStatus(issues []Issue) []Group {
 		for s := range byStatus {
 			statuses = append(statuses, s)
 		}
-		sort.Strings(statuses)
+		sort.Slice(statuses, func(i, j int) bool {
+			ri, rj := statusRank(statuses[i]), statusRank(statuses[j])
+			if ri != rj {
+				return ri < rj
+			}
+			return statuses[i] < statuses[j]
+		})
 
 		buckets := make([]StatusBucket, 0, len(statuses))
 		for _, s := range statuses {

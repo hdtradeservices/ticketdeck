@@ -7,6 +7,34 @@ import (
 	"testing"
 )
 
+func TestConfigDir(t *testing.T) {
+	orig, had := os.LookupEnv("CLAUDE_CONFIG_DIR")
+	t.Cleanup(func() {
+		if had {
+			os.Setenv("CLAUDE_CONFIG_DIR", orig)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	})
+
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	home, _ := os.UserHomeDir()
+	if got, want := ConfigDir(), filepath.Join(home, ".claude"); got != want {
+		t.Errorf("default ConfigDir() = %q, want %q", got, want)
+	}
+
+	os.Setenv("CLAUDE_CONFIG_DIR", "/home/x/.claude-support")
+	if got := ConfigDir(); got != "/home/x/.claude-support" {
+		t.Errorf("env ConfigDir() = %q, want /home/x/.claude-support", got)
+	}
+
+	// A path-list uses the first entry (where Claude writes state).
+	os.Setenv("CLAUDE_CONFIG_DIR", "/first"+string(os.PathListSeparator)+"/second")
+	if got := ConfigDir(); got != "/first" {
+		t.Errorf("path-list ConfigDir() = %q, want /first", got)
+	}
+}
+
 // realAgentsJSON mirrors the actual `claude agents --json --all` output shape.
 const realAgentsJSON = `[
   {"cwd":"/home/matthew/Repos/etp","kind":"background","startedAt":1783023170498,"sessionId":"37f1ce39-2f45-4417-bfe9-6df85c35d7ca","name":"headphone jack","state":"done"},

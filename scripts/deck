@@ -6,10 +6,65 @@
 # is kept at tab #1 so "Ctrl+b 1" always jumps back to the ticket list.
 # Detaching/quitting herdr leaves the server + ticket sessions running.
 #
+# Usage:
+#   deck                     # default Claude subscription (~/.claude)
+#   deck --account support   # run as a second subscription (~/.claude-support)
+#
 # Env:
 #   TICKETDECK_ROOT   default working dir for new ticket sessions (default ~/Repos)
 #   LINEAR_API_KEY    required by ticketdeck (export in your shell rc)
 set -euo pipefail
+
+# ── account selection ────────────────────────────────────────────────────────
+# --account NAME runs the deck as a second Claude subscription. Each account has
+# its own Claude config dir (~/.claude-NAME, where that subscription's
+# credentials live) and a FULLY ISOLATED herdr workspace (own server socket +
+# session.json), so its ticket sessions burn that subscription's rate limits and
+# never collide with the default deck. Both decks show the SAME Linear tickets
+# (the Linear key is shared) — only which Claude account runs the sessions
+# differs. Switching accounts is just: detach one (Ctrl+b q), run the other
+# launcher; background sessions in each keep running untouched.
+ACCOUNT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --account) ACCOUNT="${2:-}"; shift 2 ;;
+    --account=*) ACCOUNT="${1#*=}"; shift ;;
+    -a) ACCOUNT="${2:-}"; shift 2 ;;
+    -h|--help) echo "usage: deck [--account NAME]"; exit 0 ;;
+    *) echo "deck: unknown argument: $1 (usage: deck [--account NAME])" >&2; exit 2 ;;
+  esac
+done
+
+if [ -n "$ACCOUNT" ]; then
+  CLAUDE_CONFIG_DIR="$HOME/.claude-$ACCOUNT"
+  [ -d "$CLAUDE_CONFIG_DIR" ] || {
+    echo "deck: no Claude config dir for account '$ACCOUNT' at $CLAUDE_CONFIG_DIR" >&2
+    echo "      log in there first:  CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR claude /login" >&2
+    exit 1
+  }
+  export CLAUDE_CONFIG_DIR
+  export TICKETDECK_ACCOUNT="$ACCOUNT"
+
+  # Isolated herdr workspace via an overlay XDG_CONFIG_HOME: symlink every real
+  # ~/.config entry through — so gh/gcloud/git auth stays SHARED — but keep a
+  # private, real herdr/ dir so this account's session.json + socket don't
+  # collide with the default deck. herdr's config.toml symlinks back to the
+  # shared one, so keybinds (incl. Ctrl+b i) are identical. Rebuilt each launch
+  # to pick up any newly-added ~/.config entries.
+  OVERLAY="$HOME/.config-$ACCOUNT"
+  mkdir -p "$OVERLAY/herdr"
+  find "$OVERLAY" -maxdepth 1 -type l -delete 2>/dev/null || true
+  for e in "$HOME/.config"/* "$HOME/.config"/.[!.]*; do
+    [ -e "$e" ] || continue
+    b="$(basename "$e")"
+    [ "$b" = herdr ] && continue
+    ln -sfn "$e" "$OVERLAY/$b"
+  done
+  [ -f "$HOME/.config/herdr/config.toml" ] && ln -sfn "$HOME/.config/herdr/config.toml" "$OVERLAY/herdr/config.toml"
+  export XDG_CONFIG_HOME="$OVERLAY"
+  export HERDR_SOCKET_PATH="$OVERLAY/herdr/herdr.sock"
+  export HERDR_CLIENT_SOCKET_PATH="$OVERLAY/herdr/herdr-client.sock"
+fi
 
 LAUNCH_ROOT="${TICKETDECK_ROOT:-$HOME/Repos}"
 SESSION_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/herdr/session.json"

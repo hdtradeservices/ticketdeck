@@ -157,6 +157,36 @@ deck() {
 }
 ```
 
+### Multiple Claude subscriptions (accounts)
+
+If you have more than one Claude Code subscription — each logged into its own
+config dir (`~/.claude` for the default, `~/.claude-<name>` for others, e.g.
+`~/.claude-support`) — run a separate, fully isolated deck per account:
+
+```sh
+deck                     # default subscription (~/.claude)
+deck --account support   # the 'support' subscription (~/.claude-support)
+```
+
+Each account gets its **own herdr workspace** (separate server socket +
+`session.json`), so its ticket sessions burn *that* subscription's rate limits
+and never collide with the default deck. Both decks show the **same Linear
+tickets** (the Linear key is shared) — only which Claude subscription runs the
+sessions differs. The title bar shows a `⦿ <name>` badge and the usage bar
+reflects that account, so you always know whose limits you're spending.
+
+- **Switching is non-destructive.** Detach one deck (`Ctrl+b q`) and launch the
+  other; every background session in each workspace keeps running untouched. A
+  session you started on `matt` finishes its work whether or not you're looking
+  at it — attach the matt deck again later and it's right there.
+- **Tool auth is shared.** The isolated workspace is an overlay of your real
+  `~/.config` (symlinked through), so `gh`, `gcloud`, `git`, etc. use the same
+  credentials in both decks; only Claude's own config dir differs.
+- **First-time setup for an account:** log in to its config dir once —
+  `CLAUDE_CONFIG_DIR=~/.claude-support claude /login` — then `deck --account
+  support` works. (`ticketdeck --account support` does the same for the
+  standalone, non-herdr path.)
+
 ## Modes / flags
 
 ```sh
@@ -167,6 +197,7 @@ ticketdeck --dry-launch            # Enter prints the launch command instead of 
 ticketdeck --demo                  # canned data, no Linear key
 ticketdeck --demo --preview        # one styled frame, then exit
 ticketdeck --root <dir>            # override where new sessions launch
+ticketdeck --account <name>        # run as the ~/.claude-<name> subscription (see "Multiple Claude subscriptions")
 ```
 
 Keys: `↑/↓` move · `PgUp/PgDn` page · `g`/`G` top/bottom · `enter` open · `r` refresh · `q` quit.

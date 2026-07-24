@@ -305,14 +305,32 @@ func MarkResumable(res map[string]Status, cwd string) {
 	}
 }
 
+// ConfigDir returns Claude Code's config directory — the first entry of
+// $CLAUDE_CONFIG_DIR if set (this is how a per-subscription "account" is
+// selected: matt = ~/.claude, support = ~/.claude-support, …), else ~/.claude.
+// Transcripts and credentials live under it, so TicketDeck must resolve it the
+// same way Claude Code does to stay correct across accounts.
+func ConfigDir() string {
+	if d := os.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
+		// CLAUDE_CONFIG_DIR may be a path-list; the first is where state lives.
+		if i := strings.IndexByte(d, byte(os.PathListSeparator)); i >= 0 {
+			d = d[:i]
+		}
+		if d != "" {
+			return d
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".claude")
+}
+
 // TranscriptPath is where claude stores a session's transcript for a given cwd.
 // The project slug is the cwd with every non-alphanumeric rune replaced by '-'.
 func TranscriptPath(id, cwd string) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = ""
-	}
-	return filepath.Join(home, ".claude", "projects", projectSlug(cwd), id+".jsonl")
+	return filepath.Join(ConfigDir(), "projects", projectSlug(cwd), id+".jsonl")
 }
 
 func projectSlug(p string) string {

@@ -15,6 +15,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/hdtradeservices/ticketdeck/internal/session"
 )
 
 const usageURL = "https://api.anthropic.com/api/oauth/usage"
@@ -89,11 +91,9 @@ func oauthToken() (string, error) {
 	if t := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"); t != "" {
 		return t, nil
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	b, err := os.ReadFile(filepath.Join(home, ".claude", ".credentials.json"))
+	// Read the credentials of the active account's config dir, so the usage bar
+	// reflects whichever subscription this deck is running as (CLAUDE_CONFIG_DIR).
+	b, err := os.ReadFile(filepath.Join(session.ConfigDir(), ".credentials.json"))
 	if err != nil {
 		return "", err
 	}

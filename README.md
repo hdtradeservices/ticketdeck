@@ -99,6 +99,13 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   rendered description, resolved from whichever ticket pane you invoked it in (so you don't have
   to jump back to the deck). It's a read-only Linear fetch — no model turn. The deck's own `d`
   overlay shows the same for the cursor ticket.
+- **Multiple Claude subscriptions** — if you have more than one Claude account
+  (each in its own config dir), run an isolated deck per subscription:
+  `deck --account support` uses `~/.claude-support`, gets its own herdr workspace
+  (own server + tabs), and shows a `⦿ support` badge with that account's usage
+  bar. Both decks show the same Linear tickets; switching is just detach + launch
+  the other, and background sessions keep running. Tool auth (`gh`/`gcloud`/…) is
+  shared. See [`SETUP.md`](SETUP.md#multiple-claude-subscriptions-accounts).
 - **Claude usage** — the title bar shows your Claude 5-hour and 7-day rate-limit
   utilization (`◷ 5h 52% · 7d 42%`), color-coded, with a rough reset countdown. Same source
   as Claude Code's status line (the OAuth usage endpoint); it's a metadata read, so it does

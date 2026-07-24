@@ -1552,7 +1552,7 @@ func (m Model) View() string {
 	if m.updateLatest != "" {
 		upd = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(fmt.Sprintf("  ⬆ %s available · ticketdeck update", m.updateLatest))
 	}
-	fmt.Fprintf(&b, "%s%s%s%s\n", titleStyle.Render("TicketDeck"), dimStyle.Render(m.titleMeta()), m.quotaSegment(), upd)
+	fmt.Fprintf(&b, "%s%s%s%s%s\n", titleStyle.Render("TicketDeck"), m.accountSegment(), dimStyle.Render(m.titleMeta()), m.quotaSegment(), upd)
 
 	if m.loading && len(m.rows) == 0 {
 		fmt.Fprint(&b, dimStyle.Render("\n  loading tickets…\n"))
@@ -1604,6 +1604,18 @@ func (m Model) window() (int, int) {
 		end = len(m.rows)
 	}
 	return start, end
+}
+
+// accountSegment shows which Claude subscription this deck runs as, when
+// TICKETDECK_ACCOUNT is set (the `deck --account NAME` launcher exports it).
+// It keeps two decks visually distinct so you know whose limits you're spending;
+// blank for the default account.
+func (m Model) accountSegment() string {
+	acct := os.Getenv("TICKETDECK_ACCOUNT")
+	if acct == "" {
+		return ""
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true).Render("  ⦿ " + acct)
 }
 
 // quotaSegment renders the Claude 5h/7d usage limits for the title bar,

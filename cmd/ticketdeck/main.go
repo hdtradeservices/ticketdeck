@@ -52,7 +52,22 @@ func main() {
 	dryLaunch := flag.Bool("dry-launch", false, "on enter, print the launch command instead of running it")
 	backendName := flag.String("backend", "auto", "launch backend: claude | herdr | auto (herdr if installed, else claude)")
 	logPath := flag.String("log", "", "debug log file (default ~/.ticketdeck/ticketdeck.log; 'off' disables)")
+	account := flag.String("account", "", "Claude subscription to run as: sets CLAUDE_CONFIG_DIR=~/.claude-<name> (if unset) and shows the name in the title bar")
 	flag.Parse()
+
+	// --account selects which Claude subscription's config dir this process (and
+	// the sessions it launches) uses. The `deck --account` launcher already
+	// exports the env for the herdr flow; this makes the standalone binary
+	// coherent too. Don't override an already-set CLAUDE_CONFIG_DIR (the launcher
+	// points at the isolated dir; respect it).
+	if *account != "" {
+		os.Setenv("TICKETDECK_ACCOUNT", *account)
+		if os.Getenv("CLAUDE_CONFIG_DIR") == "" {
+			if home, err := os.UserHomeDir(); err == nil {
+				os.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude-"+*account))
+			}
+		}
+	}
 
 	if *showVersion {
 		fmt.Println("ticketdeck", version)

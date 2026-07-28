@@ -60,7 +60,8 @@ ticketdeck --demo --dump        # plain-text grouped list
 | move · page · top/bottom | `↑`/`↓` (`j`/`k`) · `PgUp`/`PgDn` · `g`/`G` (wraps at the ends) |
 | open / attach the ticket's session | `Enter` |
 | description overlay | `d` (in it: `Enter` opens the session · `o` browser · `p` PR) |
-| open ticket / linked PR in browser | `o` / `p` |
+| open ticket in browser | `o` |
+| open linked PR — picker when there are several | `p` (in it: `⏎` open · `1`-`9` open that one · `a` open all) |
 | show the ticket's description **from inside its session** | `Ctrl+b` then `i` (popup) |
 | `/triage` a ticket in the background (starts its session if needed) | `t` |
 | change status (Done/Validate/Monitoring/Blocked/Cancel) | `s` → key → `y` |
@@ -86,6 +87,12 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   `⚑` flag.
 - **Blocked tickets** show what's holding them up: a red `⛔ ZEN-1234, …` note lists the open
   tickets a Blocked ticket is blocked by (also in the `d` detail view).
+- **Multiple PRs per ticket** — a ticket's work usually splits across repos, so `p` opens a
+  picker rather than guessing: each row shows the PR's state, `repo#number`, and title,
+  ordered most-actionable-first (open → draft → merged → closed). `⏎` opens the selected one,
+  `1`-`9` opens that row directly, and **`a` opens all of them** for reviewing the whole
+  change. A single-PR ticket still opens straight away. The row's `⇄` icon carries the count
+  (`⇄3`).
 - **Recently-done tickets linger**: a ticket moved to Done stays in the deck for 12h,
   rendered struck-through and dimmed, then drops off. It doesn't count toward the top-10 focus.
 - **Unblock cascade**: marking a ticket **Done** sends every still-open ticket it was

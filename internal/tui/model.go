@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -205,6 +206,10 @@ type Model struct {
 	assignIssue   linear.Issue        // ticket being reassigned (captured when the picker opens)
 	assignQuery   string              // filter text in the assignee picker
 	assignCursor  int                 // index into the filtered picker options (0 = Unassign)
+	prMenu        bool                // multi-PR picker overlay is open
+	prIssue       linear.Issue        // ticket whose PRs are being picked
+	prList        []linear.PR         // that ticket's PRs, most-actionable-first
+	prCursor      int                 // index into prList
 	users         []linear.User       // cached workspace users for the picker
 	hideOpenHint  bool                // user chose "don't show again" for the open-session hint
 	openHintSpec  *session.LaunchSpec // pending launch awaiting the open-session hint
@@ -553,6 +558,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.assignMenu {
 			return m.updateAssign(msg)
 		}
+		if m.prMenu {
+			return m.updatePR(msg)
+		}
 		if m.openHintSpec != nil {
 			return m.updateOpenHint(msg)
 		}
@@ -827,31 +835,82 @@ func (m Model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, openBrowser(m.detail.URL)
 		}
 	case "p":
-		return m.openPRFor(*m.detail)
+		// Close the description overlay first: with several PRs this opens the
+		// picker, and only one overlay renders at a time.
+		is := *m.detail
+		m.detail = nil
+		return m.openPRFor(is)
 	}
 	return m, nil
 }
 
-// openPRFor opens the ticket's linked PR in the browser (the most actionable
-// one when several are linked), or notes when there is none.
+// openPRFor handles the `p` key for a ticket. A single linked PR opens straight
+// away; several open the picker, since a ticket's PRs usually span different
+// repos and guessing one is as likely to be wrong as right.
 func (m Model) openPRFor(is linear.Issue) (tea.Model, tea.Cmd) {
-	if len(is.PRs) == 0 {
+	switch len(is.PRs) {
+	case 0:
 		m.notice = "no linked PR for " + is.Identifier
 		return m, nil
+	case 1:
+		m.notice = "opened " + is.PRs[0].Label() + " for " + is.Identifier
+		return m, openBrowser(is.PRs[0].URL)
 	}
-	best := pickPRState(is.PRs)
-	pr := is.PRs[0]
-	for _, p := range is.PRs {
-		if p.State == best {
-			pr = p
-			break
+	m.prMenu = true
+	m.prIssue = is
+	m.prList = linear.SortPRs(is.PRs)
+	m.prCursor = 0
+	return m, nil
+}
+
+// updatePR drives the multi-PR picker: move, open one (⏎ or its digit), open
+// every PR at once (a), or back out (esc/q/p).
+func (m Model) updatePR(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch s := msg.String(); s {
+	case "esc", "q", "p", "ctrl+c":
+		m.prMenu = false
+		return m, nil
+	case "up", "k":
+		if m.prCursor > 0 {
+			m.prCursor--
+		}
+	case "down", "j":
+		if m.prCursor < len(m.prList)-1 {
+			m.prCursor++
+		}
+	case "g", "home":
+		m.prCursor = 0
+	case "G", "end":
+		m.prCursor = len(m.prList) - 1
+	case "a":
+		// Open every linked PR — the "review the whole change" case, where a
+		// ticket's work is split across repos.
+		cmds := make([]tea.Cmd, 0, len(m.prList))
+		for _, pr := range m.prList {
+			cmds = append(cmds, openBrowser(pr.URL))
+		}
+		m.prMenu = false
+		m.notice = fmt.Sprintf("opened all %d PRs for %s", len(m.prList), m.prIssue.Identifier)
+		return m, tea.Batch(cmds...)
+	case "enter":
+		return m.openPRAt(m.prCursor)
+	default:
+		// Digit shortcuts: 1-9 open that row directly.
+		if len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
+			return m.openPRAt(int(s[0] - '1'))
 		}
 	}
-	if n := len(is.PRs); n > 1 {
-		m.notice = fmt.Sprintf("opened PR for %s (1 of %d)", is.Identifier, n)
-	} else {
-		m.notice = "opened PR for " + is.Identifier
+	return m, nil
+}
+
+// openPRAt opens the i-th PR in the picker and closes the overlay.
+func (m Model) openPRAt(i int) (tea.Model, tea.Cmd) {
+	if i < 0 || i >= len(m.prList) {
+		return m, nil
 	}
+	pr := m.prList[i]
+	m.prMenu = false
+	m.notice = "opened " + pr.Label() + " for " + m.prIssue.Identifier
 	return m, openBrowser(pr.URL)
 }
 
@@ -1031,10 +1090,14 @@ func (m Model) updateStatus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// browse launches a URL in the default browser (detached). A package var so
+// tests can capture what would be opened instead of spawning a browser.
+var browse = func(url string) error { return exec.Command("xdg-open", url).Start() }
+
 // openBrowser opens a URL in the default browser (detached).
 func openBrowser(url string) tea.Cmd {
 	return func() tea.Msg {
-		_ = exec.Command("xdg-open", url).Start()
+		_ = browse(url)
 		return nil
 	}
 }
@@ -1496,23 +1559,33 @@ func prColor(state string) lipgloss.Color {
 // pickPRState summarizes a set of PRs into the most actionable state for the
 // row icon: an open PR outranks a draft, then merged, then closed.
 func pickPRState(prs []linear.PR) string {
-	rank := map[string]int{"open": 4, "draft": 3, "merged": 2, "closed": 1, "": 0}
 	best := ""
 	for _, p := range prs {
-		if rank[p.State] > rank[best] {
+		if linear.PRRank(p.State) > linear.PRRank(best) {
 			best = p.State
 		}
 	}
 	return best
 }
 
-// prMark returns the 1-column PR indicator glyph and its color, or a blank when
-// there is no linked PR (kept 1 col wide so issue rows stay aligned).
+// prMarkCol is the width of the PR indicator column: the glyph plus a count
+// digit for multi-PR tickets. Fixed so every issue row stays aligned.
+const prMarkCol = 2
+
+// prMark returns the PR indicator and its color: blank for no PR, "⇄ " for one,
+// and "⇄2"/"⇄3"/… for a ticket with several (so a multi-PR ticket is visible on
+// the row, where `p` opens the picker). "⇄+" past 9 keeps the column 2 wide.
 func prMark(prs []linear.PR) (glyph string, color lipgloss.Color) {
-	if len(prs) == 0 {
-		return " ", lipgloss.Color("240")
+	switch n := len(prs); {
+	case n == 0:
+		return "  ", lipgloss.Color("240")
+	case n == 1:
+		return "⇄ ", prColor(pickPRState(prs))
+	case n < 10:
+		return "⇄" + strconv.Itoa(n), prColor(pickPRState(prs))
+	default:
+		return "⇄+", prColor(pickPRState(prs))
 	}
-	return "⇄", prColor(pickPRState(prs))
 }
 
 // renderPrio draws a priority header, color-coded by priority, always showing
@@ -1542,6 +1615,9 @@ func (m Model) View() string {
 	}
 	if m.assignMenu {
 		return m.renderAssign()
+	}
+	if m.prMenu {
+		return m.renderPRPicker()
 	}
 	if m.openHintSpec != nil {
 		return m.renderOpenHint()
@@ -1717,9 +1793,9 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 	note := blockedNote(is) // "⛔ ZEN-1, ZEN-2" on a Blocked ticket, else ""
 
 	// Truncate the title to what's left after the fixed columns:
-	// indent(2) + badge + space + id(9) + space + prmark(1) + space, minus the
+	// indent(2) + badge + space + id(9) + space + prmark(2) + space, minus the
 	// trailing validation tag and blocked-by note (each with a leading space).
-	avail := m.rowWidth() - (2 + sessionCol + 1 + 9 + 1 + 1 + 1)
+	avail := m.rowWidth() - (2 + sessionCol + 1 + 9 + 1 + prMarkCol + 1)
 	if tagText != "" {
 		avail -= len([]rune(tagText)) + 1
 	}
@@ -2003,6 +2079,60 @@ func (m Model) renderAssign() string {
 	return b.String()
 }
 
+// renderPRPicker draws the multi-PR picker: one row per linked PR, ordered
+// most-actionable-first, each showing its state, repo#number, and title.
+func (m Model) renderPRPicker() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s%s\n", titleStyle.Render("Pull requests"), idStyle.Render(m.prIssue.Identifier), dimStyle.Render("  "+m.prIssue.Title))
+	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render("↑/↓ select · ⏎ open · 1-9 open that one · a open all · esc cancel"))
+
+	// Fixed columns so the titles line up: state ("merged" is widest) and
+	// repo#number, sized to the widest label in this ticket's set.
+	const stateCol = 6
+	labelCol := 0
+	for _, pr := range m.prList {
+		if n := len([]rune(pr.Label())); n > labelCol {
+			labelCol = n
+		}
+	}
+	for i, pr := range m.prList {
+		num := " "
+		if i < 9 {
+			num = strconv.Itoa(i + 1)
+		}
+		state := pr.State
+		if state == "" {
+			state = "?"
+		}
+		label := pr.Label()
+		title := pr.Title
+		if title == "" {
+			title = pr.URL
+		}
+		// Trim the title to the space left after the fixed columns:
+		// indent(2) + digit(1) + space + "⇄ " + state + space + label + 2 gap.
+		avail := m.width - (2 + 1 + 1 + 2 + stateCol + 1 + labelCol + 2)
+		if m.width <= 0 || avail < 12 {
+			avail = 12
+		}
+		if len([]rune(title)) > avail {
+			title = string([]rune(title)[:avail-1]) + "…"
+		}
+
+		if i == m.prCursor {
+			content := fmt.Sprintf("▶ %s ⇄ %-*s %-*s  %s", num, stateCol, state, labelCol, label, title)
+			fmt.Fprintf(&b, "%s\n", selStyle.Width(m.rowWidth()).Render(content))
+			continue
+		}
+		fmt.Fprintf(&b, "  %s %s %-*s  %s\n",
+			dimStyle.Render(num),
+			lipgloss.NewStyle().Foreground(prColor(pr.State)).Render(fmt.Sprintf("⇄ %-*s", stateCol, state)),
+			labelCol, label,
+			dimStyle.Render(title))
+	}
+	return b.String()
+}
+
 func (m Model) renderDetail() string {
 	is := m.detail
 	var b strings.Builder
@@ -2052,17 +2182,27 @@ func (m Model) renderDetail() string {
 	if is.URL != "" {
 		fmt.Fprintf(&b, "%s\n", dimStyle.Render(is.URL))
 	}
-	for _, pr := range is.PRs {
-		label := pr.State
-		if label == "" {
-			label = "PR"
+	prs := linear.SortPRs(is.PRs)
+	labelCol := 0
+	for _, pr := range prs {
+		if n := len([]rune(pr.Label())); n > labelCol {
+			labelCol = n
 		}
-		icon := lipgloss.NewStyle().Foreground(prColor(pr.State)).Render("⇄ " + label)
+	}
+	for _, pr := range prs {
+		state := pr.State
+		if state == "" {
+			state = "PR"
+		}
+		icon := lipgloss.NewStyle().Foreground(prColor(pr.State)).Render(fmt.Sprintf("⇄ %-6s", state))
 		title := pr.Title
 		if title == "" {
 			title = pr.URL
 		}
-		fmt.Fprintf(&b, "%s %s\n", icon, dimStyle.Render(title))
+		fmt.Fprintf(&b, "%s %-*s %s\n", icon, labelCol, pr.Label(), dimStyle.Render(title))
+	}
+	if len(is.PRs) > 1 {
+		fmt.Fprintf(&b, "%s\n", dimStyle.Render(fmt.Sprintf("  p → pick one of %d PRs", len(is.PRs))))
 	}
 	fmt.Fprint(&b, "\n")
 
@@ -2144,7 +2284,13 @@ func (m Model) footer() string {
 	if m.assigner != nil {
 		statusHint += "a assign · "
 	}
-	help := dimStyle.Render(fmt.Sprintf("↑↓ move · ⏎ open · d desc · o web · p PR · t %s · %sn new · ␣/←→ fold · r refresh · %s · synced %s", triageCmd, statusHint, quitHint, sync))
+	// Advertise the count when the cursor ticket has several PRs, so it's clear
+	// `p` opens a picker rather than one guessed link.
+	prHint := "p PR"
+	if is, ok := m.selected(); ok && len(is.PRs) > 1 {
+		prHint = fmt.Sprintf("p PRs (%d)", len(is.PRs))
+	}
+	help := dimStyle.Render(fmt.Sprintf("↑↓ move · ⏎ open · d desc · o web · %s · t %s · %sn new · ␣/←→ fold · r refresh · %s · synced %s", prHint, triageCmd, statusHint, quitHint, sync))
 	var status string
 	switch {
 	case m.err != nil:

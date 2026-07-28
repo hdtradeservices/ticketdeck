@@ -18,7 +18,13 @@ func (demoFetcher) FetchAssignedOpen(context.Context) ([]linear.Issue, error) {
 		{Identifier: "DEMO-102", Title: "[Bug] Webhook retries dead-letter on 400 from provider", Priority: 2, PrioLabel: "High", StateName: "In Review", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T17:50:37Z", PRs: []linear.PR{{URL: "https://github.com/acme/widgets/pull/241", Title: "fix: tolerate provider 400 in webhook retrier", State: "open"}}},
 		{Identifier: "DEMO-103", Title: "[Bug] Order create times out (>60s) under load", Priority: 2, PrioLabel: "High", StateName: "Planned", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T16:26:28Z", Labels: []string{"Bug", "validation-inconclusive"}},
 		{Identifier: "DEMO-104", Title: "Add import mapping for the new product type", Priority: 2, PrioLabel: "High", StateName: "Todo", StateType: "unstarted", TeamKey: "DEMO", UpdatedAt: "2026-07-16T18:22:58Z"},
-		{Identifier: "DEMO-105", Title: "Autoscaler fights manual replica count on deploy", Priority: 2, PrioLabel: "High", StateName: "In Review", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T17:13:09Z"},
+		// Several PRs across repos — the common multi-PR shape, where `p` opens
+		// the picker instead of guessing a link.
+		{Identifier: "DEMO-105", Title: "Autoscaler fights manual replica count on deploy", Priority: 2, PrioLabel: "High", StateName: "In Review", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T17:13:09Z", PRs: []linear.PR{
+			{URL: "https://github.com/acme/platform/pull/912", Title: "fix(autoscaler): stop reconciling manual replica overrides", State: "open", Repo: "platform", Number: 912},
+			{URL: "https://github.com/acme/widgets/pull/244", Title: "chore(deploy): drop the hardcoded replica count", State: "merged", Repo: "widgets", Number: 244},
+			{URL: "https://github.com/acme/charts/pull/57", Title: "feat(charts): expose replica policy in values.yaml", State: "draft", Repo: "charts", Number: 57},
+		}},
 		{Identifier: "DEMO-106", Title: "Sync seller policies and expose per-store valid values", Priority: 3, PrioLabel: "Medium", StateName: "Planned", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T15:39:03Z"},
 		{Identifier: "DEMO-107", Title: "Support inline shipping / return policies", Priority: 3, PrioLabel: "Medium", StateName: "Todo", StateType: "unstarted", TeamKey: "DEMO", UpdatedAt: "2026-07-16T16:22:49Z"},
 		{Identifier: "DEMO-108", Title: "Durable observability for stale-write blocks", Priority: 4, PrioLabel: "Low", StateName: "Merged", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T16:14:49Z", PRs: []linear.PR{{URL: "https://github.com/acme/widgets/pull/188", Title: "feat: stale-write log-based metric", State: "merged"}}},

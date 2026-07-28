@@ -61,10 +61,10 @@ func main() {
 	// coherent too. Don't override an already-set CLAUDE_CONFIG_DIR (the launcher
 	// points at the isolated dir; respect it).
 	if *account != "" {
-		os.Setenv("TICKETDECK_ACCOUNT", *account)
+		_ = os.Setenv("TICKETDECK_ACCOUNT", *account)
 		if os.Getenv("CLAUDE_CONFIG_DIR") == "" {
 			if home, err := os.UserHomeDir(); err == nil {
-				os.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude-"+*account))
+				_ = os.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude-"+*account))
 			}
 		}
 	}

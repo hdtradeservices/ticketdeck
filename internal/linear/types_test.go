@@ -75,6 +75,83 @@ func TestIsPRURL(t *testing.T) {
 	}
 }
 
+func TestPRStateFromMeta(t *testing.T) {
+	// GitHub attachments send subtitle:null and carry state in metadata; a draft
+	// arrives as status "open" plus draft:true.
+	cases := []struct {
+		status string
+		draft  bool
+		want   string
+	}{
+		{"open", false, "open"},
+		{"open", true, "draft"},
+		{"merged", false, "merged"},
+		{"closed", false, "closed"},
+		{"MERGED", false, "merged"},
+		{"inReview", false, "open"}, // real GitHub value: still open, awaiting review
+		{"weird", false, "open"},    // unknown-but-unfinished reads as open, not blank
+		{"merged", true, "draft"},   // draft wins
+		{"", false, ""},             // no metadata → subtitle fallback
+	}
+	for _, c := range cases {
+		if got := prStateFromMeta(c.status, c.draft); got != c.want {
+			t.Errorf("prStateFromMeta(%q, %v) = %q, want %q", c.status, c.draft, got, c.want)
+		}
+	}
+}
+
+func TestPRLabel(t *testing.T) {
+	// Metadata present → used directly.
+	if got := (PR{Repo: "etp", Number: 26020}).Label(); got != "etp#26020" {
+		t.Errorf("Label() = %q, want etp#26020", got)
+	}
+	// No metadata → parsed from the URL, for each forge shape.
+	cases := map[string]string{
+		"https://github.com/hdtradeservices/etp/pull/26020":     "etp#26020",
+		"https://gitlab.com/acme/app/-/merge_requests/12":       "app#12",
+		"https://bitbucket.org/acme/app/pull-requests/7":        "app#7",
+		"https://github.com/hdtradeservices/ebay/pull/57/files": "ebay#57",
+	}
+	for u, want := range cases {
+		if got := (PR{URL: u}).Label(); got != want {
+			t.Errorf("Label(%q) = %q, want %q", u, got, want)
+		}
+	}
+	// Unparseable → the raw URL, never an empty label.
+	if got := (PR{URL: "https://example.com/thing"}).Label(); got != "https://example.com/thing" {
+		t.Errorf("Label() fallback = %q, want the raw url", got)
+	}
+}
+
+func TestSortPRsMostActionableFirst(t *testing.T) {
+	in := []PR{
+		{Repo: "etp", Number: 100, State: "merged"},
+		{Repo: "walmart", Number: 5, State: "closed"},
+		{Repo: "listing", Number: 9, State: "open"},
+		{Repo: "charts", Number: 2, State: "draft"},
+		{Repo: "etp", Number: 101, State: "merged"}, // same repo → higher number first
+	}
+	got := SortPRs(in)
+	want := []string{"listing#9", "charts#2", "etp#101", "etp#100", "walmart#5"}
+	for i, w := range want {
+		if got[i].Label() != w {
+			t.Errorf("SortPRs()[%d] = %q, want %q (full: %v)", i, got[i].Label(), w, labels(got))
+		}
+	}
+	// The input slice must be untouched (callers render from the original).
+	if in[0].Label() != "etp#100" {
+		t.Errorf("SortPRs mutated its input: %v", labels(in))
+	}
+}
+
+func labels(prs []PR) []string {
+	out := make([]string, len(prs))
+	for i, p := range prs {
+		out[i] = p.Label()
+	}
+	return out
+}
+
 func TestPRState(t *testing.T) {
 	cases := map[string]string{
 		"Merged · #241":  "merged",

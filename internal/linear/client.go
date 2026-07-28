@@ -62,7 +62,7 @@ query AssignedOpen($after: String, $since: DateTimeOrDuration) {
         state { name type }
         team { id key name }
         updatedAt
-        attachments { nodes { url title subtitle } }
+        attachments { nodes { url title subtitle metadata } }
         labels { nodes { name } }
         inverseRelations { nodes { type issue { identifier state { name type } } } }
       }
@@ -98,6 +98,13 @@ type issueNode struct {
 			URL      string `json:"url"`
 			Title    string `json:"title"`
 			Subtitle string `json:"subtitle"`
+			// Where GitHub puts the PR's state, repo, and number (subtitle is null).
+			Metadata struct {
+				Status   string `json:"status"` // "open" | "merged" | "closed"
+				Draft    bool   `json:"draft"`
+				Number   int    `json:"number"`
+				RepoName string `json:"repoName"`
+			} `json:"metadata"`
 		} `json:"nodes"`
 	} `json:"attachments"`
 	Labels struct {
@@ -139,9 +146,22 @@ func (n issueNode) toIssue() Issue {
 		CompletedAt: parseTS(n.CompletedAt),
 	}
 	for _, a := range n.Attachments.Nodes {
-		if isPRURL(a.URL) {
-			issue.PRs = append(issue.PRs, PR{URL: a.URL, Title: a.Title, State: prState(a.Subtitle)})
+		if !isPRURL(a.URL) {
+			continue
 		}
+		// Prefer the structured metadata; fall back to the subtitle for sources
+		// that populate it instead (non-GitHub).
+		state := prStateFromMeta(a.Metadata.Status, a.Metadata.Draft)
+		if state == "" {
+			state = prState(a.Subtitle)
+		}
+		issue.PRs = append(issue.PRs, PR{
+			URL:    a.URL,
+			Title:  a.Title,
+			State:  state,
+			Repo:   a.Metadata.RepoName,
+			Number: a.Metadata.Number,
+		})
 	}
 	for _, l := range n.Labels.Nodes {
 		issue.Labels = append(issue.Labels, l.Name)
@@ -236,7 +256,7 @@ query IssueByKey($team: String!, $number: Float!) {
       state { name type }
       team { id key name }
       updatedAt
-      attachments { nodes { url title subtitle } }
+      attachments { nodes { url title subtitle metadata } }
       labels { nodes { name } }
     }
   }

@@ -880,3 +880,200 @@ func TestDoneTriggersUnblockCascade(t *testing.T) {
 	}
 	_ = msgs
 }
+
+// capturePRBrowse swaps the browser launcher for a recorder, so PR tests assert
+// which URLs would open without spawning anything.
+func capturePRBrowse(t *testing.T) *[]string {
+	t.Helper()
+	var opened []string
+	orig := browse
+	browse = func(u string) error { opened = append(opened, u); return nil }
+	t.Cleanup(func() { browse = orig })
+	return &opened
+}
+
+// prFixture is one ticket with three PRs across repos in mixed states.
+func prFixture() []linear.Issue {
+	return []linear.Issue{{
+		Identifier: "ZEN-9", Title: "spans three repos", Priority: 1,
+		StateName: "In Progress", StateType: "started",
+		PRs: []linear.PR{
+			{URL: "https://github.com/o/etp/pull/100", Title: "merged one", State: "merged", Repo: "etp", Number: 100},
+			{URL: "https://github.com/o/listing/pull/9", Title: "open one", State: "open", Repo: "listing", Number: 9},
+			{URL: "https://github.com/o/charts/pull/2", Title: "draft one", State: "draft", Repo: "charts", Number: 2},
+		},
+	}}
+}
+
+func loadedWith(t *testing.T, issues []linear.Issue) Model {
+	t.Helper()
+	m := New(fakeFetcher{issues}, "", true, fakeBackend{})
+	next, _ := m.Update(refreshedMsg{issues: issues})
+	return next.(Model)
+}
+
+func TestSinglePROpensDirectly(t *testing.T) {
+	opened := capturePRBrowse(t)
+	issues := []linear.Issue{{
+		Identifier: "ZEN-9", Title: "one pr", Priority: 1, StateName: "In Progress", StateType: "started",
+		PRs: []linear.PR{{URL: "https://github.com/o/etp/pull/7", State: "open", Repo: "etp", Number: 7}},
+	}}
+	m := loadedWith(t, issues)
+	next, cmd := m.Update(runes("p"))
+	m = next.(Model)
+	if m.prMenu {
+		t.Fatal("a single PR should open directly, not open the picker")
+	}
+	drainCmd(cmd)
+	if len(*opened) != 1 || (*opened)[0] != "https://github.com/o/etp/pull/7" {
+		t.Fatalf("expected the one PR to open, got %v", *opened)
+	}
+	if !strings.Contains(m.notice, "etp#7") {
+		t.Errorf("notice should name the PR, got %q", m.notice)
+	}
+}
+
+func TestMultiPROpensPickerOrderedByActionability(t *testing.T) {
+	m := loadedWith(t, prFixture())
+	next, _ := m.Update(runes("p"))
+	m = next.(Model)
+	if !m.prMenu {
+		t.Fatal("several PRs should open the picker")
+	}
+	// Most actionable first: open, draft, then merged.
+	want := []string{"listing#9", "charts#2", "etp#100"}
+	for i, w := range want {
+		if got := m.prList[i].Label(); got != w {
+			t.Errorf("prList[%d] = %q, want %q", i, got, w)
+		}
+	}
+	if m.prCursor != 0 {
+		t.Errorf("picker should start on the most actionable PR, cursor=%d", m.prCursor)
+	}
+	// The picker renders its rows and the ticket it belongs to.
+	view := m.View()
+	for _, want := range []string{"ZEN-9", "listing#9", "charts#2", "etp#100", "open all"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("picker view missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestPRPickerEnterOpensSelected(t *testing.T) {
+	opened := capturePRBrowse(t)
+	m := loadedWith(t, prFixture())
+	next, _ := m.Update(runes("p"))
+	m = next.(Model)
+	next, _ = m.Update(runes("j")) // move to charts#2
+	m = next.(Model)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.prMenu {
+		t.Error("opening a PR should close the picker")
+	}
+	drainCmd(cmd)
+	if len(*opened) != 1 || (*opened)[0] != "https://github.com/o/charts/pull/2" {
+		t.Fatalf("expected the selected PR to open, got %v", *opened)
+	}
+}
+
+func TestPRPickerDigitOpensThatOne(t *testing.T) {
+	opened := capturePRBrowse(t)
+	m := loadedWith(t, prFixture())
+	next, _ := m.Update(runes("p"))
+	m = next.(Model)
+	next, cmd := m.Update(runes("3")) // third row = etp#100
+	if next.(Model).prMenu {
+		t.Error("a digit should open that PR and close the picker")
+	}
+	drainCmd(cmd)
+	if len(*opened) != 1 || (*opened)[0] != "https://github.com/o/etp/pull/100" {
+		t.Fatalf("digit 3 should open the third PR, got %v", *opened)
+	}
+}
+
+func TestPRPickerOpenAll(t *testing.T) {
+	opened := capturePRBrowse(t)
+	m := loadedWith(t, prFixture())
+	next, _ := m.Update(runes("p"))
+	m = next.(Model)
+	next, cmd := m.Update(runes("a"))
+	m = next.(Model)
+	if m.prMenu {
+		t.Error("open-all should close the picker")
+	}
+	drainCmd(cmd)
+	if len(*opened) != 3 {
+		t.Fatalf("a should open all 3 PRs, got %v", *opened)
+	}
+	if !strings.Contains(m.notice, "all 3") {
+		t.Errorf("notice should report the count, got %q", m.notice)
+	}
+}
+
+func TestPRPickerEscCancels(t *testing.T) {
+	opened := capturePRBrowse(t)
+	m := loadedWith(t, prFixture())
+	next, _ := m.Update(runes("p"))
+	m = next.(Model)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	drainCmd(cmd)
+	if m.prMenu {
+		t.Error("esc should close the picker")
+	}
+	if len(*opened) != 0 {
+		t.Errorf("esc must not open anything, got %v", *opened)
+	}
+}
+
+func TestNoPRNotice(t *testing.T) {
+	opened := capturePRBrowse(t)
+	m := loadedWith(t, []linear.Issue{{Identifier: "ZEN-9", Title: "no prs", Priority: 1, StateName: "Todo", StateType: "unstarted"}})
+	next, cmd := m.Update(runes("p"))
+	m = next.(Model)
+	drainCmd(cmd)
+	if m.prMenu || len(*opened) != 0 {
+		t.Error("a ticket with no PR should neither open a picker nor a browser")
+	}
+	if !strings.Contains(m.notice, "no linked PR") {
+		t.Errorf("expected a no-PR notice, got %q", m.notice)
+	}
+}
+
+func TestPRMarkShowsCount(t *testing.T) {
+	one := []linear.PR{{State: "open"}}
+	three := []linear.PR{{State: "open"}, {State: "merged"}, {State: "draft"}}
+	if g, _ := prMark(nil); g != "  " {
+		t.Errorf("no PRs should render two blanks, got %q", g)
+	}
+	if g, _ := prMark(one); g != "⇄ " {
+		t.Errorf("one PR should render %q, got %q", "⇄ ", g)
+	}
+	if g, _ := prMark(three); g != "⇄3" {
+		t.Errorf("three PRs should render ⇄3, got %q", g)
+	}
+	// Every variant occupies the same width so issue rows stay aligned.
+	for _, prs := range [][]linear.PR{nil, one, three} {
+		if g, _ := prMark(prs); len([]rune(g)) != prMarkCol {
+			t.Errorf("prMark(%d) = %q, want %d cells", len(prs), g, prMarkCol)
+		}
+	}
+}
+
+func TestDetailPKeyOpensPicker(t *testing.T) {
+	m := loadedWith(t, prFixture())
+	next, _ := m.Update(runes("d")) // description overlay
+	m = next.(Model)
+	if m.detail == nil {
+		t.Fatal("d should open the detail overlay")
+	}
+	next, _ = m.Update(runes("p"))
+	m = next.(Model)
+	if m.detail != nil {
+		t.Error("the detail overlay should close when the picker opens")
+	}
+	if !m.prMenu {
+		t.Fatal("p in the detail overlay should open the multi-PR picker")
+	}
+}

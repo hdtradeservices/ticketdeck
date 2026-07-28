@@ -1,7 +1,9 @@
 package linear
 
 import (
+	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,7 +21,8 @@ func isPRURL(u string) bool {
 }
 
 // prState infers a PR's lifecycle state from a Linear attachment subtitle
-// (e.g. "Merged", "Open · #123", "Draft"), for the status-colored PR icon.
+// (e.g. "Merged", "Open · #123", "Draft"). Fallback for sources that populate a
+// subtitle at all; GitHub doesn't (see prStateFromMeta).
 func prState(subtitle string) string {
 	s := strings.ToLower(subtitle)
 	switch {
@@ -33,6 +36,30 @@ func prState(subtitle string) string {
 		return "open"
 	default:
 		return ""
+	}
+}
+
+// prStateFromMeta reads a PR's state from a Linear attachment's structured
+// metadata. This is the reliable source: GitHub attachments send
+// `subtitle: null` and put the state in metadata.status with a separate draft
+// flag, so a draft reads as status "open".
+//
+// status is not limited to open/merged/closed — "inReview" also shows up — so
+// anything that isn't finished counts as open rather than falling through to an
+// unknown state.
+func prStateFromMeta(status string, draft bool) string {
+	if draft {
+		return "draft"
+	}
+	switch s := strings.ToLower(status); s {
+	case "":
+		return "" // no metadata; let the subtitle fallback try
+	case "merged":
+		return "merged"
+	case "closed", "cancelled", "canceled":
+		return "closed"
+	default:
+		return "open" // "open", "inReview", and any future not-yet-finished status
 	}
 }
 
@@ -104,9 +131,98 @@ func (is Issue) OpenBlockers() []Relation {
 
 // PR is a pull/merge request linked to an issue via a Linear attachment.
 type PR struct {
-	URL   string
-	Title string
-	State string // "open" | "merged" | "closed" | "draft" | "" (unknown)
+	URL    string
+	Title  string
+	State  string // "open" | "merged" | "closed" | "draft" | "" (unknown)
+	Repo   string // repository name, e.g. "etp" (from attachment metadata)
+	Number int    // PR/MR number, e.g. 26020
+}
+
+// Label identifies a PR compactly as "repo#number" — the disambiguator that
+// matters when a ticket spans several repos, which is the common multi-PR case.
+// Falls back to parsing the URL when metadata is absent, then to the raw URL.
+func (p PR) Label() string {
+	repo, num := p.Repo, p.Number
+	if repo == "" || num == 0 {
+		r, n := parsePRURL(p.URL)
+		if repo == "" {
+			repo = r
+		}
+		if num == 0 {
+			num = n
+		}
+	}
+	switch {
+	case repo != "" && num != 0:
+		return fmt.Sprintf("%s#%d", repo, num)
+	case repo != "":
+		return repo
+	case num != 0:
+		return fmt.Sprintf("#%d", num)
+	}
+	return p.URL
+}
+
+// parsePRURL pulls the repo name and PR number out of a PR/MR URL, for links
+// whose attachment metadata is missing them (non-GitHub sources).
+// e.g. https://github.com/org/etp/pull/26020 → ("etp", 26020)
+func parsePRURL(u string) (repo string, number int) {
+	parts := strings.Split(strings.TrimSuffix(u, "/"), "/")
+	for i, p := range parts {
+		switch p {
+		case "pull", "pull-requests", "merge_requests":
+			if i+1 < len(parts) {
+				number, _ = strconv.Atoi(parts[i+1])
+			}
+			// The repo is the path segment before the PR marker; GitLab nests it
+			// under "/-/", so step back over that separator.
+			j := i - 1
+			if j >= 0 && parts[j] == "-" {
+				j--
+			}
+			if j >= 0 {
+				repo = parts[j]
+			}
+			return repo, number
+		}
+	}
+	return "", 0
+}
+
+// PRRank orders PR states by how much they still need you: an open PR outranks
+// a draft, then merged, then closed. Used for both the row icon's summary state
+// and the multi-PR picker's ordering.
+func PRRank(state string) int {
+	switch state {
+	case "open":
+		return 4
+	case "draft":
+		return 3
+	case "merged":
+		return 2
+	case "closed":
+		return 1
+	}
+	return 0
+}
+
+// SortPRs orders PRs most-actionable-first (open, draft, merged, closed), then
+// by repo, then highest number first so a resubmitted PR leads its supersedes.
+// Returns a sorted copy; the input is left alone.
+func SortPRs(prs []PR) []PR {
+	out := make([]PR, len(prs))
+	copy(out, prs)
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if ra, rb := PRRank(a.State), PRRank(b.State); ra != rb {
+			return ra > rb
+		}
+		if a.Repo != b.Repo {
+			return a.Repo < b.Repo
+		}
+		return a.Number > b.Number
+	})
+	return out
 }
 
 // User is a Linear workspace member (for the assignee picker).

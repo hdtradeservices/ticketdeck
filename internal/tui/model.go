@@ -366,12 +366,16 @@ func (m Model) refreshSessions() tea.Cmd {
 	}
 }
 
+// issueKeys is the set of tickets to poll statuses for. It deliberately reads
+// allIssues rather than the rendered rows: a search filter or a folded group hides
+// rows, and polling only those would make statusesMsg replace m.sessions with a
+// partial map — blanking the hidden tickets' badges and resetting their
+// time-in-state timers.
 func (m Model) issueKeys() []string {
-	keys := make([]string, 0, len(m.rows))
-	for _, r := range m.rows {
-		if r.kind == rowIssue {
-			keys = append(keys, r.issue.Identifier)
-		}
+	vis := linear.FilterVisible(m.allIssues)
+	keys := make([]string, 0, len(vis))
+	for _, is := range vis {
+		keys = append(keys, is.Identifier)
 	}
 	return keys
 }
@@ -1019,6 +1023,9 @@ func (m Model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// searching reports whether a filter is currently narrowing the list.
+func (m Model) searching() bool { return strings.TrimSpace(m.searchQuery) != "" }
+
 // searchMatch reports whether an issue matches the active search query (a
 // case-insensitive substring of its key or title). Empty query matches all.
 func (m Model) searchMatch(is linear.Issue) bool {
@@ -1034,7 +1041,7 @@ func (m Model) searchMatch(is linear.Issue) bool {
 // narrowed to the search query when one is active.
 func (m Model) visibleIssues() []linear.Issue {
 	vis := linear.FilterVisible(m.allIssues)
-	if strings.TrimSpace(m.searchQuery) == "" {
+	if !m.searching() {
 		return vis
 	}
 	out := make([]linear.Issue, 0, len(vis))
@@ -1345,7 +1352,7 @@ func (m *Model) regroup() {
 	// the source (the Linear client already filters, but --demo and future
 	// feeds might not).
 	groups := linear.GroupByPriorityThenStatus(m.visibleIssues())
-	searching := strings.TrimSpace(m.searchQuery) != ""
+	searching := m.searching()
 	var rows []row
 	for gi, g := range groups {
 		if gi > 0 {
@@ -1401,7 +1408,11 @@ func (m Model) cursorable(i int) bool {
 		return false
 	}
 	r := m.rows[i]
-	return r.kind == rowIssue || r.kind == rowSession || (r.kind == rowPrio && m.collapsed[r.text])
+	// A collapsed header is a cursor target so it can be expanded — but search
+	// force-expands every group without clearing m.collapsed, so during a search
+	// those headers must not be targets or the cursor lands on one instead of the
+	// first match (leaving Enter a no-op).
+	return r.kind == rowIssue || r.kind == rowSession || (r.kind == rowPrio && m.collapsed[r.text] && !m.searching())
 }
 
 func (m Model) firstCursorable() int {
@@ -1745,7 +1756,7 @@ func (m Model) View() string {
 	}
 	if len(m.rows) == 0 && m.err == nil {
 		empty := "no open tickets assigned to you 🎉"
-		if strings.TrimSpace(m.searchQuery) != "" {
+		if m.searching() {
 			empty = fmt.Sprintf("no tickets match %q", m.searchQuery)
 		}
 		fmt.Fprint(&b, dimStyle.Render("\n  "+empty+"\n"))

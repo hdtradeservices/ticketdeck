@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1171,5 +1172,48 @@ func TestStatusTickRefreshesWithoutLinearFetch(t *testing.T) {
 	_, cmd := m.Update(statusTickMsg{})
 	if cmd == nil {
 		t.Fatal("statusTickMsg should schedule a refresh + re-arm")
+	}
+}
+
+// Regression: a status poll must cover every visible ticket, not just the rows
+// currently rendered — otherwise an active search (or a folded group) makes the
+// tick replace m.sessions with a partial map, blanking badges and resetting the
+// time-in-state timers of everything filtered out.
+func TestStatusPollCoversFilteredOutTickets(t *testing.T) {
+	m := expanded(t)
+	next, _ := m.Update(runes("/"))
+	m = next.(Model)
+	next, _ = m.Update(runes("ZEN-2")) // only ZEN-2 is rendered now
+	m = next.(Model)
+
+	keys := m.issueKeys()
+	for _, want := range []string{"ZEN-9", "ZEN-1", "ZEN-2", "ZEN-5"} {
+		if !slices.Contains(keys, want) {
+			t.Errorf("status poll should still cover %s while a filter hides it; got %v", want, keys)
+		}
+	}
+}
+
+// Regression: with a folded group present, entering a search must put the cursor
+// on the first matching ticket. Folded headers stay in m.collapsed, and a
+// collapsed header is cursorable, so the cursor could land on a header instead —
+// leaving Enter a no-op because no issue is selected.
+func TestSearchCursorLandsOnFirstMatchWithFoldedGroups(t *testing.T) {
+	m := loaded(t)
+	// Fold the group holding ZEN-5 (Low), as top-10 focus does in real use.
+	m.collapsed = map[string]bool{"Low": true}
+	m.regroup()
+	m.cursor = m.firstCursorable()
+
+	next, _ := m.Update(runes("/"))
+	m = next.(Model)
+	next, _ = m.Update(runes("ZEN-5")) // ZEN-5 is Low priority — a folded group
+	m = next.(Model)
+
+	if _, ok := m.selected(); !ok {
+		t.Fatalf("cursor should sit on a matching ticket, not a header (row kind %v)", m.rows[m.cursor].kind)
+	}
+	if is, _ := m.selected(); is.Identifier != "ZEN-5" {
+		t.Errorf("cursor should be on ZEN-5, got %s", is.Identifier)
 	}
 }

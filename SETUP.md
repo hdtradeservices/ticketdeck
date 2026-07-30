@@ -73,7 +73,8 @@ running in their background tabs.
 | open an **ad-hoc Claude session** not tied to any ticket (own tab) | `n` |
 | **`/triage` in the background** | `t` — starts the ticket's session in its own (unfocused) tab if it isn't running, submits `/triage`, and keeps you on the deck (**runs a Claude turn**; herdr backend). On an "Other sessions" row it just submits `/triage` to that session. |
 | **fold/unfold** a priority section (collapsed shows a ticket count) | `Space` (toggle) · `←` collapse · `→` expand |
-| refresh | `r` |
+| **search / filter the list** | `/` — type to filter tickets by key or title (live, case-insensitive; all matching groups expand). `⏎` keeps the filter and returns to list nav; `esc` clears it. While a filter is applied the footer shows `filter "…" · esc clear`. |
+| refresh | `r` — a manual refresh. Session badges also refresh on their own every few seconds, and the instant the deck regains focus, so you don't have to. |
 
 An **"Other sessions"** section at the bottom lists live Claude sessions not shown as a
 ticket badge — ad-hoc `n` sessions and sessions for tickets that dropped off the list

@@ -81,6 +81,11 @@ type assigner interface {
 
 const refreshEvery = 60 * time.Second
 
+// statusRefreshEvery can be far tighter than refreshEvery because the status
+// poll only hits the local backend (herdr socket / on-disk claude agents), never
+// the rate-limited Linear API.
+const statusRefreshEvery = 3 * time.Second
+
 // triageCmd is the message the `t` hotkey sends to the highlighted session.
 const triageCmd = "/triage"
 
@@ -134,6 +139,10 @@ type detachedDoneMsg struct {
 }
 
 type tickMsg struct{}
+
+// statusTickMsg drives the fast, status-only poll (session badges + other
+// sessions), decoupled from the slow tickMsg that also hits the Linear API.
+type statusTickMsg struct{}
 
 // updateAvailableMsg carries a newer release tag found by the startup check.
 type updateAvailableMsg struct{ latest string }
@@ -206,6 +215,8 @@ type Model struct {
 	assignIssue   linear.Issue        // ticket being reassigned (captured when the picker opens)
 	assignQuery   string              // filter text in the assignee picker
 	assignCursor  int                 // index into the filtered picker options (0 = Unassign)
+	searchMode    bool                // "/" search input is active (captures typing)
+	searchQuery   string              // active ticket-list filter (key/title substring); persists after leaving searchMode
 	prMenu        bool                // multi-PR picker overlay is open
 	prIssue       linear.Issue        // ticket whose PRs are being picked
 	prList        []linear.PR         // that ticket's PRs, most-actionable-first
@@ -275,7 +286,13 @@ func Preview(f Fetcher, height int) (string, error) {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refresh(), tick(), checkUpdate(), m.fetchQuota())
+	cmds := []tea.Cmd{m.refresh(), tick(), checkUpdate(), m.fetchQuota()}
+	// The fast status poll only makes sense against a live backend; --demo/--preview
+	// resolve statuses synchronously, so don't spin a ticker there.
+	if m.demoStatuses == nil {
+		cmds = append(cmds, statusTick())
+	}
+	return tea.Batch(cmds...)
 }
 
 // fetchQuota reads Claude's usage limits (metadata only — no token spend).
@@ -366,6 +383,12 @@ func tick() tea.Cmd {
 	return tea.Tick(refreshEvery+jitter, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
+// statusTick schedules the next fast status-only poll. No jitter: it only hits
+// the local backend, not the shared Linear API, so there's no herd to spread.
+func statusTick() tea.Cmd {
+	return tea.Tick(statusRefreshEvery, func(time.Time) tea.Msg { return statusTickMsg{} })
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -374,6 +397,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		return m, tea.Batch(m.refresh(), m.refreshStatuses(), m.refreshSessions(), m.fetchQuota(), tick())
+
+	case statusTickMsg:
+		// Deliberately no Linear fetch or quota call — those stay on the slow tick.
+		return m, tea.Batch(m.refreshStatuses(), m.refreshSessions(), statusTick())
+
+	case tea.FocusMsg:
+		// The deck pane regained focus (e.g. returning from a ticket's tab under
+		// herdr) — refresh badges immediately so they're live on arrival rather
+		// than up to statusRefreshEvery stale.
+		if m.demoStatuses == nil {
+			return m, tea.Batch(m.refreshStatuses(), m.refreshSessions())
+		}
 
 	case updateAvailableMsg:
 		m.updateLatest = msg.latest
@@ -564,7 +599,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.openHintSpec != nil {
 			return m.updateOpenHint(msg)
 		}
+		if m.searchMode {
+			return m.updateSearch(msg)
+		}
 		switch msg.String() {
+		case "/":
+			m.searchMode = true
+			m.notice = ""
+		case "esc":
+			// Clear an applied filter (when not in the input itself).
+			if m.searchQuery != "" {
+				m.setSearch("")
+			}
 		case "q":
 			// Under herdr the deck is the persistent hub; quitting it orphans
 			// tab 1. Keep it open and point at the herdr-native ways to leave.
@@ -941,6 +987,65 @@ func (m Model) fetchUsers() tea.Cmd {
 }
 
 // filteredUsers returns the workspace users matching the picker's filter text.
+// setSearch applies a new ticket-list filter and rebuilds the visible rows,
+// parking the cursor on the first match so the top result is selected.
+func (m *Model) setSearch(q string) {
+	m.searchQuery = q
+	m.regroup()
+	m.cursor = m.firstCursorable()
+	m.ensureVisible()
+}
+
+// updateSearch drives "/" search: type to filter the list live, Backspace to
+// edit, Enter to keep the filter and return to list navigation, Esc to clear it
+// and exit. Arrow/navigation keys are inert while typing — press Enter first.
+func (m Model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.searchMode = false
+		m.setSearch("")
+	case "enter":
+		// Apply the filter and drop back to navigation (arrows/enter act on rows).
+		m.searchMode = false
+	case "backspace":
+		if r := []rune(m.searchQuery); len(r) > 0 {
+			m.setSearch(string(r[:len(r)-1]))
+		}
+	default:
+		if len(msg.Runes) > 0 {
+			m.setSearch(m.searchQuery + string(msg.Runes))
+		}
+	}
+	return m, nil
+}
+
+// searchMatch reports whether an issue matches the active search query (a
+// case-insensitive substring of its key or title). Empty query matches all.
+func (m Model) searchMatch(is linear.Issue) bool {
+	q := strings.ToLower(strings.TrimSpace(m.searchQuery))
+	if q == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(is.Identifier), q) ||
+		strings.Contains(strings.ToLower(is.Title), q)
+}
+
+// visibleIssues is the render source: always non-terminal (FilterVisible), and
+// narrowed to the search query when one is active.
+func (m Model) visibleIssues() []linear.Issue {
+	vis := linear.FilterVisible(m.allIssues)
+	if strings.TrimSpace(m.searchQuery) == "" {
+		return vis
+	}
+	out := make([]linear.Issue, 0, len(vis))
+	for _, is := range vis {
+		if m.searchMatch(is) {
+			out = append(out, is)
+		}
+	}
+	return out
+}
+
 func (m Model) filteredUsers() []linear.User {
 	q := strings.ToLower(strings.TrimSpace(m.assignQuery))
 	if q == "" {
@@ -1239,7 +1344,8 @@ func (m *Model) regroup() {
 	// Defensive BR-2a: never render Done/Cancelled/Duplicate tickets, whatever
 	// the source (the Linear client already filters, but --demo and future
 	// feeds might not).
-	groups := linear.GroupByPriorityThenStatus(linear.FilterVisible(m.allIssues))
+	groups := linear.GroupByPriorityThenStatus(m.visibleIssues())
+	searching := strings.TrimSpace(m.searchQuery) != ""
 	var rows []row
 	for gi, g := range groups {
 		if gi > 0 {
@@ -1250,7 +1356,8 @@ func (m *Model) regroup() {
 			n += len(sb.Issues)
 		}
 		rows = append(rows, row{kind: rowPrio, text: g.PrioLabel, count: n})
-		if m.collapsed[g.PrioLabel] {
+		// While searching, always expand so no match hides inside a folded group.
+		if m.collapsed[g.PrioLabel] && !searching {
 			continue // header only
 		}
 		for _, sb := range g.Statuses {
@@ -1274,7 +1381,9 @@ func (m *Model) regroup() {
 			others = append(others, s)
 		}
 	}
-	if len(others) > 0 {
+	// The "Other sessions" section is off-list context; hide it while searching so
+	// results read cleanly (the query targets the ticket list).
+	if len(others) > 0 && !searching {
 		rows = append(rows, row{kind: rowSpacer})
 		rows = append(rows, row{kind: rowSessionHeader, text: "Other sessions", count: len(others)})
 		for _, s := range others {
@@ -1635,7 +1744,13 @@ func (m Model) View() string {
 		return b.String()
 	}
 	if len(m.rows) == 0 && m.err == nil {
-		fmt.Fprint(&b, dimStyle.Render("\n  no open tickets assigned to you 🎉\n"))
+		empty := "no open tickets assigned to you 🎉"
+		if strings.TrimSpace(m.searchQuery) != "" {
+			empty = fmt.Sprintf("no tickets match %q", m.searchQuery)
+		}
+		fmt.Fprint(&b, dimStyle.Render("\n  "+empty+"\n"))
+		// Keep the footer so an empty search still shows how to clear it.
+		fmt.Fprintf(&b, "\n%s", m.footer())
 		return b.String()
 	}
 
@@ -2265,6 +2380,9 @@ func (m Model) footer() string {
 		is, _ := m.selected()
 		return noticeStyle.Render(fmt.Sprintf("  priority %s →  u Urgent · h High · m Medium · l Low · 0 None · esc", is.Identifier))
 	}
+	if m.searchMode {
+		return noticeStyle.Render(fmt.Sprintf("  /%s▏   type to filter · ⏎ apply · esc clear", m.searchQuery))
+	}
 	sync := "never"
 	if !m.lastSync.IsZero() {
 		sync = m.lastSync.Format("15:04:05")
@@ -2290,7 +2408,11 @@ func (m Model) footer() string {
 	if is, ok := m.selected(); ok && len(is.PRs) > 1 {
 		prHint = fmt.Sprintf("p PRs (%d)", len(is.PRs))
 	}
-	help := dimStyle.Render(fmt.Sprintf("↑↓ move · ⏎ open · d desc · o web · %s · t %s · %sn new · ␣/←→ fold · r refresh · %s · synced %s", prHint, triageCmd, statusHint, quitHint, sync))
+	filterHint := ""
+	if m.searchQuery != "" {
+		filterHint = fmt.Sprintf("filter %q · esc clear · ", m.searchQuery)
+	}
+	help := dimStyle.Render(fmt.Sprintf("%s↑↓ move · ⏎ open · d desc · o web · %s · t %s · %s/ search · n new · ␣/←→ fold · r refresh · %s · synced %s", filterHint, prHint, triageCmd, statusHint, quitHint, sync))
 	var status string
 	switch {
 	case m.err != nil:

@@ -106,7 +106,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(tui.New(fetcher, resolveRoot(*root), *dryLaunch, backend), tea.WithAltScreen())
+	// WithReportFocus lets the deck refresh session badges the instant its pane
+	// regains focus (e.g. switching back from a ticket tab under herdr).
+	p := tea.NewProgram(tui.New(fetcher, resolveRoot(*root), *dryLaunch, backend), tea.WithAltScreen(), tea.WithReportFocus())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "ticketdeck:", err)
 		os.Exit(1)

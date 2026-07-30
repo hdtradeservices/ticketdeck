@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1075,5 +1076,144 @@ func TestDetailPKeyOpensPicker(t *testing.T) {
 	}
 	if !m.prMenu {
 		t.Fatal("p in the detail overlay should open the multi-PR picker")
+	}
+}
+
+func TestSearchFiltersByKeyAndTitle(t *testing.T) {
+	m := expanded(t) // fixture's 4 open tickets, all groups unfolded
+
+	// "/" enters search input mode.
+	next, _ := m.Update(runes("/"))
+	m = next.(Model)
+	if !m.searchMode {
+		t.Fatal("/ should enter search mode")
+	}
+
+	// Typing narrows the list to a key substring.
+	for _, r := range []string{"Z", "E", "N", "-", "2"} {
+		next, _ = m.Update(runes(r))
+		m = next.(Model)
+	}
+	if m.searchQuery != "ZEN-2" {
+		t.Fatalf("query should accumulate to ZEN-2, got %q", m.searchQuery)
+	}
+	view := m.View()
+	if !strings.Contains(view, "ZEN-2") {
+		t.Errorf("matching ticket ZEN-2 should be visible\n%s", view)
+	}
+	for _, gone := range []string{"ZEN-9", "ZEN-1", "ZEN-5"} {
+		if strings.Contains(view, gone) {
+			t.Errorf("%s should be filtered out by query %q\n%s", gone, m.searchQuery, view)
+		}
+	}
+
+	// Enter keeps the filter but leaves input mode so list nav works again.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.searchMode {
+		t.Error("enter should exit search input mode")
+	}
+	if m.searchQuery != "ZEN-2" {
+		t.Errorf("enter should keep the filter, got %q", m.searchQuery)
+	}
+
+	// Esc from the list clears the applied filter.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.searchQuery != "" {
+		t.Errorf("esc should clear the filter, got %q", m.searchQuery)
+	}
+	if v := m.View(); !strings.Contains(v, "ZEN-9") || !strings.Contains(v, "ZEN-1") {
+		t.Errorf("clearing the filter should restore the full list\n%s", v)
+	}
+}
+
+func TestSearchMatchesTitleCaseInsensitively(t *testing.T) {
+	m := expanded(t)
+	next, _ := m.Update(runes("/"))
+	m = next.(Model)
+	next, _ = m.Update(runes("URGENT")) // fixture ZEN-9 title is "urgent thing"
+	m = next.(Model)
+	view := m.View()
+	if !strings.Contains(view, "ZEN-9") {
+		t.Errorf("title match should surface ZEN-9 for query %q\n%s", m.searchQuery, view)
+	}
+	if strings.Contains(view, "ZEN-1") {
+		t.Errorf("non-matching ZEN-1 should be hidden\n%s", view)
+	}
+}
+
+func TestSearchNoMatchShowsMessageAndFooter(t *testing.T) {
+	m := expanded(t)
+	m.height = 40 // give the view a viewport so the footer renders
+	next, _ := m.Update(runes("/"))
+	m = next.(Model)
+	next, _ = m.Update(runes("zzzznope"))
+	m = next.(Model)
+	view := m.View()
+	if !strings.Contains(view, "no tickets match") {
+		t.Errorf("an empty result set should say so\n%s", view)
+	}
+	if !strings.Contains(view, "esc clear") {
+		t.Errorf("the search footer must stay visible so the filter can be cleared\n%s", view)
+	}
+}
+
+func TestFocusMsgRefreshesStatuses(t *testing.T) {
+	m := loaded(t)
+	_, cmd := m.Update(tea.FocusMsg{})
+	if cmd == nil {
+		t.Fatal("a focus event should trigger a status refresh command")
+	}
+}
+
+func TestStatusTickRefreshesWithoutLinearFetch(t *testing.T) {
+	m := loaded(t)
+	_, cmd := m.Update(statusTickMsg{})
+	if cmd == nil {
+		t.Fatal("statusTickMsg should schedule a refresh + re-arm")
+	}
+}
+
+// Regression: a status poll must cover every visible ticket, not just the rows
+// currently rendered — otherwise an active search (or a folded group) makes the
+// tick replace m.sessions with a partial map, blanking badges and resetting the
+// time-in-state timers of everything filtered out.
+func TestStatusPollCoversFilteredOutTickets(t *testing.T) {
+	m := expanded(t)
+	next, _ := m.Update(runes("/"))
+	m = next.(Model)
+	next, _ = m.Update(runes("ZEN-2")) // only ZEN-2 is rendered now
+	m = next.(Model)
+
+	keys := m.issueKeys()
+	for _, want := range []string{"ZEN-9", "ZEN-1", "ZEN-2", "ZEN-5"} {
+		if !slices.Contains(keys, want) {
+			t.Errorf("status poll should still cover %s while a filter hides it; got %v", want, keys)
+		}
+	}
+}
+
+// Regression: with a folded group present, entering a search must put the cursor
+// on the first matching ticket. Folded headers stay in m.collapsed, and a
+// collapsed header is cursorable, so the cursor could land on a header instead —
+// leaving Enter a no-op because no issue is selected.
+func TestSearchCursorLandsOnFirstMatchWithFoldedGroups(t *testing.T) {
+	m := loaded(t)
+	// Fold the group holding ZEN-5 (Low), as top-10 focus does in real use.
+	m.collapsed = map[string]bool{"Low": true}
+	m.regroup()
+	m.cursor = m.firstCursorable()
+
+	next, _ := m.Update(runes("/"))
+	m = next.(Model)
+	next, _ = m.Update(runes("ZEN-5")) // ZEN-5 is Low priority — a folded group
+	m = next.(Model)
+
+	if _, ok := m.selected(); !ok {
+		t.Fatalf("cursor should sit on a matching ticket, not a header (row kind %v)", m.rows[m.cursor].kind)
+	}
+	if is, _ := m.selected(); is.Identifier != "ZEN-5" {
+		t.Errorf("cursor should be on ZEN-5, got %s", is.Identifier)
 	}
 }

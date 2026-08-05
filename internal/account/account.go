@@ -56,7 +56,15 @@ func All() []Account {
 			if _, seen := byDir[dir]; seen || !hasCreds(dir) {
 				continue
 			}
-			byDir[dir] = Account{Name: nameFor(dir), ConfigDir: dir}
+			// Only ~/.claude and ~/.claude-<name> are accounts. Without this, a
+			// stray ~/.claudeX would also be named Default and two entries would
+			// collide on one name — one accent color, one usage bar, and an
+			// ambiguous hand-off target.
+			name := nameFor(dir)
+			if name == Default && dir != filepath.Join(home, ".claude") {
+				continue
+			}
+			byDir[dir] = Account{Name: name, ConfigDir: dir}
 		}
 	}
 	out := make([]Account, 0, len(byDir))

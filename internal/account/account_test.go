@@ -256,3 +256,36 @@ func TestHandOffFindsTranscriptOutsideTheLaunchRoot(t *testing.T) {
 		t.Errorf("subdir session not handed off: %v", err)
 	}
 }
+
+// Only ~/.claude and ~/.claude-<name> are accounts. A stray ~/.claudeX would
+// otherwise also be named Default, and two entries sharing one name collide on
+// a single accent color and usage bar — and make the hand-off target ambiguous.
+func TestAllRejectsNonAccountClaudeDirs(t *testing.T) {
+	home := fakeHome(t, Default)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("TICKETDECK_ACCOUNT", "")
+	for _, stray := range []string{".claudex", ".claude-"} {
+		dir := filepath.Join(home, stray)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	all := All()
+	if len(all) != 1 {
+		t.Fatalf("All() = %d accounts, want just the real one: %+v", len(all), all)
+	}
+	seen := map[string]bool{}
+	for _, a := range all {
+		if seen[a.Name] {
+			t.Errorf("two accounts share the name %q: %+v", a.Name, all)
+		}
+		seen[a.Name] = true
+	}
+	if others := Others(); len(others) != 0 {
+		t.Errorf("Others() offered a non-account as a hand-off target: %+v", others)
+	}
+}

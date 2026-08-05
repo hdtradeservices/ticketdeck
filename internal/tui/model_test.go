@@ -3,6 +3,8 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -11,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
+	"github.com/hdtradeservices/ticketdeck/internal/quota"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
 )
 
@@ -1215,5 +1218,185 @@ func TestSearchCursorLandsOnFirstMatchWithFoldedGroups(t *testing.T) {
 	}
 	if is, _ := m.selected(); is.Identifier != "ZEN-5" {
 		t.Errorf("cursor should be on ZEN-5, got %s", is.Identifier)
+	}
+}
+
+// twoAccounts points the process at a home holding two subscriptions and returns
+// a loaded model that has resolved them, as a deck running as "matt" would.
+func twoAccounts(t *testing.T) Model {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, dir := range []string{".claude", ".claude-support"} {
+		p := filepath.Join(home, dir)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(p, ".credentials.json"), []byte(`{}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
+	t.Setenv("TICKETDECK_ACCOUNT", "matt")
+	return loaded(t)
+}
+
+// An unlabelled deck is indistinguishable from any other deck, so the primary
+// one must carry a badge too.
+func TestAccountBadgeAlwaysRenders(t *testing.T) {
+	m := twoAccounts(t)
+	if !strings.Contains(m.accountSegment(), "matt") {
+		t.Errorf("account badge missing the account name: %q", m.accountSegment())
+	}
+	if !strings.Contains(m.View(), "⦿ matt") {
+		t.Error("view should name the subscription this deck runs as")
+	}
+}
+
+func TestAccountColorsDifferBetweenAccounts(t *testing.T) {
+	m := twoAccounts(t)
+	if m.acctColors["matt"] == m.acctColors["support"] {
+		t.Errorf("both accounts got color %q — the accent can't tell them apart", m.acctColors["matt"])
+	}
+}
+
+// The whole reason to read every account: seeing the other's headroom without
+// switching decks.
+func TestOtherAccountQuotaShownInView(t *testing.T) {
+	m := twoAccounts(t)
+	m.usages = map[string]*quota.Usage{
+		"matt":    {FiveHourPct: 94, SevenDayPct: 61},
+		"support": {FiveHourPct: 12, SevenDayPct: 8},
+	}
+	line := m.otherQuotaLine()
+	if !strings.Contains(line, "support") || !strings.Contains(line, "12%") {
+		t.Errorf("other account's headroom missing: %q", line)
+	}
+	if strings.Contains(line, "matt") {
+		t.Errorf("active account belongs on the title line, not the others line: %q", line)
+	}
+	if !strings.Contains(m.View(), "12%") {
+		t.Error("view should show the other subscription's usage")
+	}
+}
+
+func TestQuotaMsgKeepsPriorReadingForFailedAccount(t *testing.T) {
+	m := twoAccounts(t)
+	m.usages = map[string]*quota.Usage{"support": {FiveHourPct: 12}}
+	// support failed this round (absent from the message); its bar must not blank.
+	next, _ := m.Update(quotaMsg{usages: map[string]*quota.Usage{"matt": {FiveHourPct: 50}}})
+	m = next.(Model)
+	if m.usages["support"] == nil {
+		t.Error("a transient failure blanked an account that was readable a moment ago")
+	}
+	if m.usages["matt"] == nil || m.usages["matt"].FiveHourPct != 50 {
+		t.Error("new reading not applied")
+	}
+}
+
+func TestHandoffOverlayOpensAndNamesBothAccounts(t *testing.T) {
+	m := twoAccounts(t)
+	m.sessions = map[string]session.Status{"ZEN-9": session.NeedsInput}
+	next, _ := m.Update(runes("H"))
+	m = next.(Model)
+	if m.handoffKey != "ZEN-9" {
+		t.Fatalf("H should open the hand-off overlay for the cursor ticket, got %q", m.handoffKey)
+	}
+	view := m.View()
+	for _, want := range []string{"ZEN-9", "matt", "support"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("hand-off overlay missing %q: %s", want, view)
+		}
+	}
+}
+
+// Nothing to move means the overlay must not open — it would offer an action
+// that can't do anything.
+func TestHandoffRefusedWithoutASession(t *testing.T) {
+	m := twoAccounts(t)
+	m.sessions = map[string]session.Status{}
+	next, _ := m.Update(runes("H"))
+	m = next.(Model)
+	if m.handoffKey != "" {
+		t.Error("hand-off opened for a ticket with no session")
+	}
+	if !strings.Contains(m.notice, "no session") {
+		t.Errorf("expected an explanatory notice, got %q", m.notice)
+	}
+}
+
+func TestHandoffRefusedWithOnlyOneAccount(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("TICKETDECK_ACCOUNT", "matt")
+	m := loaded(t)
+	m.sessions = map[string]session.Status{"ZEN-9": session.Working}
+	next, _ := m.Update(runes("H"))
+	m = next.(Model)
+	if m.handoffKey != "" {
+		t.Error("hand-off opened with nowhere to hand off to")
+	}
+}
+
+// Stopping the session before copying is mandatory: two accounts appending to
+// their own copy of one transcript diverge irreconcilably.
+func TestHandoffStopsTheSessionBeforeCopying(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, dir := range []string{".claude", ".claude-support"} {
+		p := filepath.Join(home, dir)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(p, ".credentials.json"), []byte(`{}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
+	t.Setenv("TICKETDECK_ACCOUNT", "matt")
+
+	rec := &recBackend{}
+	m := New(fakeFetcher{fixture()}, "", true, rec)
+	next, _ := m.Update(refreshedMsg{issues: fixture()})
+	m = next.(Model)
+	m.sessions = map[string]session.Status{"ZEN-9": session.NeedsInput}
+
+	next, _ = m.Update(runes("H"))
+	m = next.(Model)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.handoffKey != "" {
+		t.Error("overlay should close on confirm")
+	}
+	drainCmd(cmd)
+	if rec.closedByName != "ZEN-9" {
+		t.Errorf("hand-off must stop the session first, closed %q", rec.closedByName)
+	}
+}
+
+func TestHandoffEscCancels(t *testing.T) {
+	m := twoAccounts(t)
+	m.sessions = map[string]session.Status{"ZEN-9": session.Working}
+	next, _ := m.Update(runes("H"))
+	next, _ = next.(Model).Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if next.(Model).handoffKey != "" {
+		t.Error("esc should close the hand-off overlay")
+	}
+}
+
+// The footer names the destination when there's exactly one, so the two-account
+// case reads as an action rather than a menu.
+func TestFooterNamesTheHandoffTarget(t *testing.T) {
+	m := twoAccounts(t)
+	if !strings.Contains(m.View(), "H hand to ⦿support") {
+		t.Error("footer should name the single hand-off target")
 	}
 }

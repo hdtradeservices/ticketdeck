@@ -11,8 +11,10 @@
 #   deck --account support   # run as a second subscription (~/.claude-support)
 #
 # Env:
-#   TICKETDECK_ROOT   default working dir for new ticket sessions (default ~/Repos)
-#   LINEAR_API_KEY    required by ticketdeck (export in your shell rc)
+#   TICKETDECK_ROOT     default working dir for new ticket sessions (default ~/Repos)
+#   LINEAR_API_KEY      required by ticketdeck (export in your shell rc)
+#   TICKETDECK_ACCOUNT  label for the DEFAULT deck (else "default"); --account
+#                       overrides it. Export in your rc to see e.g. "⦿ matt".
 set -euo pipefail
 
 # ── account selection ────────────────────────────────────────────────────────

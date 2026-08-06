@@ -30,6 +30,20 @@ func fakeHome(t *testing.T, names ...string) string {
 	return home
 }
 
+// mkAccountDir creates a credentialed config dir by literal basename, for the
+// cases fakeHome's "default means ~/.claude" shorthand can't express.
+func mkAccountDir(t *testing.T, home, base string) string {
+	t.Helper()
+	dir := filepath.Join(home, base)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func TestCurrentNamesTheDefaultAccount(t *testing.T) {
 	fakeHome(t, Default)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
@@ -264,7 +278,7 @@ func TestAllRejectsNonAccountClaudeDirs(t *testing.T) {
 	home := fakeHome(t, Default)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("TICKETDECK_ACCOUNT", "")
-	for _, stray := range []string{".claudex", ".claude-"} {
+	for _, stray := range []string{".claudex", ".claude-", ".claudeX/nested"} {
 		dir := filepath.Join(home, stray)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
@@ -287,5 +301,120 @@ func TestAllRejectsNonAccountClaudeDirs(t *testing.T) {
 	}
 	if others := Others(); len(others) != 0 {
 		t.Errorf("Others() offered a non-account as a hand-off target: %+v", others)
+	}
+}
+
+// A peer deck must call a renamed account by the SAME name. TICKETDECK_ACCOUNT
+// only renames its own process, so the label is published into the config dir;
+// without that, one subscription carries two names across decks — and once those
+// names sort differently, two different accent colors.
+func TestRenamedAccountIsVisibleToPeerDecks(t *testing.T) {
+	home := fakeHome(t, Default, "support")
+
+	// Deck A runs as the primary, renamed to "matt".
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
+	t.Setenv("TICKETDECK_ACCOUNT", "matt")
+	if got := Current().Name; got != "matt" {
+		t.Fatalf("deck A name = %q", got)
+	}
+
+	// Deck B runs as support and must see the primary as "matt", not "default".
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude-support"))
+	t.Setenv("TICKETDECK_ACCOUNT", "")
+	var peer *Account
+	for _, a := range All() {
+		if a.ConfigDir == filepath.Join(home, ".claude") {
+			c := a
+			peer = &c
+		}
+	}
+	if peer == nil {
+		t.Fatal("peer deck can't see the primary account at all")
+	}
+	if peer.Name != "matt" {
+		t.Errorf("peer sees the primary as %q, deck A calls itself \"matt\"", peer.Name)
+	}
+}
+
+// Colors must agree across decks, which only holds if both decks resolve the
+// same names in the same sort order.
+func TestAccentColorsAgreeAcrossDecks(t *testing.T) {
+	home := fakeHome(t, Default, "support")
+
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
+	t.Setenv("TICKETDECK_ACCOUNT", "zed") // sorts AFTER "support", unlike "default"
+	fromA := Colors(All())
+
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude-support"))
+	t.Setenv("TICKETDECK_ACCOUNT", "")
+	fromB := Colors(All())
+
+	for name, c := range fromA {
+		if fromB[name] != c {
+			t.Errorf("%q is %s in one deck and %s in the other", name, c, fromB[name])
+		}
+	}
+}
+
+// The primary subscription takes no --account flag: `deck --account default`
+// would look for a ~/.claude-default that doesn't exist.
+func TestLaunchCmdForPrimaryHasNoAccountFlag(t *testing.T) {
+	home := t.TempDir()
+	primary := Account{Name: Default, ConfigDir: filepath.Join(home, ".claude")}
+	if got := primary.LaunchCmd(); got != "deck" {
+		t.Errorf("primary LaunchCmd() = %q, want \"deck\"", got)
+	}
+	// Renaming the primary must not invent a --account flag either.
+	renamed := Account{Name: "matt", ConfigDir: filepath.Join(home, ".claude")}
+	if got := renamed.LaunchCmd(); got != "deck" {
+		t.Errorf("renamed primary LaunchCmd() = %q, want \"deck\"", got)
+	}
+	named := Account{Name: "support", ConfigDir: filepath.Join(home, ".claude-support")}
+	if got := named.LaunchCmd(); got != "deck --account support" {
+		t.Errorf("named LaunchCmd() = %q", got)
+	}
+}
+
+// ~/.claude-default is a real `deck --account default` account; the stray-dir
+// guard must judge the directory's shape, not its derived label.
+func TestClaudeDashDefaultIsAnAccount(t *testing.T) {
+	home := fakeHome(t, Default)
+	mkAccountDir(t, home, ".claude-default")
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
+	t.Setenv("TICKETDECK_ACCOUNT", "matt")
+
+	all := All()
+	if len(all) != 2 {
+		t.Fatalf("All() = %d accounts, want 2 (~/.claude + ~/.claude-default): %+v", len(all), all)
+	}
+	var found bool
+	for _, a := range all {
+		if a.ConfigDir == filepath.Join(home, ".claude-default") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("~/.claude-default was dropped: %+v", all)
+	}
+}
+
+// Two dirs deriving one label must not shadow each other in the color/usage maps.
+func TestCollidingNamesAreDisambiguated(t *testing.T) {
+	home := fakeHome(t, Default)
+	mkAccountDir(t, home, ".claude-default")
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
+	t.Setenv("TICKETDECK_ACCOUNT", "") // primary is "default", so is ~/.claude-default
+
+	all := All()
+	seen := map[string]bool{}
+	for _, a := range all {
+		if seen[a.Name] {
+			t.Errorf("duplicate account name %q: %+v", a.Name, all)
+		}
+		seen[a.Name] = true
+	}
+	// The current account keeps its name — the deck looks itself up by it.
+	if cur := Current(); !seen[cur.Name] {
+		t.Errorf("current account %q not present under its own name: %+v", cur.Name, all)
 	}
 }

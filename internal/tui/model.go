@@ -160,6 +160,7 @@ type quotaMsg struct {
 type handoffMsg struct {
 	key string
 	to  string
+	cmd string // how to open the target's deck (not derivable from its name)
 	err error
 }
 
@@ -469,7 +470,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		debugLog.Printf("handoff %s → %s ok", msg.key, msg.to)
-		m.notice = fmt.Sprintf("%s → ⦿%s ✓ resume it in that deck (deck --account %s)", msg.key, msg.to, msg.to)
+		m.notice = fmt.Sprintf("%s → ⦿%s ✓ resume it there (%s)", msg.key, msg.to, msg.cmd)
 		// The session is stopped here now, so refresh badges to show it.
 		return m, tea.Batch(m.refreshStatuses(), m.refreshSessions())
 
@@ -1957,7 +1958,7 @@ func (m Model) handOff(key string, to account.Account) tea.Cmd {
 		if err := account.HandOff(from, to, key); err != nil {
 			return handoffMsg{key: key, to: to.Name, err: err}
 		}
-		return handoffMsg{key: key, to: to.Name}
+		return handoffMsg{key: key, to: to.Name, cmd: to.LaunchCmd()}
 	}
 }
 

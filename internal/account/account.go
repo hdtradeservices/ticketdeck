@@ -39,9 +39,29 @@ func Current() Account {
 	dir := session.ConfigDir()
 	name := strings.TrimSpace(os.Getenv("TICKETDECK_ACCOUNT"))
 	if name == "" {
-		name = nameFor(dir)
+		return Account{Name: nameFor(dir), ConfigDir: dir}
+	}
+	// Publish the label into the config dir so PEER decks call this subscription
+	// the same thing. TICKETDECK_ACCOUNT only renames this process; without
+	// publishing, another deck would label it from its directory and one account
+	// would carry two names — and, once those names sort differently, two
+	// different accent colors. Best-effort: an unwritable dir just means peers
+	// fall back to the directory-derived name.
+	if name != readLabel(dir) {
+		_ = os.WriteFile(filepath.Join(dir, labelFile), []byte(name+"\n"), 0o644)
 	}
 	return Account{Name: name, ConfigDir: dir}
+}
+
+// LaunchCmd is the command that opens this account's deck. The primary
+// subscription takes no --account flag: `deck --account default` would look for
+// a ~/.claude-default that doesn't exist.
+func (a Account) LaunchCmd() string {
+	base := filepath.Base(a.ConfigDir)
+	if base == ".claude" {
+		return "deck"
+	}
+	return "deck --account " + strings.TrimPrefix(base, ".claude-")
 }
 
 // All lists every subscription with credentials on disk (~/.claude and
@@ -53,18 +73,10 @@ func All() []Account {
 	if home, err := os.UserHomeDir(); err == nil {
 		matches, _ := filepath.Glob(filepath.Join(home, ".claude*"))
 		for _, dir := range matches {
-			if _, seen := byDir[dir]; seen || !hasCreds(dir) {
+			if _, seen := byDir[dir]; seen || !isAccountDir(home, dir) || !hasCreds(dir) {
 				continue
 			}
-			// Only ~/.claude and ~/.claude-<name> are accounts. Without this, a
-			// stray ~/.claudeX would also be named Default and two entries would
-			// collide on one name — one accent color, one usage bar, and an
-			// ambiguous hand-off target.
-			name := nameFor(dir)
-			if name == Default && dir != filepath.Join(home, ".claude") {
-				continue
-			}
-			byDir[dir] = Account{Name: name, ConfigDir: dir}
+			byDir[dir] = Account{Name: nameFor(dir), ConfigDir: dir}
 		}
 	}
 	out := make([]Account, 0, len(byDir))
@@ -72,7 +84,40 @@ func All() []Account {
 		out = append(out, a)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	// Two dirs can still land on one label (~/.claude and ~/.claude-default, or a
+	// stale published label). Names key the color and usage maps, so one would
+	// silently shadow the other; disambiguate deterministically instead. The
+	// current account keeps its name unconditionally — the deck looks itself up
+	// by the name Current() gave it.
+	taken := map[string]bool{cur.Name: true}
+	for i := range out {
+		if out[i].ConfigDir == cur.ConfigDir {
+			continue
+		}
+		base, name := out[i].Name, out[i].Name
+		for n := 2; taken[name]; n++ {
+			name = fmt.Sprintf("%s(%d)", base, n)
+		}
+		out[i].Name, taken[name] = name, true
+	}
 	return out
+}
+
+// isAccountDir reports whether a path is a subscription dir: ~/.claude or
+// ~/.claude-<name>. Judging the directory's shape rather than its derived label
+// keeps ~/.claude-default (a real `deck --account default`) while still
+// rejecting a stray ~/.claudeX.
+func isAccountDir(home, dir string) bool {
+	if filepath.Dir(dir) != home {
+		return false
+	}
+	base := filepath.Base(dir)
+	if base == ".claude" {
+		return true
+	}
+	n := strings.TrimPrefix(base, ".claude-")
+	return n != base && n != ""
 }
 
 // Others is All minus the account this deck runs as — the candidates a session
@@ -104,7 +149,22 @@ func Colors(accts []Account) map[string]string {
 	return out
 }
 
+// labelFile holds an account's published display name, so every deck agrees on
+// what to call that subscription (see Current).
+const labelFile = ".ticketdeck-name"
+
+func readLabel(configDir string) string {
+	b, err := os.ReadFile(filepath.Join(configDir, labelFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
 func nameFor(configDir string) string {
+	if l := readLabel(configDir); l != "" {
+		return l
+	}
 	base := filepath.Base(configDir)
 	if n := strings.TrimPrefix(base, ".claude-"); n != base && n != "" {
 		return n

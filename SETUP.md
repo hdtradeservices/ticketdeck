@@ -192,6 +192,10 @@ Name the default deck something better than `default` by exporting
 export TICKETDECK_ACCOUNT=matt   # labels the ~/.claude deck "matt"
 ```
 
+The name is published into that config dir, so **every** deck calls the
+subscription `matt` — the label and its accent color stay the same whichever
+deck you're looking from.
+
 **Seeing where the headroom is.** The title bar shows *every* subscription's
 5h/7d usage, not just the one you're in — the active account on the title line
 with its reset hint, the others on the line below:

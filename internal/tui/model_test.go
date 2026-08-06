@@ -1400,3 +1400,19 @@ func TestFooterNamesTheHandoffTarget(t *testing.T) {
 		t.Error("footer should name the single hand-off target")
 	}
 }
+
+// The success notice must tell you how to actually open that deck. `deck
+// --account default` would look for a ~/.claude-default that doesn't exist, so
+// the command comes from the target's config dir, not its name.
+func TestHandoffNoticeUsesTheTargetsRealLaunchCommand(t *testing.T) {
+	m := twoAccounts(t)
+	next, _ := m.Update(handoffMsg{key: "ZEN-9", to: "support", cmd: "deck --account support"})
+	if !strings.Contains(next.(Model).notice, "deck --account support") {
+		t.Errorf("notice = %q", next.(Model).notice)
+	}
+	// Handing back to the primary: plain `deck`, no invented --account flag.
+	next, _ = m.Update(handoffMsg{key: "ZEN-9", to: "matt", cmd: "deck"})
+	if n := next.(Model).notice; strings.Contains(n, "--account") {
+		t.Errorf("primary target should need no --account flag: %q", n)
+	}
+}

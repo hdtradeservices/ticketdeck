@@ -29,11 +29,15 @@ type Usage struct {
 	SevenDayReset time.Time
 }
 
-// Fetch reads the OAuth token and queries the usage endpoint. Returns an error
-// (to be handled silently by the caller) when there's no OAuth token — e.g. an
-// API-key setup — or the request fails.
-func Fetch(ctx context.Context) (Usage, error) {
-	tok, err := oauthToken()
+// Fetch reads the OAuth token from configDir and queries the usage endpoint.
+// Returns an error (to be handled silently by the caller) when there's no OAuth
+// token — e.g. an API-key setup — or the request fails.
+//
+// configDir is explicit rather than implied so one deck can read every
+// subscription's headroom, not just its own: knowing the other account has room
+// is the whole reason to look when this one runs out.
+func Fetch(ctx context.Context, configDir string) (Usage, error) {
+	tok, err := oauthToken(configDir)
 	if err != nil {
 		return Usage{}, err
 	}
@@ -86,14 +90,14 @@ func parseTime(s string) time.Time {
 	return t
 }
 
-// oauthToken reads the Claude Code OAuth access token.
-func oauthToken() (string, error) {
-	if t := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"); t != "" {
+// oauthToken reads the Claude Code OAuth access token out of configDir.
+func oauthToken(configDir string) (string, error) {
+	// The env token belongs to the active account only — using it for another
+	// account's dir would report this subscription's usage under that one's name.
+	if t := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"); t != "" && configDir == session.ConfigDir() {
 		return t, nil
 	}
-	// Read the credentials of the active account's config dir, so the usage bar
-	// reflects whichever subscription this deck is running as (CLAUDE_CONFIG_DIR).
-	b, err := os.ReadFile(filepath.Join(session.ConfigDir(), ".credentials.json"))
+	b, err := os.ReadFile(filepath.Join(configDir, ".credentials.json"))
 	if err != nil {
 		return "", err
 	}

@@ -74,6 +74,7 @@ running in their background tabs.
 | **`/triage` in the background** | `t` — starts the ticket's session in its own (unfocused) tab if it isn't running, submits `/triage`, and keeps you on the deck (**runs a Claude turn**; herdr backend). On an "Other sessions" row it just submits `/triage` to that session. |
 | **fold/unfold** a priority section (collapsed shows a ticket count) | `Space` (toggle) · `←` collapse · `→` expand |
 | **search / filter the list** | `/` — type to filter tickets by key or title (live, case-insensitive; all matching groups expand). `⏎` keeps the filter and returns to list nav; `esc` clears it. While a filter is applied the footer shows `filter "…" · esc clear`. |
+| **hand the session to another Claude subscription** | `H` — for when this subscription hits a limit mid-task. Stops the session here, copies its transcript to the other account, and it becomes resumable in that deck. `⏎` confirms, `1`-`9` picks a target, `esc` cancels. Only offered when a second subscription exists — see [Multiple Claude subscriptions](#multiple-claude-subscriptions-accounts). |
 | refresh | `r` — a manual refresh. Session badges also refresh on their own every few seconds, and the instant the deck regains focus, so you don't have to. |
 
 An **"Other sessions"** section at the bottom lists live Claude sessions not shown as a
@@ -173,8 +174,55 @@ Each account gets its **own herdr workspace** (separate server socket +
 `session.json`), so its ticket sessions burn *that* subscription's rate limits
 and never collide with the default deck. Both decks show the **same Linear
 tickets** (the Linear key is shared) — only which Claude subscription runs the
-sessions differs. The title bar shows a `⦿ <name>` badge and the usage bar
-reflects that account, so you always know whose limits you're spending.
+sessions differs.
+
+**Telling the decks apart.** Every deck names itself — there is no unlabelled
+deck. Three cues, in order of how far away you can read them:
+
+| Cue | Where |
+| --- | --- |
+| OS window / tab title `deck ⦿ support` | your taskbar, without focusing the window |
+| `⦿ <name>` badge in a **per-account color** | title bar, top left |
+| both accounts' usage | title bar, active account first |
+
+Name the default deck something better than `default` by exporting
+`TICKETDECK_ACCOUNT` in your shell rc:
+
+```sh
+export TICKETDECK_ACCOUNT=matt   # labels the ~/.claude deck "matt"
+```
+
+The name is published into that config dir, so **every** deck calls the
+subscription `matt` — the label and its accent color stay the same whichever
+deck you're looking from.
+
+**Seeing where the headroom is.** The title bar shows *every* subscription's
+5h/7d usage, not just the one you're in — the active account on the title line
+with its reset hint, the others on the line below:
+
+```
+TicketDeck  ⦿ matt  assigned · open only  ◷ 5h 94% (12m) · 7d 61%
+            ⦿support 5h 12% · 7d 8%
+```
+
+So when one account is throttled you can see the other has room without
+switching decks to go look.
+
+**Handing a session to the other subscription.** `H` on a ticket moves its
+session to another account — for when the current subscription hits a limit
+mid-task. It stops the session here, copies its transcript into the other
+account's config dir, and the session becomes resumable in that deck.
+
+Three things to know:
+
+- **Context carries over; a live process does not.** Resuming replays the
+  conversation, so an in-flight tool call is lost. Hand off between steps.
+- **Never run one session in two accounts at once.** That's why `H` stops the
+  session first — two accounts appending to their own copy of one transcript
+  diverge with no way to reconcile them.
+- **It refuses to destroy work.** If the target account already has *newer* work
+  on that ticket, the hand-off fails instead of overwriting it. An older copy
+  there is just stale, so a ticket can move back and forth freely.
 
 - **Switching is non-destructive.** Detach one deck (`Ctrl+b q`) and launch the
   other; every background session in each workspace keeps running untouched. A

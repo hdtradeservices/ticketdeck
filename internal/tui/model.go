@@ -5,18 +5,21 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/hdtradeservices/ticketdeck/internal/account"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/quota"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
@@ -147,10 +150,18 @@ type statusTickMsg struct{}
 // updateAvailableMsg carries a newer release tag found by the startup check.
 type updateAvailableMsg struct{ latest string }
 
-// quotaMsg carries the latest Claude usage limits (5h / 7d windows).
+// quotaMsg carries the latest Claude usage limits (5h / 7d windows) per account
+// name. Accounts whose usage couldn't be read are simply absent.
 type quotaMsg struct {
-	u  quota.Usage
-	ok bool
+	usages map[string]*quota.Usage
+}
+
+// handoffMsg is the result of moving a session to another subscription.
+type handoffMsg struct {
+	key string
+	to  string
+	cmd string // how to open the target's deck (not derivable from its name)
+	err error
 }
 
 // statusWriteMsg is the result of a MoveState write.
@@ -205,28 +216,34 @@ type Model struct {
 	detail        *linear.Issue             // non-nil = showing the description overlay
 	detailOffset  int                       // scroll offset within the detail overlay
 	loading       bool
-	underHerdr    bool                // running as a herdr pane (the persistent deck) — q must not kill it
-	writer        statusWriter        // non-nil when the backing Fetcher can write status (live Linear)
-	assigner      assigner            // non-nil when the backing Fetcher can change assignee (live Linear)
-	statusMenu    bool                // status-change overlay is open
-	statusPend    string              // chosen target awaiting y/n confirm ("" = still choosing)
-	priorityMenu  bool                // priority-change overlay is open
-	assignMenu    bool                // assignee-picker overlay is open
-	assignIssue   linear.Issue        // ticket being reassigned (captured when the picker opens)
-	assignQuery   string              // filter text in the assignee picker
-	assignCursor  int                 // index into the filtered picker options (0 = Unassign)
-	searchMode    bool                // "/" search input is active (captures typing)
-	searchQuery   string              // active ticket-list filter (key/title substring); persists after leaving searchMode
-	prMenu        bool                // multi-PR picker overlay is open
-	prIssue       linear.Issue        // ticket whose PRs are being picked
-	prList        []linear.PR         // that ticket's PRs, most-actionable-first
-	prCursor      int                 // index into prList
-	users         []linear.User       // cached workspace users for the picker
-	hideOpenHint  bool                // user chose "don't show again" for the open-session hint
-	openHintSpec  *session.LaunchSpec // pending launch awaiting the open-session hint
-	openHintLabel string              // ticket key for the pending launch
-	updateLatest  string              // newer release tag, if the startup check found one
-	usage         *quota.Usage        // Claude 5h/7d rate-limit usage, if available
+	underHerdr    bool                    // running as a herdr pane (the persistent deck) — q must not kill it
+	writer        statusWriter            // non-nil when the backing Fetcher can write status (live Linear)
+	assigner      assigner                // non-nil when the backing Fetcher can change assignee (live Linear)
+	statusMenu    bool                    // status-change overlay is open
+	statusPend    string                  // chosen target awaiting y/n confirm ("" = still choosing)
+	priorityMenu  bool                    // priority-change overlay is open
+	assignMenu    bool                    // assignee-picker overlay is open
+	assignIssue   linear.Issue            // ticket being reassigned (captured when the picker opens)
+	assignQuery   string                  // filter text in the assignee picker
+	assignCursor  int                     // index into the filtered picker options (0 = Unassign)
+	searchMode    bool                    // "/" search input is active (captures typing)
+	searchQuery   string                  // active ticket-list filter (key/title substring); persists after leaving searchMode
+	prMenu        bool                    // multi-PR picker overlay is open
+	prIssue       linear.Issue            // ticket whose PRs are being picked
+	prList        []linear.PR             // that ticket's PRs, most-actionable-first
+	prCursor      int                     // index into prList
+	users         []linear.User           // cached workspace users for the picker
+	hideOpenHint  bool                    // user chose "don't show again" for the open-session hint
+	openHintSpec  *session.LaunchSpec     // pending launch awaiting the open-session hint
+	openHintLabel string                  // ticket key for the pending launch
+	updateLatest  string                  // newer release tag, if the startup check found one
+	acct          account.Account         // the subscription this deck runs as
+	accounts      []account.Account       // Claude subscriptions on this machine, resolved once (globs the fs)
+	acctColors    map[string]string       // account name → accent color, so two decks never look alike
+	usages        map[string]*quota.Usage // account name → its 5h/7d usage, so one deck shows every account's headroom
+	handoffKey    string                  // ticket awaiting a hand-off confirm ("" = overlay closed)
+	handoffCands  []account.Account       // accounts that ticket can be handed to
+	handoffCursor int                     // index into handoffCands
 	err           error
 	notice        string // transient status line (e.g. dry-run launch plan)
 	lastSync      time.Time
@@ -249,6 +266,12 @@ type demoOtherSessioner interface {
 
 func New(f Fetcher, root string, dry bool, backend Backend) Model {
 	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, collapsed: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != ""}
+	// Resolved once, not per frame: All() globs the filesystem, and View runs on
+	// every keystroke.
+	m.acct = account.Current()
+	m.accounts = account.All()
+	m.acctColors = account.Colors(m.accounts)
+	m.usages = map[string]*quota.Usage{}
 	if ds, ok := f.(demoSessioner); ok {
 		m.demoStatuses = ds.DemoSessions()
 	}
@@ -287,6 +310,11 @@ func Preview(f Fetcher, height int) (string, error) {
 
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{m.refresh(), tick(), checkUpdate(), m.fetchQuota()}
+	// Name the OS window/tab after the account, so you can tell two decks apart
+	// from the taskbar without focusing either one.
+	if m.acct.Name != "" {
+		cmds = append(cmds, tea.SetWindowTitle("deck ⦿ "+m.acct.Name))
+	}
 	// The fast status poll only makes sense against a live backend; --demo/--preview
 	// resolve statuses synchronously, so don't spin a ticker there.
 	if m.demoStatuses == nil {
@@ -301,14 +329,32 @@ func (m Model) fetchQuota() tea.Cmd {
 	if m.demoStatuses != nil {
 		return nil
 	}
+	accts := m.accounts
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
-		u, err := quota.Fetch(ctx)
-		if err != nil {
-			return quotaMsg{ok: false}
+		// One call per subscription, concurrently — the point is to see whether
+		// another account has room while this one is throttled.
+		var (
+			mu  sync.Mutex
+			wg  sync.WaitGroup
+			out = map[string]*quota.Usage{}
+		)
+		for _, a := range accts {
+			wg.Add(1)
+			go func(a account.Account) {
+				defer wg.Done()
+				u, err := quota.Fetch(ctx, a.ConfigDir)
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				out[a.Name] = &u
+				mu.Unlock()
+			}(a)
 		}
-		return quotaMsg{u: u, ok: true}
+		wg.Wait()
+		return quotaMsg{usages: out}
 	}
 }
 
@@ -417,11 +463,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case updateAvailableMsg:
 		m.updateLatest = msg.latest
 
-	case quotaMsg:
-		if msg.ok {
-			u := msg.u
-			m.usage = &u
+	case handoffMsg:
+		if msg.err != nil {
+			debugLog.Printf("handoff %s → %s failed: %v", msg.key, msg.to, msg.err)
+			m.notice = fmt.Sprintf("hand-off failed: %v", msg.err)
+			break
 		}
+		debugLog.Printf("handoff %s → %s ok", msg.key, msg.to)
+		m.notice = fmt.Sprintf("%s → ⦿%s ✓ resume it there (%s)", msg.key, msg.to, msg.cmd)
+		// The session is stopped here now, so refresh badges to show it.
+		return m, tea.Batch(m.refreshStatuses(), m.refreshSessions())
+
+	case quotaMsg:
+		// Merge rather than replace: an account that failed this round keeps its
+		// previous reading instead of blanking a bar that was fine a moment ago.
+		maps.Copy(m.usages, msg.usages)
 
 	case refreshedMsg:
 		m.loading = false
@@ -600,6 +656,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.prMenu {
 			return m.updatePR(msg)
 		}
+		if m.handoffKey != "" {
+			return m.updateHandoff(msg)
+		}
 		if m.openHintSpec != nil {
 			return m.updateOpenHint(msg)
 		}
@@ -645,6 +704,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "p":
 			if is, ok := m.selected(); ok {
 				return m.openPRFor(is)
+			}
+		case "H":
+			if is, ok := m.selected(); ok {
+				return m.openHandoff(is)
 			}
 		case "s":
 			// Open the status-change menu (write). Unavailable in --demo.
@@ -1739,6 +1802,9 @@ func (m Model) View() string {
 	if m.prMenu {
 		return m.renderPRPicker()
 	}
+	if m.handoffKey != "" {
+		return m.renderHandoff()
+	}
 	if m.openHintSpec != nil {
 		return m.renderOpenHint()
 	}
@@ -1749,6 +1815,7 @@ func (m Model) View() string {
 		upd = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(fmt.Sprintf("  ⬆ %s available · ticketdeck update", m.updateLatest))
 	}
 	fmt.Fprintf(&b, "%s%s%s%s%s\n", titleStyle.Render("TicketDeck"), m.accountSegment(), dimStyle.Render(m.titleMeta()), m.quotaSegment(), upd)
+	fmt.Fprint(&b, m.otherQuotaLine())
 
 	if m.loading && len(m.rows) == 0 {
 		fmt.Fprint(&b, dimStyle.Render("\n  loading tickets…\n"))
@@ -1808,33 +1875,157 @@ func (m Model) window() (int, int) {
 	return start, end
 }
 
-// accountSegment shows which Claude subscription this deck runs as, when
-// TICKETDECK_ACCOUNT is set (the `deck --account NAME` launcher exports it).
-// It keeps two decks visually distinct so you know whose limits you're spending;
-// blank for the default account.
-func (m Model) accountSegment() string {
-	acct := os.Getenv("TICKETDECK_ACCOUNT")
-	if acct == "" {
-		return ""
+// otherAccounts is the cached subscriptions minus the one this deck runs as. It
+// reads the cached list rather than re-globbing, because View calls it.
+func (m Model) otherAccounts() []account.Account {
+	var out []account.Account
+	for _, a := range m.accounts {
+		if a.ConfigDir != m.acct.ConfigDir {
+			out = append(out, a)
+		}
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true).Render("  ⦿ " + acct)
+	return out
 }
 
-// quotaSegment renders the Claude 5h/7d usage limits for the title bar,
-// color-coded by utilization, with a coarse "resets in" hint.
-func (m Model) quotaSegment() string {
-	if m.usage == nil {
+// openHandoff opens the confirm overlay for moving a ticket's session to
+// another subscription. Refuses early when there is nothing to move or nowhere
+// to move it, so the overlay never appears without a usable action.
+func (m Model) openHandoff(is linear.Issue) (tea.Model, tea.Cmd) {
+	if m.demoStatuses != nil {
+		m.notice = "hand-off needs a live backend"
+		return m, nil
+	}
+	cands := m.otherAccounts()
+	if len(cands) == 0 {
+		m.notice = "only one Claude subscription found — see `deck --account` in SETUP.md"
+		return m, nil
+	}
+	if st := m.sessions[is.Identifier]; st == session.None {
+		m.notice = is.Identifier + " has no session to hand off"
+		return m, nil
+	}
+	m.handoffKey = is.Identifier
+	m.handoffCands = cands
+	m.handoffCursor = 0
+	m.notice = ""
+	return m, nil
+}
+
+func (m Model) updateHandoff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.handoffKey, m.handoffCands, m.handoffCursor = "", nil, 0
+	case "up", "k":
+		if m.handoffCursor > 0 {
+			m.handoffCursor--
+		}
+	case "down", "j":
+		if m.handoffCursor < len(m.handoffCands)-1 {
+			m.handoffCursor++
+		}
+	case "enter":
+		return m.confirmHandoff(m.handoffCursor)
+	default:
+		// 1-9 picks a row directly.
+		if n, err := strconv.Atoi(msg.String()); err == nil && n >= 1 && n <= len(m.handoffCands) {
+			return m.confirmHandoff(n - 1)
+		}
+	}
+	return m, nil
+}
+
+func (m Model) confirmHandoff(i int) (tea.Model, tea.Cmd) {
+	if i < 0 || i >= len(m.handoffCands) {
+		return m, nil
+	}
+	key, to := m.handoffKey, m.handoffCands[i]
+	m.handoffKey, m.handoffCands, m.handoffCursor = "", nil, 0
+	m.notice = fmt.Sprintf("handing %s to ⦿%s…", key, to.Name)
+	return m, m.handOff(key, to)
+}
+
+// handOff stops the ticket's session here, then copies its transcript into the
+// target account. Stopping first is mandatory: two accounts appending to their
+// own copy of one transcript diverge with no way back.
+func (m Model) handOff(key string, to account.Account) tea.Cmd {
+	backend, from := m.backend, m.acct
+	return func() tea.Msg {
+		// Best-effort: a stopped session is already fine, and the built-in claude
+		// backend has no daemon to stop one through.
+		if out, err := backend.CloseByName(key); err != nil {
+			debugLog.Printf("handoff %s: close failed (continuing): %v %s", key, err, out)
+		}
+		if err := account.HandOff(from, to, key); err != nil {
+			return handoffMsg{key: key, to: to.Name, err: err}
+		}
+		return handoffMsg{key: key, to: to.Name, cmd: to.LaunchCmd()}
+	}
+}
+
+// accountSegment names the Claude subscription this deck runs as. Every deck
+// renders one, including the primary: an unlabelled deck is ambiguous with any
+// other deck, which is what the badge exists to prevent. The color is
+// per-account so two decks never look alike at a glance.
+func (m Model) accountSegment() string {
+	if m.acct.Name == "" {
 		return ""
 	}
+	return m.acctStyle(m.acct.Name).Bold(true).Render("  ⦿ " + m.acct.Name)
+}
+
+// acctStyle is the accent style for one account name.
+func (m Model) acctStyle(name string) lipgloss.Style {
+	c, ok := m.acctColors[name]
+	if !ok {
+		c = "111"
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(c))
+}
+
+// quotaSegment renders this account's Claude 5h/7d usage for the title bar,
+// color-coded by utilization, with a coarse "resets in" hint.
+func (m Model) quotaSegment() string {
+	u := m.usages[m.acct.Name]
+	if u == nil {
+		return ""
+	}
+	return dimStyle.Render("  ◷ ") + quotaPair(u, true)
+}
+
+// otherQuotaLine renders the OTHER subscriptions' usage on its own line under
+// the title. This is why every account is read, not just the active one: when
+// this one is throttled, the decision you need is whether another has headroom,
+// and that answer must not require switching decks to go look.
+func (m Model) otherQuotaLine() string {
+	var parts []string
+	for _, a := range m.accounts {
+		u := m.usages[a.Name]
+		if a.Name == m.acct.Name || u == nil {
+			continue
+		}
+		parts = append(parts, m.acctStyle(a.Name).Render("⦿"+a.Name)+" "+quotaPair(u, false))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "            " + strings.Join(parts, dimStyle.Render("  ")) + "\n"
+}
+
+// quotaPair formats one account's two windows. The "resets in" hint is only
+// worth its width for the active account; for the others the percentage alone
+// answers "is there room over there?".
+func quotaPair(u *quota.Usage, withReset bool) string {
 	seg := func(label string, pct float64, reset time.Time) string {
 		s := fmt.Sprintf("%s %.0f%%", label, pct)
-		if r := resetsIn(reset); r != "" {
-			s += " " + r
+		if withReset {
+			if r := resetsIn(reset); r != "" {
+				s += " " + r
+			}
 		}
 		return lipgloss.NewStyle().Foreground(quotaColor(pct)).Render(s)
 	}
-	return dimStyle.Render("  ◷ ") + seg("5h", m.usage.FiveHourPct, m.usage.FiveHourReset) +
-		dimStyle.Render(" · ") + seg("7d", m.usage.SevenDayPct, m.usage.SevenDayReset)
+	return seg("5h", u.FiveHourPct, u.FiveHourReset) +
+		dimStyle.Render(" · ") + seg("7d", u.SevenDayPct, u.SevenDayReset)
 }
 
 func quotaColor(pct float64) lipgloss.Color {
@@ -2205,6 +2396,42 @@ func (m Model) renderAssign() string {
 	return b.String()
 }
 
+// renderHandoff draws the hand-off confirm: which subscription the ticket's
+// session moves to, and what that costs. It spells out the two things that
+// surprise people — the session stops here, and resuming replays context rather
+// than continuing a live process.
+func (m Model) renderHandoff() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s\n", titleStyle.Render("Hand off session"), idStyle.Render(m.handoffKey))
+	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render("↑/↓ select · ⏎ hand off · 1-9 pick · esc cancel"))
+
+	fmt.Fprintf(&b, "  from  %s\n\n", m.acctStyle(m.acct.Name).Bold(true).Render("⦿ "+m.acct.Name))
+	for i, a := range m.handoffCands {
+		num := " "
+		if i < 9 {
+			num = strconv.Itoa(i + 1)
+		}
+		row := fmt.Sprintf("%s  to    %s", num, "⦿ "+a.Name)
+		if u := m.usages[a.Name]; u != nil {
+			row += fmt.Sprintf("   %s", quotaPair(u, true))
+		}
+		if i == m.handoffCursor {
+			fmt.Fprintf(&b, "%s\n", selStyle.Render("▶ "+row))
+		} else {
+			fmt.Fprintf(&b, "  %s\n", row)
+		}
+	}
+
+	warn := ""
+	if m.sessions[m.handoffKey] == session.Working {
+		warn = "\n  ⚠ that session is working right now — handing off interrupts it"
+	}
+	fmt.Fprintf(&b, "\n%s%s\n", dimStyle.Render(
+		"  stops the session here, copies its transcript over, and it becomes\n"+
+			"  resumable in that deck. Context carries; an in-flight tool call does not."), warn)
+	return b.String()
+}
+
 // renderPRPicker draws the multi-PR picker: one row per linked PR, ordered
 // most-actionable-first, each showing its state, repo#number, and title.
 func (m Model) renderPRPicker() string {
@@ -2423,7 +2650,17 @@ func (m Model) footer() string {
 	if m.searchQuery != "" {
 		filterHint = fmt.Sprintf("filter %q · esc clear · ", m.searchQuery)
 	}
-	help := dimStyle.Render(fmt.Sprintf("%s↑↓ move · ⏎ open · d desc · o web · %s · t %s · %s/ search · n new · ␣/←→ fold · r refresh · %s · synced %s", filterHint, prHint, triageCmd, statusHint, quitHint, sync))
+	// Only advertise hand-off when there is somewhere to hand off to, and name
+	// the destination when there's exactly one — the common two-subscription case.
+	handoffHint := ""
+	switch others := m.otherAccounts(); len(others) {
+	case 0:
+	case 1:
+		handoffHint = "H hand to ⦿" + others[0].Name + " · "
+	default:
+		handoffHint = "H hand off · "
+	}
+	help := dimStyle.Render(fmt.Sprintf("%s↑↓ move · ⏎ open · d desc · o web · %s · t %s · %s%s/ search · n new · ␣/←→ fold · r refresh · %s · synced %s", filterHint, prHint, triageCmd, statusHint, handoffHint, quitHint, sync))
 	var status string
 	switch {
 	case m.err != nil:

@@ -3,6 +3,7 @@ package account
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -416,5 +417,32 @@ func TestCollidingNamesAreDisambiguated(t *testing.T) {
 	// The current account keeps its name — the deck looks itself up by it.
 	if cur := Current(); !seen[cur.Name] {
 		t.Errorf("current account %q not present under its own name: %+v", cur.Name, all)
+	}
+}
+
+// All builds from map iteration, so ordering must come from a total order on a
+// unique key. If it doesn't, the disambiguator hands the bare name to a
+// different account run to run and the accent colors drift between decks — the
+// exact failure the disambiguator exists to prevent.
+func TestAllIsDeterministicAcrossRuns(t *testing.T) {
+	home := fakeHome(t, Default, "support")
+	for _, b := range []string{".claude-default", ".claude-alpha"} {
+		mkAccountDir(t, home, b)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude-support"))
+	t.Setenv("TICKETDECK_ACCOUNT", "")
+
+	fingerprint := func() string {
+		var sb strings.Builder
+		for _, a := range All() {
+			sb.WriteString(a.Name + "=" + a.ConfigDir + ";")
+		}
+		return sb.String()
+	}
+	want := fingerprint()
+	for i := 0; i < 50; i++ {
+		if got := fingerprint(); got != want {
+			t.Fatalf("All() order/labels varied between runs:\n  %s\n  %s", want, got)
+		}
 	}
 }

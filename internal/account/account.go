@@ -83,7 +83,16 @@ func All() []Account {
 	for _, a := range byDir {
 		out = append(out, a)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	// Order on (name, dir), not name alone: out comes from map iteration and
+	// sort.Slice isn't stable, so equal names would order arbitrarily and the
+	// disambiguator below would hand the bare name to a different account run to
+	// run. ConfigDir is unique, which makes this a total order.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].ConfigDir < out[j].ConfigDir
+	})
 
 	// Two dirs can still land on one label (~/.claude and ~/.claude-default, or a
 	// stale published label). Names key the color and usage maps, so one would

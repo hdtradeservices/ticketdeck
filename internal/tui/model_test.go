@@ -1416,3 +1416,56 @@ func TestHandoffNoticeUsesTheTargetsRealLaunchCommand(t *testing.T) {
 		t.Errorf("primary target should need no --account flag: %q", n)
 	}
 }
+
+// An account whose usage can't be read must still appear. Dropping the row made
+// a rate-limited subscription look like it was never detected — which is exactly
+// how this reads to someone checking whether their second account is wired up.
+func TestOtherAccountShownEvenWithoutUsage(t *testing.T) {
+	m := twoAccounts(t)
+	m.usages = map[string]*quota.Usage{"matt": {FiveHourPct: 94}} // support failed
+	line := m.otherQuotaLine()
+	if !strings.Contains(line, "support") {
+		t.Errorf("account vanished when its usage was unreadable: %q", line)
+	}
+	if !strings.Contains(line, "unavailable") {
+		t.Errorf("missing usage should say so: %q", line)
+	}
+	if !strings.Contains(m.View(), "support") {
+		t.Error("view should still name the other subscription")
+	}
+}
+
+// A 429 must push the next poll out. The budget is shared with Claude Code's own
+// status line, so holding the normal schedule just extends the throttle.
+func TestRateLimitBacksOffTheNextPoll(t *testing.T) {
+	m := twoAccounts(t)
+	m.quotaNextAt = time.Now()
+	next, _ := m.Update(quotaMsg{usages: map[string]*quota.Usage{}, rateLimited: true})
+	got := next.(Model).quotaNextAt
+	if wait := time.Until(got); wait < quotaEvery {
+		t.Errorf("backoff = %v, want at least quotaEvery (%v)", wait, quotaEvery)
+	}
+}
+
+// Quota rides the slow tick but on its own longer schedule; a tick that isn't
+// due must not queue another usage round.
+func TestTickSkipsQuotaUntilDue(t *testing.T) {
+	// Assert on quotaNextAt rather than draining the batch: the tick command is a
+	// real 60s tea.Tick, and draining it would stall the suite for a minute.
+	// quotaNextAt is stamped exactly when a fetch is dispatched, so it's a
+	// faithful proxy.
+	m := twoAccounts(t)
+	armed := time.Now().Add(quotaEvery)
+	m.quotaNextAt = armed
+	next, _ := m.Update(tickMsg{})
+	if !next.(Model).quotaNextAt.Equal(armed) {
+		t.Error("a not-yet-due tick moved the quota schedule (so it fetched)")
+	}
+
+	// Once due, it fires and re-arms.
+	m.quotaNextAt = time.Now().Add(-time.Second)
+	next, _ = m.Update(tickMsg{})
+	if time.Until(next.(Model).quotaNextAt) < quotaEvery/2 {
+		t.Error("a due tick should re-arm the quota schedule")
+	}
+}

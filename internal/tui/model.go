@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -84,6 +85,17 @@ type assigner interface {
 
 const refreshEvery = 60 * time.Second
 
+// quotaEvery is how often the usage endpoint is polled — far slower than the
+// ticket refresh. Utilization moves slowly, the deck now asks once per
+// subscription rather than once in total, and Claude Code's own status line
+// spends the same per-account budget. Polling it every minute earns a 429, and
+// a 429 costs the whole usage bar.
+const quotaEvery = 5 * time.Minute
+
+// quotaBackoff is how long to wait after the endpoint rate-limits us. Longer
+// than quotaEvery so a throttled deck stops adding to the pile.
+const quotaBackoff = 15 * time.Minute
+
 // statusRefreshEvery can be far tighter than refreshEvery because the status
 // poll only hits the local backend (herdr socket / on-disk claude agents), never
 // the rate-limited Linear API.
@@ -153,7 +165,8 @@ type updateAvailableMsg struct{ latest string }
 // quotaMsg carries the latest Claude usage limits (5h / 7d windows) per account
 // name. Accounts whose usage couldn't be read are simply absent.
 type quotaMsg struct {
-	usages map[string]*quota.Usage
+	usages      map[string]*quota.Usage
+	rateLimited bool // endpoint threw 429 — back off rather than keep the schedule
 }
 
 // handoffMsg is the result of moving a session to another subscription.
@@ -241,6 +254,7 @@ type Model struct {
 	accounts      []account.Account       // Claude subscriptions on this machine, resolved once (globs the fs)
 	acctColors    map[string]string       // account name → accent color, so two decks never look alike
 	usages        map[string]*quota.Usage // account name → its 5h/7d usage, so one deck shows every account's headroom
+	quotaNextAt   time.Time               // earliest next usage poll (quotaEvery, or quotaBackoff after a 429)
 	handoffKey    string                  // ticket awaiting a hand-off confirm ("" = overlay closed)
 	handoffCands  []account.Account       // accounts that ticket can be handed to
 	handoffCursor int                     // index into handoffCands
@@ -272,6 +286,10 @@ func New(f Fetcher, root string, dry bool, backend Backend) Model {
 	m.accounts = account.All()
 	m.acctColors = account.Colors(m.accounts)
 	m.usages = map[string]*quota.Usage{}
+	// Init fires the first poll; schedule the next one a full interval out. Set
+	// here, not in Init — Init takes a value receiver and bubbletea drops the
+	// model it returns.
+	m.quotaNextAt = time.Now().Add(quotaEvery)
 	if ds, ok := f.(demoSessioner); ok {
 		m.demoStatuses = ds.DemoSessions()
 	}
@@ -336,25 +354,30 @@ func (m Model) fetchQuota() tea.Cmd {
 		// One call per subscription, concurrently — the point is to see whether
 		// another account has room while this one is throttled.
 		var (
-			mu  sync.Mutex
-			wg  sync.WaitGroup
-			out = map[string]*quota.Usage{}
+			mu      sync.Mutex
+			wg      sync.WaitGroup
+			out     = map[string]*quota.Usage{}
+			limited bool
 		)
 		for _, a := range accts {
 			wg.Add(1)
 			go func(a account.Account) {
 				defer wg.Done()
 				u, err := quota.Fetch(ctx, a.ConfigDir)
+				mu.Lock()
+				defer mu.Unlock()
 				if err != nil {
+					if errors.Is(err, quota.ErrRateLimited) {
+						limited = true
+					}
+					debugLog.Printf("quota %s: %v", a.Name, err)
 					return
 				}
-				mu.Lock()
 				out[a.Name] = &u
-				mu.Unlock()
 			}(a)
 		}
 		wg.Wait()
-		return quotaMsg{usages: out}
+		return quotaMsg{usages: out, rateLimited: limited}
 	}
 }
 
@@ -446,7 +469,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ensureVisible()
 
 	case tickMsg:
-		return m, tea.Batch(m.refresh(), m.refreshStatuses(), m.refreshSessions(), m.fetchQuota(), tick())
+		cmds := []tea.Cmd{m.refresh(), m.refreshStatuses(), m.refreshSessions(), tick()}
+		// Quota rides the slow tick but on its own, much longer schedule. Stamp
+		// the next time on dispatch, not on reply, or every tick until the first
+		// response would fire another round.
+		if !time.Now().Before(m.quotaNextAt) {
+			m.quotaNextAt = time.Now().Add(quotaEvery)
+			cmds = append(cmds, m.fetchQuota())
+		}
+		return m, tea.Batch(cmds...)
 
 	case statusTickMsg:
 		// Deliberately no Linear fetch or quota call — those stay on the slow tick.
@@ -478,6 +509,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Merge rather than replace: an account that failed this round keeps its
 		// previous reading instead of blanking a bar that was fine a moment ago.
 		maps.Copy(m.usages, msg.usages)
+		if msg.rateLimited {
+			m.quotaNextAt = time.Now().Add(quotaBackoff)
+		}
 
 	case refreshedMsg:
 		m.loading = false
@@ -1999,11 +2033,17 @@ func (m Model) quotaSegment() string {
 func (m Model) otherQuotaLine() string {
 	var parts []string
 	for _, a := range m.accounts {
-		u := m.usages[a.Name]
-		if a.Name == m.acct.Name || u == nil {
+		if a.Name == m.acct.Name {
 			continue
 		}
-		parts = append(parts, m.acctStyle(a.Name).Render("⦿"+a.Name)+" "+quotaPair(u, false))
+		// An account whose usage can't be read still gets a row. Dropping it made
+		// a rate-limited or logged-out subscription look like it wasn't detected
+		// at all, which is the opposite of what this line is for.
+		body := dimStyle.Render("usage unavailable")
+		if u := m.usages[a.Name]; u != nil {
+			body = quotaPair(u, false)
+		}
+		parts = append(parts, m.acctStyle(a.Name).Render("⦿"+a.Name)+" "+body)
 	}
 	if len(parts) == 0 {
 		return ""

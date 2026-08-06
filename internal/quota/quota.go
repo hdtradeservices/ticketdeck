@@ -10,6 +10,7 @@ package quota
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -20,6 +21,11 @@ import (
 )
 
 const usageURL = "https://api.anthropic.com/api/oauth/usage"
+
+// ErrRateLimited reports that the endpoint refused the request for rate reasons.
+// The budget is shared with Claude Code's own status line, so a deck that keeps
+// asking on its normal schedule just extends the throttle — callers back off.
+var ErrRateLimited = errors.New("usage endpoint: rate limited")
 
 // Usage is the pair of rate-limit windows Claude Code enforces.
 type Usage struct {
@@ -55,6 +61,9 @@ func Fetch(ctx context.Context, configDir string) (Usage, error) {
 		return Usage{}, err
 	}
 	defer res.Body.Close()
+	if res.StatusCode == http.StatusTooManyRequests {
+		return Usage{}, ErrRateLimited
+	}
 	if res.StatusCode != http.StatusOK {
 		return Usage{}, fmt.Errorf("usage endpoint: http %d", res.StatusCode)
 	}

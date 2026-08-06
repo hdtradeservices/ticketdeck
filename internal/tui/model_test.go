@@ -1416,3 +1416,106 @@ func TestHandoffNoticeUsesTheTargetsRealLaunchCommand(t *testing.T) {
 		t.Errorf("primary target should need no --account flag: %q", n)
 	}
 }
+
+// An account whose usage can't be read must still appear. Dropping the row made
+// a rate-limited subscription look like it was never detected — which is exactly
+// how this reads to someone checking whether their second account is wired up.
+func TestOtherAccountShownEvenWithoutUsage(t *testing.T) {
+	m := twoAccounts(t)
+	m.usages = map[string]*quota.Usage{"matt": {FiveHourPct: 94}} // support failed
+	line := m.otherQuotaLine()
+	if !strings.Contains(line, "support") {
+		t.Errorf("account vanished when its usage was unreadable: %q", line)
+	}
+	if !strings.Contains(line, "unavailable") {
+		t.Errorf("missing usage should say so: %q", line)
+	}
+	if !strings.Contains(m.View(), "support") {
+		t.Error("view should still name the other subscription")
+	}
+}
+
+// A 429 must push the next poll out. The budget is shared with Claude Code's own
+// status line, so holding the normal schedule just extends the throttle.
+func TestRateLimitBacksOffTheNextPoll(t *testing.T) {
+	m := twoAccounts(t)
+	m.quotaNextAt = time.Now()
+	next, _ := m.Update(quotaMsg{usages: map[string]*quota.Usage{}, rateLimited: true})
+	got := next.(Model).quotaNextAt
+	if wait := time.Until(got); wait < quotaEvery {
+		t.Errorf("backoff = %v, want at least quotaEvery (%v)", wait, quotaEvery)
+	}
+}
+
+// Quota rides the slow tick but on its own longer schedule; a tick that isn't
+// due must not queue another usage round.
+func TestTickSkipsQuotaUntilDue(t *testing.T) {
+	// Assert on quotaNextAt rather than draining the batch: the tick command is a
+	// real 60s tea.Tick, and draining it would stall the suite for a minute.
+	// quotaNextAt is stamped exactly when a fetch is dispatched, so it's a
+	// faithful proxy.
+	m := twoAccounts(t)
+	armed := time.Now().Add(quotaEvery)
+	m.quotaNextAt = armed
+	next, _ := m.Update(tickMsg{})
+	if !next.(Model).quotaNextAt.Equal(armed) {
+		t.Error("a not-yet-due tick moved the quota schedule (so it fetched)")
+	}
+
+	// Once due, it fires and re-arms.
+	m.quotaNextAt = time.Now().Add(-time.Second)
+	next, _ = m.Update(tickMsg{})
+	if time.Until(next.(Model).quotaNextAt) < quotaEvery/2 {
+		t.Error("a due tick should re-arm the quota schedule")
+	}
+}
+
+// The other-accounts header row must be reserved in viewportHeight. It wasn't,
+// so the body ran one line too tall and pushed the footer off-screen — in
+// exactly the multi-account case the row exists to serve.
+func TestOtherQuotaLineIsReservedInViewport(t *testing.T) {
+	m := twoAccounts(t)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 14})
+	m = next.(Model)
+	if !m.hasOtherQuotaLine() {
+		t.Fatal("fixture should render the other-accounts row")
+	}
+
+	// The rendered frame must fit the terminal, or the footer is off-screen.
+	lines := strings.Count(strings.TrimRight(m.View(), "\n"), "\n") + 1
+	if lines > m.height {
+		t.Errorf("frame is %d lines in a %d-line terminal — the footer scrolls off", lines, m.height)
+	}
+	if !strings.Contains(m.View(), "↑↓ move") {
+		t.Error("help footer missing from the frame")
+	}
+
+	// One account: no extra row, so one more body line is available.
+	solo := loadedSingleAccount(t)
+	next, _ = solo.Update(tea.WindowSizeMsg{Width: 100, Height: 14})
+	solo = next.(Model)
+	if solo.hasOtherQuotaLine() {
+		t.Fatal("single-account deck should not render the row")
+	}
+	if solo.viewportHeight() != m.viewportHeight()+1 {
+		t.Errorf("viewport heights: single=%d two-account=%d, want single to be exactly one larger",
+			solo.viewportHeight(), m.viewportHeight())
+	}
+}
+
+// loadedSingleAccount is a deck with only the primary subscription on disk.
+func loadedSingleAccount(t *testing.T) Model {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("TICKETDECK_ACCOUNT", "matt")
+	return loaded(t)
+}

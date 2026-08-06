@@ -1656,6 +1656,9 @@ func (m Model) viewportHeight() int {
 		return 0
 	}
 	reserved := 1 + 1 + 1 // title + blank spacer + help line
+	if m.hasOtherQuotaLine() {
+		reserved++ // second header line: the other subscriptions' usage
+	}
 	if m.err != nil || m.notice != "" {
 		reserved++ // status line above help
 	}
@@ -2030,6 +2033,11 @@ func (m Model) quotaSegment() string {
 // the title. This is why every account is read, not just the active one: when
 // this one is throttled, the decision you need is whether another has headroom,
 // and that answer must not require switching decks to go look.
+// hasOtherQuotaLine reports whether the header carries the other-accounts row,
+// so viewportHeight can reserve a line for it. Kept beside otherQuotaLine: if
+// the two ever disagree the body is sized wrong and the footer scrolls off.
+func (m Model) hasOtherQuotaLine() bool { return len(m.otherAccounts()) > 0 }
+
 func (m Model) otherQuotaLine() string {
 	var parts []string
 	for _, a := range m.accounts {

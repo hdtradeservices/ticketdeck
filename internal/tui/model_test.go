@@ -1469,3 +1469,53 @@ func TestTickSkipsQuotaUntilDue(t *testing.T) {
 		t.Error("a due tick should re-arm the quota schedule")
 	}
 }
+
+// The other-accounts header row must be reserved in viewportHeight. It wasn't,
+// so the body ran one line too tall and pushed the footer off-screen — in
+// exactly the multi-account case the row exists to serve.
+func TestOtherQuotaLineIsReservedInViewport(t *testing.T) {
+	m := twoAccounts(t)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 14})
+	m = next.(Model)
+	if !m.hasOtherQuotaLine() {
+		t.Fatal("fixture should render the other-accounts row")
+	}
+
+	// The rendered frame must fit the terminal, or the footer is off-screen.
+	lines := strings.Count(strings.TrimRight(m.View(), "\n"), "\n") + 1
+	if lines > m.height {
+		t.Errorf("frame is %d lines in a %d-line terminal — the footer scrolls off", lines, m.height)
+	}
+	if !strings.Contains(m.View(), "↑↓ move") {
+		t.Error("help footer missing from the frame")
+	}
+
+	// One account: no extra row, so one more body line is available.
+	solo := loadedSingleAccount(t)
+	next, _ = solo.Update(tea.WindowSizeMsg{Width: 100, Height: 14})
+	solo = next.(Model)
+	if solo.hasOtherQuotaLine() {
+		t.Fatal("single-account deck should not render the row")
+	}
+	if solo.viewportHeight() != m.viewportHeight()+1 {
+		t.Errorf("viewport heights: single=%d two-account=%d, want single to be exactly one larger",
+			solo.viewportHeight(), m.viewportHeight())
+	}
+}
+
+// loadedSingleAccount is a deck with only the primary subscription on disk.
+func loadedSingleAccount(t *testing.T) Model {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("TICKETDECK_ACCOUNT", "matt")
+	return loaded(t)
+}

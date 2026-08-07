@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/hdtradeservices/ticketdeck/internal/account"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
@@ -1593,4 +1595,60 @@ func loadedSingleAccount(t *testing.T) Model {
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
 	t.Setenv("TICKETDECK_ACCOUNT", "matt")
 	return loaded(t)
+}
+
+// ansiRe strips styling so a row can be measured in the columns a terminal
+// actually gives it.
+var ansiRe = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+// A row must never render wider than the width it was given. The layout sums
+// counted runes, but ⛔ (the blocked-by note) and any emoji in a Linear title
+// take two columns each, so those rows overran by one and wrapped.
+func TestRowNeverOverrunsItsWidth(t *testing.T) {
+	m := twoAccounts(t)
+	m.width = 90
+	m.owners = map[string]account.Owner{"ZEN-1": {Name: "support", Status: session.Idle, Live: true}}
+	m.sessions = map[string]session.Status{"ZEN-1": session.Idle}
+	m.ownerCol = ownerColWidth(m.accounts, m.owners)
+
+	for _, is := range []linear.Issue{
+		{Identifier: "ZEN-1", Title: "a session row with an owner dot and a long title to truncate", Priority: 1},
+		{Identifier: "ZEN-2", Title: "no session anywhere, so the owner column is blank padding here", Priority: 1},
+		{Identifier: "ZEN-3", Title: "blocked, so a two-column glyph trails the row", Priority: 2,
+			StateName: "Blocked", BlockedBy: []linear.Relation{
+				{Identifier: "ZEN-90", StateName: "Triage", StateType: "unstarted"},
+				{Identifier: "ZEN-91", StateName: "Triage", StateType: "unstarted"},
+			}},
+		{Identifier: "ZEN-4", Title: "🎉 an emoji leads this title", Priority: 2},
+	} {
+		for _, sel := range []bool{false, true} {
+			got := runewidth.StringWidth(ansiRe.ReplaceAllString(m.renderIssue(is, sel), ""))
+			if got > m.rowWidth() {
+				t.Errorf("%s (selected=%v) rendered %d columns, row width is %d",
+					is.Identifier, sel, got, m.rowWidth())
+			}
+		}
+	}
+}
+
+// The other-subscriptions line sits directly under the title bar's own account,
+// so the two account names must start in the same column. The dots lining up
+// isn't enough — a missing space after the dot shifts only the name.
+func TestOtherAccountsLineAlignsWithTitleBar(t *testing.T) {
+	m := twoAccounts(t)
+	m.width = 120
+	line1 := ansiRe.ReplaceAllString("TicketDeck"+m.accountSegment(), "")
+	line2 := ansiRe.ReplaceAllString(m.otherQuotaLine(), "")
+
+	col := func(line, name string) int {
+		i := strings.Index(line, name)
+		if i < 0 {
+			t.Fatalf("account %q not found in %q", name, line)
+		}
+		return runewidth.StringWidth(line[:i])
+	}
+	if a, b := col(line1, "matt"), col(line2, "support"); a != b {
+		t.Errorf("account names start in different columns: title bar %d, other-accounts line %d\n%s\n%s",
+			a, b, line1, line2)
+	}
 }

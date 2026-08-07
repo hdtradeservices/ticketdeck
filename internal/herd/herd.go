@@ -57,8 +57,22 @@ type agentListResp struct {
 }
 
 // List enumerates herdr agents (requires a running herdr server).
-func List() ([]Agent, error) {
-	out, err := exec.Command(herdrBin, "agent", "list").Output()
+func List() ([]Agent, error) { return ListAt("") }
+
+// ListAt enumerates the agents of the herdr server listening on socket, rather
+// than the one this process's environment points at. That is how a deck sees
+// ANOTHER account's sessions: `deck --account NAME` gives each subscription its
+// own server socket (scripts/deck), so the ambient list only ever holds this
+// deck's own work. An empty socket means the ambient environment.
+//
+// Only HERDR_SOCKET_PATH is overridden. The client socket stays this process's
+// own — pointing it at the peer's would put two clients on one path.
+func ListAt(socket string) ([]Agent, error) {
+	cmd := exec.Command(herdrBin, "agent", "list")
+	if socket != "" {
+		cmd.Env = append(os.Environ(), "HERDR_SOCKET_PATH="+socket)
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("herdr agent list: %w", err)
 	}

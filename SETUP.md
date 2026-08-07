@@ -87,6 +87,7 @@ transcript persists, so it stays resumable).
 
 - **Priority** group headers are color-coded: Urgent (red) · High (orange) · Medium (yellow) · Low (blue) · No priority (gray), always showing a `(count)`.
 - **Session** badge per ticket: `●` working (green) · `◆` needs input (amber) · `○` idle (cyan) · `✓` done · `↻` **resumable** (an on-disk session you can reattach — shown even right after a fresh start, before any agent is running) · `·` none yet.
+- **Account** dot `⦿` left of the session badge, in the owning subscription's color — which Claude account is running that ticket's session, including one running under another account. Labelled with the account name on the highlighted row. Only rendered when you have more than one subscription; see [Multiple Claude subscriptions](#multiple-claude-subscriptions-accounts).
 - **Top-10 focus** — priority sections are auto-folded unless they hold one of your top 10 tickets (by priority, then status, then recency), and this is re-applied on each refresh. So if your top 10 are all Urgent, only Urgent stays open; if they span Urgent/High/Medium, those stay open and lower sections fold (shown as `▸ Low (3)`). Expand any folded section with `→`/`Space` (it re-folds on the next refresh).
 - **Working tickets are dimmed** — a ticket whose session is actively `working` renders in faint gray (no bright id/title), so your eye is drawn to the tickets that still need you (needs-input, idle, resumable, untouched) rather than the ones already in progress. Move the cursor onto one and it still highlights normally.
 - **Time-in-state** — live sessions (working / needs-input / idle) show how long they've held that state once it's been ≥1 minute, e.g. `◆ needs input 20m` or `● working 45m`. Useful for spotting a session parked a while (waiting on CI, or one that's needed input for a bit). The detail view (`d`) spells it out. Note: it's measured from when the deck first saw the state, not necessarily the session's true start.
@@ -207,6 +208,29 @@ TicketDeck  ⦿ matt  assigned · open only  ◷ 5h 94% (12m) · 7d 61%
 
 So when one account is throttled you can see the other has room without
 switching decks to go look.
+
+**Seeing which account is on a ticket.** Every ticket with a session carries a
+`⦿` dot in the owning subscription's color, in the column left of the status
+badge — including sessions running under the *other* account, which this deck
+otherwise can't see. Move the cursor onto a row and the dot is labelled with the
+account name:
+
+```
+          ⦿ ● working 4m    ZEN-3395  ●  fix shipworks sweep
+▶ support ⦿ ● working 12m   ZEN-3401  ○  retry backoff
+          ⦿ ↻ resumable     ZEN-3402  ○  order alert dedupe
+```
+
+The name only appears on the highlighted row (naming every row would cost the
+title that much width on every line), but the column is reserved either way, so
+moving the cursor never shifts the columns. A deck with one subscription doesn't
+render the column at all.
+
+Ownership is read from each account's transcripts on disk plus its herdr
+workspace, so an account whose deck isn't running still shows up. When a ticket
+has been worked under both accounts — a hand-off leaves the transcript behind in
+the source — the dot names the live session, or the one that wrote most
+recently.
 
 **Handing a session to the other subscription.** `H` on a ticket moves its
 session to another account — for when the current subscription hits a limit

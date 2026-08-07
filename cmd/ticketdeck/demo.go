@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 
+	"github.com/hdtradeservices/ticketdeck/internal/account"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
 )
@@ -42,6 +43,18 @@ func (demoFetcher) DemoSessions() map[string]session.Status {
 		"DEMO-103": session.Idle,
 		"DEMO-106": session.Completed,
 		"DEMO-104": session.Stopped,
+	}
+}
+
+// DemoOwners fabricates which subscription runs each session, so --demo shows
+// the account column on a machine that only has one Claude subscription.
+func (demoFetcher) DemoOwners() map[string]account.Owner {
+	return map[string]account.Owner{
+		"DEMO-101": {Name: "default", Status: session.Working, Live: true},
+		"DEMO-102": {Name: "support", Status: session.NeedsInput, Live: true},
+		"DEMO-103": {Name: "support", Status: session.Idle, Live: true},
+		"DEMO-104": {Name: "default", Status: session.Stopped},
+		"DEMO-106": {Name: "support", Status: session.Completed},
 	}
 }
 

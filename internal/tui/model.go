@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -136,6 +137,7 @@ type refreshedMsg struct {
 
 type statusesMsg struct {
 	statuses map[string]session.Status
+	owners   map[string]account.Owner // ticket key → the subscription running its session
 	err      error
 }
 
@@ -224,8 +226,11 @@ type Model struct {
 	backend       Backend
 	sessions      map[string]session.Status // ticket key → session status
 	statusSince   map[string]time.Time      // ticket key → when its current status was first seen
+	owners        map[string]account.Owner  // ticket key → which subscription runs its session
+	ownerCol      int                       // width of the account column (0 = one account, nothing to label)
 	otherSessions []session.SessionRef      // live sessions not tied to a visible ticket
 	demoStatuses  map[string]session.Status // --demo override; nil in real use
+	demoOwners    map[string]account.Owner  // --demo override; nil in real use
 	detail        *linear.Issue             // non-nil = showing the description overlay
 	detailOffset  int                       // scroll offset within the detail overlay
 	loading       bool
@@ -278,8 +283,14 @@ type demoOtherSessioner interface {
 	DemoOtherSessions() []session.SessionRef
 }
 
+// demoOwner lets --demo inject canned session ownership, so the account column
+// is visible on a machine that only has one subscription.
+type demoOwner interface {
+	DemoOwners() map[string]account.Owner
+}
+
 func New(f Fetcher, root string, dry bool, backend Backend) Model {
-	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, collapsed: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != ""}
+	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != ""}
 	// Resolved once, not per frame: All() globs the filesystem, and View runs on
 	// every keystroke.
 	m.acct = account.Current()
@@ -296,6 +307,27 @@ func New(f Fetcher, root string, dry bool, backend Backend) Model {
 	if dos, ok := f.(demoOtherSessioner); ok {
 		m.otherSessions = dos.DemoOtherSessions()
 	}
+	if dow, ok := f.(demoOwner); ok {
+		m.demoOwners = dow.DemoOwners()
+		m.owners = m.demoOwners
+		// --demo runs on whatever machine it's on, usually a one-subscription
+		// one. Give its fabricated accounts real accent colors (appended, so the
+		// machine's own accounts keep theirs) or every dot would be the same
+		// color and the column would demonstrate nothing.
+		accts := m.accounts
+		var extra []string
+		for _, o := range m.owners {
+			if _, known := m.acctColors[o.Name]; !known && !slices.Contains(extra, o.Name) {
+				extra = append(extra, o.Name)
+			}
+		}
+		slices.Sort(extra) // map order is random; colors must not shuffle per run
+		for _, n := range extra {
+			accts = append(accts, account.Account{Name: n})
+		}
+		m.acctColors = account.Colors(accts)
+	}
+	m.ownerCol = ownerColWidth(m.accounts, m.owners)
 	if w, ok := f.(statusWriter); ok {
 		m.writer = w
 	}
@@ -405,20 +437,26 @@ func (m Model) refresh() tea.Cmd {
 func (m Model) refreshStatuses() tea.Cmd {
 	keys := m.issueKeys()
 	if m.demoStatuses != nil {
-		ds := m.demoStatuses
+		ds, owners := m.demoStatuses, m.demoOwners
 		return func() tea.Msg {
 			out := make(map[string]session.Status, len(keys))
 			for _, k := range keys {
 				out[k] = ds[k]
 			}
-			return statusesMsg{statuses: out}
+			return statusesMsg{statuses: out, owners: owners}
 		}
 	}
 	b := m.backend
 	cwd := m.root
+	// Ownership is only a question with more than one subscription on the
+	// machine; a single-account deck skips the peer polling entirely.
+	accts := m.accounts
+	if len(accts) < 2 {
+		accts = nil
+	}
 	return func() tea.Msg {
 		st, err := b.Statuses(keys, cwd)
-		return statusesMsg{statuses: st, err: err}
+		return statusesMsg{statuses: st, owners: account.Owners(keys, accts), err: err}
 	}
 }
 
@@ -525,6 +563,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.refreshStatuses(), m.refreshSessions())
 
 	case statusesMsg:
+		// Ownership is resolved from disk and the peer workspaces, not from the
+		// backend, so it stands even when the backend poll failed.
+		if msg.owners != nil {
+			m.owners = msg.owners
+			m.ownerCol = ownerColWidth(m.accounts, m.owners)
+		}
 		if msg.err != nil {
 			debugLog.Printf("status refresh error: %v", msg.err)
 		} else {
@@ -2012,11 +2056,17 @@ func (m Model) accountSegment() string {
 
 // acctStyle is the accent style for one account name.
 func (m Model) acctStyle(name string) lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(m.acctColor(name))
+}
+
+// acctColor is one account's accent color, defaulting for a name with no color
+// assigned (a peer that appeared between two All() scans).
+func (m Model) acctColor(name string) lipgloss.Color {
 	c, ok := m.acctColors[name]
 	if !ok {
 		c = "111"
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(c))
+	return lipgloss.Color(c)
 }
 
 // quotaSegment renders this account's Claude 5h/7d usage for the title bar,
@@ -2120,6 +2170,65 @@ func (m Model) titleMeta() string {
 // label ("needs input").
 const sessionCol = 17 // fits "◆ needs input 20m" (badge + label + elapsed)
 
+// ownerNameMax caps how much of an account name the row column reserves, so one
+// long name can't eat the title column.
+const ownerNameMax = 8
+
+// ownerColWidth sizes the account column: a ⦿ dot in the owning subscription's
+// accent color on every session row, and its name on the selected row only —
+// naming every row would spend the title column's width on something that
+// rarely changes. The column is reserved at its full width either way, so moving
+// the cursor doesn't shift every column to its right; the name grows leftward
+// into space the dot already reserved.
+//
+// 0 when there is nothing to disambiguate (one subscription on the machine), so
+// a single-account deck looks exactly as it did.
+func ownerColWidth(accts []account.Account, owners map[string]account.Owner) int {
+	names := map[string]bool{}
+	if len(accts) > 1 {
+		for _, a := range accts {
+			names[a.Name] = true
+		}
+	}
+	for _, o := range owners {
+		names[o.Name] = true
+	}
+	if len(names) < 2 {
+		return 0
+	}
+	widest := 0
+	for n := range names {
+		if l := len([]rune(n)); l > widest {
+			widest = l
+		}
+	}
+	if widest > ownerNameMax {
+		widest = ownerNameMax
+	}
+	return widest + 3 // name + space + ⦿ + trailing gap
+}
+
+// ownerCell renders the account column for a row: right-aligned name (selected
+// rows only) then the dot, padded to ownerCol. Returns "" when the column is
+// off, and blank padding for a ticket with no session under any account.
+func (m Model) ownerCell(name string, selected bool) (string, lipgloss.Color) {
+	if m.ownerCol == 0 {
+		return "", ""
+	}
+	if name == "" {
+		return strings.Repeat(" ", m.ownerCol), ""
+	}
+	label := ""
+	if selected {
+		if r := []rune(name); len(r) > m.ownerCol-3 {
+			label = string(r[:m.ownerCol-3])
+		} else {
+			label = name
+		}
+	}
+	return fmt.Sprintf("%*s ⦿ ", m.ownerCol-3, label), m.acctColor(name)
+}
+
 // elapsedLabel formats how long a session has been in its current state, or ""
 // for under a minute (so fresh/transient states stay uncluttered).
 func elapsedLabel(since time.Time) string {
@@ -2152,15 +2261,16 @@ func (m Model) elapsedInStatus(key string, st session.Status) string {
 func (m Model) renderIssue(is linear.Issue, selected bool) string {
 	st := m.sessions[is.Identifier]
 	cell, color := sessionCellText(st, m.elapsedInStatus(is.Identifier, st))
+	own, ownColor := m.ownerCell(m.owners[is.Identifier].Name, selected)
 	id := fmt.Sprintf("%-9s", is.Identifier)
 	prG, prC := prMark(is.PRs)
 	tagText, tagColor := validationTag(is.Labels)
 	note := blockedNote(is) // "⛔ ZEN-1, ZEN-2" on a Blocked ticket, else ""
 
 	// Truncate the title to what's left after the fixed columns:
-	// indent(2) + badge + space + id(9) + space + prmark(2) + space, minus the
-	// trailing validation tag and blocked-by note (each with a leading space).
-	avail := m.rowWidth() - (2 + sessionCol + 1 + 9 + 1 + prMarkCol + 1)
+	// indent(2) + owner + badge + space + id(9) + space + prmark(2) + space, minus
+	// the trailing validation tag and blocked-by note (each with a leading space).
+	avail := m.rowWidth() - (2 + m.ownerCol + sessionCol + 1 + 9 + 1 + prMarkCol + 1)
 	if tagText != "" {
 		avail -= len([]rune(tagText)) + 1
 	}
@@ -2177,7 +2287,7 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 
 	if selected {
 		// Plain text (no inner colors) so the selection bg spans the whole row.
-		content := fmt.Sprintf("▶ %s %s %s %s", cell, id, prG, title)
+		content := fmt.Sprintf("▶ %s%s %s %s %s", own, cell, id, prG, title)
 		if tagText != "" {
 			content += " " + tagText
 		}
@@ -2202,12 +2312,15 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 	// for a while without drawing the eye. Strike only the text tokens, not the
 	// column gaps or id padding, so the strikethrough tracks the words. Validate
 	// is a completed-type state but an active gate, so it's exempt.
+	// The account dot keeps its own accent color in every row style below —
+	// dimming or striking it would defeat the one thing it is there to say.
+	ownR := lipgloss.NewStyle().Foreground(ownColor).Render(own)
 	if is.IsDone() && !is.IsValidate() {
 		strike := doneRowStyle
 		gap := doneRowStyle.Strikethrough(false)
 		idText := strings.TrimRight(id, " ")
 		idPad := id[len(idText):]
-		row := "  " + strike.Render(cell) + gap.Render(" ") +
+		row := "  " + ownR + strike.Render(cell) + gap.Render(" ") +
 			strike.Render(idText) + gap.Render(idPad+" ") +
 			strike.Render(prG) + gap.Render(" ") +
 			strike.Render(title)
@@ -2217,11 +2330,11 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 	// (uniform dim, no cyan id / bright title) so the eye is drawn to the
 	// tickets that still need attention.
 	if st == session.Working {
-		return workingRowStyle.Render(fmt.Sprintf("  %s %s %s %s", cell, id, prG, title)) + tag + noteR
+		return "  " + ownR + workingRowStyle.Render(fmt.Sprintf("%s %s %s %s", cell, id, prG, title)) + tag + noteR
 	}
 	badge := lipgloss.NewStyle().Foreground(color).Render(cell)
 	pr := lipgloss.NewStyle().Foreground(prC).Render(prG)
-	return fmt.Sprintf("  %s %s %s %s", badge, idStyle.Render(id), pr, title) + tag + noteR
+	return fmt.Sprintf("  %s%s %s %s %s", ownR, badge, idStyle.Render(id), pr, title) + tag + noteR
 }
 
 // blockedNote returns a compact "⛔ blocker keys" note for a Blocked ticket that
@@ -2270,19 +2383,22 @@ func validationTag(labels []string) (string, lipgloss.Color) {
 	return "", lipgloss.Color("")
 }
 
-// renderSession renders an "other sessions" row: its status badge + name.
+// renderSession renders an "other sessions" row: its status badge + name. These
+// come from this deck's own backend, so the account column always names this
+// subscription — the peers' equivalents show up on their own decks.
 func (m Model) renderSession(ref session.SessionRef, selected bool) string {
 	cell, color := sessionCellText(ref.Status, "")
+	own, ownColor := m.ownerCell(m.acct.Name, selected)
 	name := ref.Name
-	avail := m.rowWidth() - (2 + sessionCol + 1)
+	avail := m.rowWidth() - (2 + m.ownerCol + sessionCol + 1)
 	if avail > 0 && len([]rune(name)) > avail {
 		name = string([]rune(name)[:avail-1]) + "…"
 	}
 	if selected {
-		return selStyle.Width(m.rowWidth()).Render(fmt.Sprintf("▶ %s %s", cell, name))
+		return selStyle.Width(m.rowWidth()).Render(fmt.Sprintf("▶ %s%s %s", own, cell, name))
 	}
 	badge := lipgloss.NewStyle().Foreground(color).Render(cell)
-	return fmt.Sprintf("  %s %s", badge, name)
+	return fmt.Sprintf("  %s%s %s", lipgloss.NewStyle().Foreground(ownColor).Render(own), badge, name)
 }
 
 // sessionCellText returns the badge + status label as plain text padded to

@@ -12,6 +12,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/hdtradeservices/ticketdeck/internal/account"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/quota"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
@@ -725,6 +726,80 @@ func TestWorkingTicketDeEmphasized(t *testing.T) {
 	// from a normal, attention-worthy row.
 	if strings.Contains(normal, "\x1b[") && working == normal {
 		t.Error("working ticket should render de-emphasized vs a normal ticket")
+	}
+}
+
+// ownedDeck is a two-subscription deck where the peer holds ZEN-9's session —
+// the case the account column exists for.
+func ownedDeck(t *testing.T) Model {
+	t.Helper()
+	m := twoAccounts(t)
+	m.owners = map[string]account.Owner{
+		"ZEN-9": {Name: "support", Status: session.Working, Live: true},
+	}
+	m.ownerCol = ownerColWidth(m.accounts, m.owners)
+	return m
+}
+
+func TestAccountColumnNamesTheOwnerOnTheSelectedRow(t *testing.T) {
+	m := ownedDeck(t)
+	is := linear.Issue{Identifier: "ZEN-9", Title: "urgent thing", Priority: 1}
+
+	// Unselected: a dot, no name — naming every row would spend the title
+	// column's width on something that rarely changes.
+	row := m.renderIssue(is, false)
+	if !strings.Contains(row, "⦿") {
+		t.Errorf("row with a session should carry an account dot:\n%q", row)
+	}
+	if strings.Contains(row, "support") {
+		t.Errorf("unselected row should not spell out the account:\n%q", row)
+	}
+	// Selected: the name, which is the whole point of the column.
+	if sel := m.renderIssue(is, true); !strings.Contains(sel, "support") {
+		t.Errorf("selected row should name the owning account:\n%q", sel)
+	}
+
+	// A ticket nobody has a session for gets blank padding, not a dot.
+	other := linear.Issue{Identifier: "ZEN-1", Title: "high a", Priority: 2}
+	if strings.Contains(m.renderIssue(other, false), "⦿") {
+		t.Errorf("ticket with no session anywhere should have no dot:\n%q", m.renderIssue(other, false))
+	}
+}
+
+// Selecting a row must not shift the columns to its right, so the reserved width
+// is the same either way.
+func TestAccountColumnWidthIsStable(t *testing.T) {
+	m := ownedDeck(t)
+	plain, _ := m.ownerCell("support", false)
+	named, _ := m.ownerCell("support", true)
+	blank, _ := m.ownerCell("", false)
+	if len([]rune(plain)) != m.ownerCol || len([]rune(named)) != m.ownerCol || len([]rune(blank)) != m.ownerCol {
+		t.Errorf("owner cells must all be %d wide: %q / %q / %q", m.ownerCol, plain, named, blank)
+	}
+}
+
+// One subscription means nothing to disambiguate — the column costs width and
+// says nothing, so it must not appear at all.
+func TestAccountColumnAbsentWithOneSubscription(t *testing.T) {
+	one := []account.Account{{Name: "matt", ConfigDir: "/home/u/.claude"}}
+	if got := ownerColWidth(one, nil); got != 0 {
+		t.Errorf("ownerColWidth with one account = %d, want 0", got)
+	}
+	m := loaded(t)
+	m.accounts, m.ownerCol = one, 0
+	if row := m.renderIssue(linear.Issue{Identifier: "ZEN-9", Title: "x", Priority: 1}, false); strings.Contains(row, "⦿") {
+		t.Errorf("single-account deck should render no account column:\n%q", row)
+	}
+}
+
+// Ownership comes from disk and the peer workspaces, not from the backend, so a
+// failed status poll must not blank it.
+func TestOwnersSurviveAFailedStatusPoll(t *testing.T) {
+	m := ownedDeck(t)
+	owners := map[string]account.Owner{"ZEN-9": {Name: "support"}}
+	next, _ := m.Update(statusesMsg{owners: owners, err: os.ErrDeadlineExceeded})
+	if got := next.(Model).owners["ZEN-9"].Name; got != "support" {
+		t.Errorf("owner after a failed poll = %q, want support", got)
 	}
 }
 

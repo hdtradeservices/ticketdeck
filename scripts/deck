@@ -136,6 +136,22 @@ if [ -z "$(deck_pane)" ]; then
   # so tab #1 is never orphaned. The `sleep` avoids a tight loop on hard failure.
   herdr agent start deck --cwd "$LAUNCH_ROOT" -- \
     bash -c 'while true; do ticketdeck || sleep 1; done' >/dev/null 2>&1 || true
+else
+  # Reusing the agent above also reuses whatever binary it started with, so
+  # `ticketdeck update` appeared to do nothing: the deck kept running the
+  # replaced file for as long as the pane lived. Kill the stale process — the
+  # respawn loop restarts it from the new binary within a second, and the agent,
+  # its pane and tab #1 all survive, which closing the agent would not.
+  # Linux-only: on macOS there is no /proc and readlink finds nothing, so this
+  # no-ops rather than misfiring.
+  # `|| true`: no match is the normal case, not an error. A `for` list doesn't
+  # trip `set -e` on bash 5.1, but this script is the only way into the deck —
+  # it must not be one shell-version difference away from refusing to attach.
+  for pid in $(pgrep -x ticketdeck 2>/dev/null || true); do
+    case "$(readlink "/proc/$pid/exe" 2>/dev/null)" in
+      *"(deleted)") kill "$pid" 2>/dev/null || true ;;
+    esac
+  done
 fi
 
 # 3b. close any non-agent (default shell) panes so the workspace shows only the

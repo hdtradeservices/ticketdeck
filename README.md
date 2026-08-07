@@ -34,7 +34,13 @@ The deck checks for a newer release on startup (cached daily, non-blocking) and 
 
 ```sh
 ticketdeck update      # pulls the latest release (re-runs the installer)
+deck                   # restarts the deck onto it
 ```
+
+Run `deck` after updating. `ticketdeck update` replaces the binary on disk, but a deck already
+running in a herdr pane keeps the old one until its process restarts — so the update looks like
+it did nothing. `deck` now spots that stale process and restarts it in place, keeping the agent
+and tab #1.
 
 `ticketdeck --version` prints the running build. Releases are cut by tagging (`vX.Y.Z`), which
 builds prebuilt binaries for Linux/macOS — so teammates install and update without needing Go.

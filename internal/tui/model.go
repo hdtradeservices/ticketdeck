@@ -20,6 +20,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/hdtradeservices/ticketdeck/internal/account"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
@@ -2101,7 +2102,10 @@ func (m Model) otherQuotaLine() string {
 		if u := m.usages[a.Name]; u != nil {
 			body = quotaPair(u, false)
 		}
-		parts = append(parts, m.acctStyle(a.Name).Render("⦿"+a.Name)+" "+body)
+		// "⦿ name", spaced exactly as accountSegment renders the active account —
+		// without the space this line's names sit one column left of the title
+		// bar's and the two rows visibly fail to stack.
+		parts = append(parts, m.acctStyle(a.Name).Render("⦿ "+a.Name)+" "+body)
 	}
 	if len(parts) == 0 {
 		return ""
@@ -2166,6 +2170,21 @@ func (m Model) titleMeta() string {
 	return meta
 }
 
+// cols is a string's width in terminal columns, which is what every layout sum
+// here is actually counting. Rune count is the wrong unit: ⛔ (the blocked-by
+// note) and any emoji in a Linear title occupy two columns each, so counting
+// runes under-measures them and the row overruns its width.
+func cols(s string) int { return runewidth.StringWidth(s) }
+
+// truncCols shortens s to at most max columns, ending in "…" when it had to cut.
+// Slicing runes would cut mid-glyph and still overrun on a two-column rune.
+func truncCols(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	return runewidth.Truncate(s, max, "…")
+}
+
 // sessionCol is the fixed width of the badge+label column, sized to the widest
 // label ("needs input").
 const sessionCol = 17 // fits "◆ needs input 20m" (badge + label + elapsed)
@@ -2198,7 +2217,7 @@ func ownerColWidth(accts []account.Account, owners map[string]account.Owner) int
 	}
 	widest := 0
 	for n := range names {
-		if l := len([]rune(n)); l > widest {
+		if l := cols(n); l > widest {
 			widest = l
 		}
 	}
@@ -2218,15 +2237,16 @@ func (m Model) ownerCell(name string, selected bool) (string, lipgloss.Color) {
 	if name == "" {
 		return strings.Repeat(" ", m.ownerCol), ""
 	}
+	nameCol := m.ownerCol - 3
 	label := ""
 	if selected {
-		if r := []rune(name); len(r) > m.ownerCol-3 {
-			label = string(r[:m.ownerCol-3])
-		} else {
-			label = name
-		}
+		// "…" rather than a bare cut: "averylo…" reads as a shortened name,
+		// "averylon" reads as a different account.
+		label = truncCols(name, nameCol)
 	}
-	return fmt.Sprintf("%*s ⦿ ", m.ownerCol-3, label), m.acctColor(name)
+	// Pad by columns, not by fmt's %*s — that counts runes, so a two-column
+	// glyph in a name would push the dot out of its column.
+	return strings.Repeat(" ", nameCol-cols(label)) + label + " ⦿ ", m.acctColor(name)
 }
 
 // elapsedLabel formats how long a session has been in its current state, or ""
@@ -2272,18 +2292,15 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 	// the trailing validation tag and blocked-by note (each with a leading space).
 	avail := m.rowWidth() - (2 + m.ownerCol + sessionCol + 1 + 9 + 1 + prMarkCol + 1)
 	if tagText != "" {
-		avail -= len([]rune(tagText)) + 1
+		avail -= cols(tagText) + 1
 	}
 	if note != "" {
-		avail -= len([]rune(note)) + 1
+		avail -= cols(note) + 1
 	}
 	if avail < 12 {
 		avail = 12
 	}
-	title := is.Title
-	if len([]rune(title)) > avail {
-		title = string([]rune(title)[:avail-1]) + "…"
-	}
+	title := truncCols(is.Title, avail)
 
 	if selected {
 		// Plain text (no inner colors) so the selection bg spans the whole row.
@@ -2391,8 +2408,8 @@ func (m Model) renderSession(ref session.SessionRef, selected bool) string {
 	own, ownColor := m.ownerCell(m.acct.Name, selected)
 	name := ref.Name
 	avail := m.rowWidth() - (2 + m.ownerCol + sessionCol + 1)
-	if avail > 0 && len([]rune(name)) > avail {
-		name = string([]rune(name)[:avail-1]) + "…"
+	if avail > 0 {
+		name = truncCols(name, avail)
 	}
 	if selected {
 		return selStyle.Width(m.rowWidth()).Render(fmt.Sprintf("▶ %s%s %s", own, cell, name))
@@ -2413,7 +2430,7 @@ func sessionCellText(s session.Status, elapsed string) (string, lipgloss.Color) 
 	if elapsed != "" {
 		text += " " + elapsed
 	}
-	if pad := sessionCol - len([]rune(text)); pad > 0 {
+	if pad := sessionCol - cols(text); pad > 0 {
 		text += strings.Repeat(" ", pad)
 	}
 	return text, color
@@ -2608,7 +2625,7 @@ func (m Model) renderPRPicker() string {
 	const stateCol = 6
 	labelCol := 0
 	for _, pr := range m.prList {
-		if n := len([]rune(pr.Label())); n > labelCol {
+		if n := cols(pr.Label()); n > labelCol {
 			labelCol = n
 		}
 	}
@@ -2632,9 +2649,7 @@ func (m Model) renderPRPicker() string {
 		if m.width <= 0 || avail < 12 {
 			avail = 12
 		}
-		if len([]rune(title)) > avail {
-			title = string([]rune(title)[:avail-1]) + "…"
-		}
+		title = truncCols(title, avail)
 
 		if i == m.prCursor {
 			content := fmt.Sprintf("▶ %s ⇄ %-*s %-*s  %s", num, stateCol, state, labelCol, label, title)
@@ -2702,7 +2717,7 @@ func (m Model) renderDetail() string {
 	prs := linear.SortPRs(is.PRs)
 	labelCol := 0
 	for _, pr := range prs {
-		if n := len([]rune(pr.Label())); n > labelCol {
+		if n := cols(pr.Label()); n > labelCol {
 			labelCol = n
 		}
 	}

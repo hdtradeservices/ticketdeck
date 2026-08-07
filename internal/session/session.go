@@ -27,8 +27,8 @@ const (
 	Stopped                  // exists but not running and not done; resumable
 )
 
-// running reports whether a session process is live (attach, don't fork).
-func (s Status) running() bool {
+// Running reports whether a session process is live (attach, don't fork).
+func (s Status) Running() bool {
 	return s == Working || s == NeedsInput || s == Idle
 }
 
@@ -261,7 +261,7 @@ func Plan(t Ticket, infos []Info, defaultCwd string) (LaunchSpec, error) {
 	if in, ok := findByBinding(t.Key, infos); ok {
 		st := statusOf(in)
 		switch {
-		case st.running():
+		case st.Running():
 			// One terminal per session (BR-4): don't fork a running session —
 			// hand off to the interactive agent view to attach it there.
 			return LaunchSpec{Args: []string{"agents"}, Cwd: firstNonEmpty(in.Cwd, defaultCwd), Action: "agents-view", Foreground: true}, nil

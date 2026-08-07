@@ -113,6 +113,10 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   bar. Both decks show the same Linear tickets; switching is just detach + launch
   the other, and background sessions keep running. Tool auth (`gh`/`gcloud`/…) is
   shared. See [`SETUP.md`](SETUP.md#multiple-claude-subscriptions-accounts).
+- **Which account is on a ticket** — every ticket with a session carries a `⦿` dot in the
+  owning subscription's color, and the highlighted row spells out the name. That includes
+  sessions running under the *other* account, which a deck otherwise can't see: ownership is
+  read from each account's transcripts and its herdr workspace. One subscription, no column.
 - **Claude usage** — the title bar shows your Claude 5-hour and 7-day rate-limit
   utilization (`◷ 5h 52% · 7d 42%`), color-coded, with a rough reset countdown. Same source
   as Claude Code's status line (the OAuth usage endpoint); it's a metadata read, so it does

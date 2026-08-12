@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/hdtradeservices/ticketdeck/internal/session"
 )
@@ -288,7 +289,42 @@ func Send(agents []Agent, name, text string) (string, error) {
 	return "", fmt.Errorf("no running session for %s", name)
 }
 
-// sendAndEnter writes literal text to a named agent then submits it with Enter.
+// Submit timing. Claude's TUI drops an Enter that arrives while it is still
+// painting, and treats one coalesced into the same read as the pasted text as a
+// literal newline — either way the command lands in the prompt and never runs.
+// So sendAndEnter watches the pane instead of firing blind: wait for the typed
+// text to show up in the input box, then press Enter until the box clears.
+// Shortened by the tests.
+var (
+	typedTimeout   = 5 * time.Second        // wait for typed text to appear in the input box
+	submitTimeout  = 3 * time.Second        // wait for the box to clear after each Enter
+	promptTimeout  = 30 * time.Second       // wait for a fresh session to paint its input box
+	submitAttempts = 4                      // Enter presses before giving up
+	pollEvery      = 200 * time.Millisecond // pane re-read interval
+)
+
+// waitForPrompt waits for an empty Claude input box to appear. herdr calls a
+// just-spawned agent "idle" within a second — long before Claude paints — so a
+// fresh session needs this on top of `agent wait` or the typed text lands in a
+// TUI that isn't reading stdin yet.
+//
+// It reports whether the pane is safe to type into. False means the box was
+// readable and stayed occupied for the whole budget — the trust prompt draws its
+// own "❯ 1. Yes…" line, and typing a command into that answers a dialog instead.
+// A pane we could never read returns true: there is nothing to judge, and one
+// blind Enter beats a `t` that silently stops working wherever herdr can't read.
+func waitForPrompt(name string) bool {
+	sawBox := false
+	empty := waitFor(promptTimeout, func() bool {
+		in, ok := promptInput(paneText(name))
+		sawBox = sawBox || ok
+		return ok && in == ""
+	})
+	return empty || !sawBox
+}
+
+// sendAndEnter writes literal text to a named agent then submits it with Enter,
+// confirming against the pane that the text actually left the input box.
 func sendAndEnter(name, paneID, text string) (string, error) {
 	if out, err := exec.Command(herdrBin, "agent", "send", name, text).CombinedOutput(); err != nil {
 		return string(out), fmt.Errorf("agent send: %w: %s", err, strings.TrimSpace(string(out)))
@@ -296,11 +332,116 @@ func sendAndEnter(name, paneID, text string) (string, error) {
 	if paneID == "" {
 		return "", fmt.Errorf("no pane id to submit %s", name)
 	}
-	if out, err := exec.Command(herdrBin, "pane", "send-keys", paneID, "Enter").CombinedOutput(); err != nil {
-		return string(out), fmt.Errorf("submit Enter: %w: %s", err, strings.TrimSpace(string(out)))
+	// Don't press Enter until the text is on screen — an Enter that beats the
+	// text is the race this whole dance exists to avoid. If the pane is
+	// unreadable (no herdr read, a modal covering the box) this falls through and
+	// the single blind Enter below is the old behaviour.
+	typed := waitFor(typedTimeout, func() bool { return pending(paneText(name), text) })
+	for range submitAttempts {
+		out, err := exec.Command(herdrBin, "pane", "send-keys", paneID, "Enter").CombinedOutput()
+		if err != nil {
+			return string(out), fmt.Errorf("submit Enter: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		if !typed {
+			return "sent + Enter (unverified)", nil
+		}
+		// Success needs the box readable AND empty of our text. "No box in this
+		// frame" is not success: a swallowed Enter happens mid-paint, which is
+		// exactly when a read comes back without the input box, so accepting that
+		// as gone would report the failure this exists to catch as a submit.
+		last := boxUnknown
+		if waitFor(submitTimeout, func() bool {
+			last = readBox(paneText(name), text)
+			return last == boxSubmitted
+		}) {
+			return "sent + Enter", nil
+		}
+		if last == boxUnknown {
+			// The pane stopped being readable, so there is nothing left to judge
+			// against — say so rather than pressing Enter at a session we can no
+			// longer see.
+			return "sent + Enter (unverified)", nil
+		}
 	}
-	return "sent + Enter", nil
+	return "", fmt.Errorf("%s still sitting unsent in %s's prompt after %d Enters", text, name, submitAttempts)
 }
+
+// waitFor polls cond every pollEvery until it holds or the budget runs out.
+func waitFor(budget time.Duration, cond func() bool) bool {
+	for deadline := time.Now().Add(budget); ; time.Sleep(pollEvery) {
+		if cond() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+	}
+}
+
+// paneText returns the visible text of an agent's pane, "" if unreadable.
+func paneText(name string) string {
+	out, err := exec.Command(herdrBin, "agent", "read", name, "--source", "visible", "--format", "text").Output()
+	if err != nil {
+		return ""
+	}
+	var r struct {
+		Result struct {
+			Read struct {
+				Text string `json:"text"`
+			} `json:"read"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(out, &r) != nil {
+		return ""
+	}
+	return r.Result.Read.Text
+}
+
+// promptMarkerRE matches a Claude prompt line ("❯ /triage", "> hello", "❯").
+var promptMarkerRE = regexp.MustCompile(`^\s*[❯>]\s?(.*)$`)
+
+// promptInput returns what is sitting in Claude's input box, and whether a box
+// was found. The box is the LAST prompt line on screen — the ones above it are
+// the transcript's echoes of already-submitted messages.
+func promptInput(screen string) (string, bool) {
+	lines := strings.Split(screen, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if m := promptMarkerRE.FindStringSubmatch(lines[i]); m != nil {
+			return strings.TrimSpace(m[1]), true
+		}
+	}
+	return "", false
+}
+
+// boxState is what one frame of the pane says about text we typed. The third
+// state is the point: "we couldn't see a box" has to be distinguishable from
+// "the box no longer holds it", or an unreadable frame reads as a submit.
+type boxState int
+
+const (
+	boxUnknown   boxState = iota // no input box in this frame — mid-paint, or a modal over it
+	boxPending                   // the text is still sitting in the box
+	boxSubmitted                 // the box is readable and the text has left it
+)
+
+// readBox classifies one frame. A half-painted box (input is a prefix of text)
+// and a box the user had already typed a draft into (text is somewhere inside
+// input) both still count as holding the text.
+func readBox(screen, text string) boxState {
+	input, ok := promptInput(screen)
+	switch {
+	case !ok:
+		return boxUnknown
+	case input == "":
+		return boxSubmitted
+	case strings.Contains(input, text) || strings.HasPrefix(text, input):
+		return boxPending
+	}
+	return boxSubmitted // the box holds something else, so ours went through
+}
+
+// pending reports whether text is still sitting unsent in the input box.
+func pending(screen, text string) bool { return readBox(screen, text) == boxPending }
 
 // Triage runs "/triage" against a ticket's session in the background, without
 // leaving the deck. If the session is already running it just submits /triage;
@@ -328,8 +469,12 @@ func Triage(agents []Agent, t session.Ticket, cwd string) (string, error) {
 	if out, err := exec.Command(herdrBin, "pane", "move", paneID, "--new-tab", "--label", session.TabLabel(t)).CombinedOutput(); err != nil {
 		return string(out), fmt.Errorf("pane move: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	// Wait until Claude is up and idle (ready for input), then submit /triage.
+	// Wait until Claude is up and its prompt is painted, then submit /triage.
 	_ = exec.Command(herdrBin, "agent", "wait", t.Key, "--status", "idle", "--timeout", "60000").Run()
+	if !waitForPrompt(t.Key) {
+		_ = exec.Command(herdrBin, "agent", "focus", "deck").Run()
+		return "", fmt.Errorf("%s has a prompt of its own open (trust dialog?) — clear it in its tab, then triage again", t.Key)
+	}
 	out, err := sendAndEnter(t.Key, paneID, "/triage")
 	// Make sure focus is back on the deck regardless of what the new tab did.
 	_ = exec.Command(herdrBin, "agent", "focus", "deck").Run()

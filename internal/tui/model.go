@@ -1,12 +1,11 @@
 package tui
 
 import (
+	"cmp"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log"
-	"maps"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -14,7 +13,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -94,17 +92,6 @@ type commenter interface {
 
 const refreshEvery = 60 * time.Second
 
-// quotaEvery is how often the usage endpoint is polled — far slower than the
-// ticket refresh. Utilization moves slowly, the deck now asks once per
-// subscription rather than once in total, and Claude Code's own status line
-// spends the same per-account budget. Polling it every minute earns a 429, and
-// a 429 costs the whole usage bar.
-const quotaEvery = 5 * time.Minute
-
-// quotaBackoff is how long to wait after the endpoint rate-limits us. Longer
-// than quotaEvery so a throttled deck stops adding to the pile.
-const quotaBackoff = 15 * time.Minute
-
 // statusRefreshEvery can be far tighter than refreshEvery because the status
 // poll only hits the local backend (herdr socket / on-disk claude agents), never
 // the rate-limited Linear API.
@@ -172,12 +159,11 @@ type statusTickMsg struct{}
 // updateAvailableMsg carries a newer release tag found by the startup check.
 type updateAvailableMsg struct{ latest string }
 
-// quotaMsg carries the latest Claude usage limits (5h / 7d windows) per account
-// name. Accounts whose usage couldn't be read are simply absent.
-type quotaMsg struct {
-	usages      map[string]*quota.Usage
-	rateLimited bool // endpoint threw 429 — back off rather than keep the schedule
-}
+// quotaMsg carries each account's latest usage entry: the 5h/7d windows when
+// there's a reading, and why there isn't when there isn't. Every account asked
+// for comes back — "rate limited" and "token expired" are different problems
+// with different fixes, and a missing key can say neither.
+type quotaMsg struct{ entries map[string]quota.Entry }
 
 // handoffMsg is the result of moving a session to another subscription.
 type handoffMsg struct {
@@ -256,35 +242,34 @@ type Model struct {
 	commentsErr   map[string]error            // issue id → why its comment fetch failed
 	commentsBusy  map[string]bool             // issue id → a fetch is in flight
 	loading       bool
-	underHerdr    bool                    // running as a herdr pane (the persistent deck) — q must not kill it
-	writer        statusWriter            // non-nil when the backing Fetcher can write status (live Linear)
-	assigner      assigner                // non-nil when the backing Fetcher can change assignee (live Linear)
-	statusMenu    bool                    // status-change overlay is open
-	statusPend    string                  // chosen target awaiting y/n confirm ("" = still choosing)
-	priorityMenu  bool                    // priority-change overlay is open
-	assignMenu    bool                    // assignee-picker overlay is open
-	assignIssue   linear.Issue            // ticket being reassigned (captured when the picker opens)
-	assignQuery   string                  // filter text in the assignee picker
-	assignCursor  int                     // index into the filtered picker options (0 = Unassign)
-	searchMode    bool                    // "/" search input is active (captures typing)
-	searchQuery   string                  // active ticket-list filter (key/title substring); persists after leaving searchMode
-	prMenu        bool                    // multi-PR picker overlay is open
-	prIssue       linear.Issue            // ticket whose PRs are being picked
-	prList        []linear.PR             // that ticket's PRs, most-actionable-first
-	prCursor      int                     // index into prList
-	users         []linear.User           // cached workspace users for the picker
-	hideOpenHint  bool                    // user chose "don't show again" for the open-session hint
-	openHintSpec  *session.LaunchSpec     // pending launch awaiting the open-session hint
-	openHintLabel string                  // ticket key for the pending launch
-	updateLatest  string                  // newer release tag, if the startup check found one
-	acct          account.Account         // the subscription this deck runs as
-	accounts      []account.Account       // Claude subscriptions on this machine, resolved once (globs the fs)
-	acctColors    map[string]string       // account name → accent color, so two decks never look alike
-	usages        map[string]*quota.Usage // account name → its 5h/7d usage, so one deck shows every account's headroom
-	quotaNextAt   time.Time               // earliest next usage poll (quotaEvery, or quotaBackoff after a 429)
-	handoffKey    string                  // ticket awaiting a hand-off confirm ("" = overlay closed)
-	handoffCands  []account.Account       // accounts that ticket can be handed to
-	handoffCursor int                     // index into handoffCands
+	underHerdr    bool                   // running as a herdr pane (the persistent deck) — q must not kill it
+	writer        statusWriter           // non-nil when the backing Fetcher can write status (live Linear)
+	assigner      assigner               // non-nil when the backing Fetcher can change assignee (live Linear)
+	statusMenu    bool                   // status-change overlay is open
+	statusPend    string                 // chosen target awaiting y/n confirm ("" = still choosing)
+	priorityMenu  bool                   // priority-change overlay is open
+	assignMenu    bool                   // assignee-picker overlay is open
+	assignIssue   linear.Issue           // ticket being reassigned (captured when the picker opens)
+	assignQuery   string                 // filter text in the assignee picker
+	assignCursor  int                    // index into the filtered picker options (0 = Unassign)
+	searchMode    bool                   // "/" search input is active (captures typing)
+	searchQuery   string                 // active ticket-list filter (key/title substring); persists after leaving searchMode
+	prMenu        bool                   // multi-PR picker overlay is open
+	prIssue       linear.Issue           // ticket whose PRs are being picked
+	prList        []linear.PR            // that ticket's PRs, most-actionable-first
+	prCursor      int                    // index into prList
+	users         []linear.User          // cached workspace users for the picker
+	hideOpenHint  bool                   // user chose "don't show again" for the open-session hint
+	openHintSpec  *session.LaunchSpec    // pending launch awaiting the open-session hint
+	openHintLabel string                 // ticket key for the pending launch
+	updateLatest  string                 // newer release tag, if the startup check found one
+	acct          account.Account        // the subscription this deck runs as
+	accounts      []account.Account      // Claude subscriptions on this machine, resolved once (globs the fs)
+	acctColors    map[string]string      // account name → accent color, so two decks never look alike
+	quotas        map[string]quota.Entry // account name → its usage reading (or why there is none), so one deck shows every account's headroom
+	handoffKey    string                 // ticket awaiting a hand-off confirm ("" = overlay closed)
+	handoffCands  []account.Account      // accounts that ticket can be handed to
+	handoffCursor int                    // index into handoffCands
 	err           error
 	notice        string // transient status line (e.g. dry-run launch plan)
 	lastSync      time.Time
@@ -318,11 +303,7 @@ func New(f Fetcher, root string, dry bool, backend Backend) Model {
 	m.acct = account.Current()
 	m.accounts = account.All()
 	m.acctColors = account.Colors(m.accounts)
-	m.usages = map[string]*quota.Usage{}
-	// Init fires the first poll; schedule the next one a full interval out. Set
-	// here, not in Init — Init takes a value receiver and bubbletea drops the
-	// model it returns.
-	m.quotaNextAt = time.Now().Add(quotaEvery)
+	m.quotas = map[string]quota.Entry{}
 	if ds, ok := f.(demoSessioner); ok {
 		m.demoStatuses = ds.DemoSessions()
 	}
@@ -400,41 +381,24 @@ func (m Model) Init() tea.Cmd {
 
 // fetchQuota reads Claude's usage limits (metadata only — no token spend).
 // Skipped in --demo. Fails silently.
+//
+// The read goes through quota.Poll, which serves the machine-wide cache and
+// calls the endpoint only for accounts whose reading has aged out — and only
+// from one deck at a time. Every deck reads every subscription, so calling
+// directly meant decks × accounts requests arriving together against a budget
+// already shared with every running Claude Code status line.
 func (m Model) fetchQuota() tea.Cmd {
 	if m.demoStatuses != nil {
 		return nil
 	}
-	accts := m.accounts
+	accts := make([]quota.Account, 0, len(m.accounts))
+	for _, a := range m.accounts {
+		accts = append(accts, quota.Account{Name: a.Name, ConfigDir: a.ConfigDir})
+	}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
-		// One call per subscription, concurrently — the point is to see whether
-		// another account has room while this one is throttled.
-		var (
-			mu      sync.Mutex
-			wg      sync.WaitGroup
-			out     = map[string]*quota.Usage{}
-			limited bool
-		)
-		for _, a := range accts {
-			wg.Add(1)
-			go func(a account.Account) {
-				defer wg.Done()
-				u, err := quota.Fetch(ctx, a.ConfigDir)
-				mu.Lock()
-				defer mu.Unlock()
-				if err != nil {
-					if errors.Is(err, quota.ErrRateLimited) {
-						limited = true
-					}
-					debugLog.Printf("quota %s: %v", a.Name, err)
-					return
-				}
-				out[a.Name] = &u
-			}(a)
-		}
-		wg.Wait()
-		return quotaMsg{usages: out, rateLimited: limited}
+		return quotaMsg{entries: quota.Poll(ctx, accts, time.Now())}
 	}
 }
 
@@ -532,15 +496,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ensureVisible()
 
 	case tickMsg:
-		cmds := []tea.Cmd{m.refresh(), m.refreshStatuses(), m.refreshSessions(), tick()}
-		// Quota rides the slow tick but on its own, much longer schedule. Stamp
-		// the next time on dispatch, not on reply, or every tick until the first
-		// response would fire another round.
-		if !time.Now().Before(m.quotaNextAt) {
-			m.quotaNextAt = time.Now().Add(quotaEvery)
-			cmds = append(cmds, m.fetchQuota())
-		}
-		return m, tea.Batch(cmds...)
+		// Quota rides this tick with no schedule of its own: quota.Poll answers
+		// from the cache shared by every deck on the machine and decides for
+		// itself when an account is old enough to re-read. Asking every tick is
+		// also how a deck that skipped a round — another deck held the poll lock —
+		// picks up the answer. A per-deck timer here would only put the decks back
+		// in lockstep — the state that earns the 429s.
+		return m, tea.Batch(m.refresh(), m.refreshStatuses(), m.refreshSessions(), tick(), m.fetchQuota())
 
 	case statusTickMsg:
 		// Deliberately no Linear fetch or quota call — those stay on the slow tick.
@@ -569,11 +531,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.refreshStatuses(), m.refreshSessions())
 
 	case quotaMsg:
-		// Merge rather than replace: an account that failed this round keeps its
-		// previous reading instead of blanking a bar that was fine a moment ago.
-		maps.Copy(m.usages, msg.usages)
-		if msg.rateLimited {
-			m.quotaNextAt = time.Now().Add(quotaBackoff)
+		for name, e := range msg.entries {
+			// Log the reason once per change, not once per tick: with the poll on
+			// every tick, a throttled account would otherwise write a line a minute
+			// for as long as it stays throttled.
+			if e.Reason != m.quotas[name].Reason && e.Reason != "" {
+				debugLog.Printf("quota %s: %s", name, e.Reason)
+			}
+			// An entry that failed this round still carries the last good reading,
+			// so this keeps the bar rather than blanking one that was fine a moment
+			// ago — but never overwrites a reading with nothing.
+			if e.Usage == nil {
+				e.Usage, e.FetchedAt = m.quotas[name].Usage, m.quotas[name].FetchedAt
+			}
+			m.quotas[name] = e
 		}
 
 	case refreshedMsg:
@@ -2160,11 +2131,27 @@ func (m Model) acctColor(name string) lipgloss.Color {
 // quotaSegment renders this account's Claude 5h/7d usage for the title bar,
 // color-coded by utilization, with a coarse "resets in" hint.
 func (m Model) quotaSegment() string {
-	u := m.usages[m.acct.Name]
-	if u == nil {
+	e := m.quotas[m.acct.Name]
+	if e.Usage == nil {
+		if e.Reason == "" {
+			return ""
+		}
+		// Say why. A blank here and a blank while the first poll is still in flight
+		// look identical, and the two call for opposite responses: wait, or go log
+		// that account back in.
+		return dimStyle.Render("  ◷ " + e.Reason)
+	}
+	return dimStyle.Render("  ◷ ") + quotaPair(e.Usage, true) + staleMark(e)
+}
+
+// staleMark flags a reading old enough to distrust — the numbers are real but
+// predate the last couple of intervals, which is what a rate-limited or
+// logged-out account looks like once its last good reading ages.
+func staleMark(e quota.Entry) string {
+	if !e.Stale(time.Now()) {
 		return ""
 	}
-	return dimStyle.Render("  ◷ ") + quotaPair(u, true)
+	return dimStyle.Render(" ~")
 }
 
 // otherQuotaLine renders the OTHER subscriptions' usage on its own line under
@@ -2185,9 +2172,10 @@ func (m Model) otherQuotaLine() string {
 		// An account whose usage can't be read still gets a row. Dropping it made
 		// a rate-limited or logged-out subscription look like it wasn't detected
 		// at all, which is the opposite of what this line is for.
-		body := dimStyle.Render("usage unavailable")
-		if u := m.usages[a.Name]; u != nil {
-			body = quotaPair(u, false)
+		e := m.quotas[a.Name]
+		body := dimStyle.Render(cmp.Or(e.Reason, "usage unavailable"))
+		if e.Usage != nil {
+			body = quotaPair(e.Usage, false) + staleMark(e)
 		}
 		// "⦿ name", spaced exactly as accountSegment renders the active account —
 		// without the space this line's names sit one column left of the title
@@ -2680,8 +2668,8 @@ func (m Model) renderHandoff() string {
 			num = strconv.Itoa(i + 1)
 		}
 		row := fmt.Sprintf("%s  to    %s", num, "⦿ "+a.Name)
-		if u := m.usages[a.Name]; u != nil {
-			row += fmt.Sprintf("   %s", quotaPair(u, true))
+		if e := m.quotas[a.Name]; e.Usage != nil {
+			row += fmt.Sprintf("   %s", quotaPair(e.Usage, true)+staleMark(e))
 		}
 		if i == m.handoffCursor {
 			fmt.Fprintf(&b, "%s\n", selStyle.Render("▶ "+row))

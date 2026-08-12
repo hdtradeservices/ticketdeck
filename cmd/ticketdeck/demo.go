@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"time"
 
 	"github.com/hdtradeservices/ticketdeck/internal/account"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
@@ -15,7 +16,7 @@ type demoFetcher struct{}
 
 func (demoFetcher) FetchAssignedOpen(context.Context) ([]linear.Issue, error) {
 	return []linear.Issue{
-		{Identifier: "DEMO-101", Title: "[Bug] Checkout total ignores expired coupons", Description: "Steps:\n1. Add an item to the cart.\n2. Apply an expired coupon code.\n\nExpected: the coupon is rejected and the total is unchanged.\nActual: the discount is still applied.", URL: "https://linear.app/acme/issue/DEMO-101", Priority: 1, PrioLabel: "Urgent", StateName: "In Progress", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T16:14:31Z"},
+		{ID: "demo-101", Identifier: "DEMO-101", Title: "[Bug] Checkout total ignores expired coupons", Description: "Steps:\n1. Add an item to the cart.\n2. Apply an expired coupon code.\n\nExpected: the coupon is rejected and the total is unchanged.\nActual: the discount is still applied.", URL: "https://linear.app/acme/issue/DEMO-101", Priority: 1, PrioLabel: "Urgent", StateName: "In Progress", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T16:14:31Z"},
 		{Identifier: "DEMO-102", Title: "[Bug] Webhook retries dead-letter on 400 from provider", Priority: 2, PrioLabel: "High", StateName: "In Review", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T17:50:37Z", PRs: []linear.PR{{URL: "https://github.com/acme/widgets/pull/241", Title: "fix: tolerate provider 400 in webhook retrier", State: "open"}}},
 		{Identifier: "DEMO-103", Title: "[Bug] Order create times out (>60s) under load", Priority: 2, PrioLabel: "High", StateName: "Planned", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T16:26:28Z", Labels: []string{"Bug", "validation-inconclusive"}},
 		{Identifier: "DEMO-104", Title: "Add import mapping for the new product type", Priority: 2, PrioLabel: "High", StateName: "Todo", StateType: "unstarted", TeamKey: "DEMO", UpdatedAt: "2026-07-16T18:22:58Z"},
@@ -56,6 +57,42 @@ func (demoFetcher) DemoOwners() map[string]account.Owner {
 		"DEMO-104": {Name: "default", Status: session.Stopped},
 		"DEMO-106": {Name: "support", Status: session.Completed},
 	}
+}
+
+// FetchComments fabricates the /investigate and /plan write-ups for DEMO-101, so
+// the overlay's `i` and `P` views have something to show without a Linear key.
+func (demoFetcher) FetchComments(_ context.Context, issueID string) ([]linear.Comment, error) {
+	if issueID != "demo-101" {
+		return nil, nil
+	}
+	return []linear.Comment{
+		{
+			ID:        "c1",
+			Author:    "Claude",
+			CreatedAt: time.Date(2026, 7, 16, 9, 12, 0, 0, time.UTC),
+			Body: `## Investigation summary
+
+**Verdict:** confirmed — expired coupons are applied when the cart is repriced.
+
+### Expected vs actual
+Expected the coupon to be rejected. The reprice path skips the expiry check.
+
+<!-- investigate-summary -->`,
+		},
+		{
+			ID:        "c2",
+			Author:    "Claude",
+			CreatedAt: time.Date(2026, 7, 16, 10, 3, 0, 0, time.UTC),
+			Body: `## Implementation plan
+
+### Plan (ordered)
+1. Move the expiry check into the shared coupon validator.
+2. Call it from the reprice path.
+3. Add a regression test for an expired coupon at reprice time.
+
+<!-- implementation-plan -->`,
+		},
+	}, nil
 }
 
 // DemoOtherSessions fabricates sessions not tied to a visible ticket (an off-list

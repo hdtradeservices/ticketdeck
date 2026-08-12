@@ -66,7 +66,7 @@ ticketdeck --demo --dump        # plain-text grouped list
 | move · page · top/bottom | `↑`/`↓` (`j`/`k`) · `PgUp`/`PgDn` · `g`/`G` (wraps at the ends) |
 | open / attach the ticket's session | `Enter` |
 | description overlay | `d` (in it: `Enter` opens the session · `o` browser · `p` PR) |
-| the ticket's **investigation** or **plan**, in that overlay | `i` · `P` — the `/investigate` and `/plan` write-ups, pulled from the ticket's Linear comments. Same key again returns to the description. |
+| the ticket's **investigation** or **plan**, in that overlay | `i` · `P` — the `/investigate` and `/plan` write-ups, pulled from the ticket's Linear comments. Same key again returns to the description; `r` re-reads the comments. |
 | open ticket in browser | `o` |
 | open linked PR — picker when there are several | `p` (in it: `⏎` open · `1`-`9` open that one · `a` open all) |
 | show the ticket's description **from inside its session** | `Ctrl+b` then `i` (popup) |

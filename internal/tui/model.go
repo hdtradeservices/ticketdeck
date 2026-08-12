@@ -1019,6 +1019,12 @@ func (m Model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.showSection(linear.SectionInvestigation)
 	case "P":
 		return m.showSection(linear.SectionPlan)
+	case "r":
+		// Only in a section view: the description comes with the ticket list and
+		// refreshes on its own tick.
+		if m.detailView != linear.SectionDescription {
+			return m.refreshSection()
+		}
 	case "enter":
 		// Navigate straight to this ticket's Claude session from its description.
 		is := *m.detail
@@ -1080,6 +1086,23 @@ func (m Model) showSection(s linear.Section) (tea.Model, tea.Cmd) {
 	}
 	m.commentsBusy[is.ID] = true
 	delete(m.commentsErr, is.ID)
+	return m, m.fetchComments(is)
+}
+
+// refreshSection re-reads the open ticket's comments. The fetch is cached for
+// the life of the deck, and that cache goes stale while you watch: the agent in
+// the next tab posts its write-up minutes after you first looked, so a first
+// look that found nothing would otherwise keep saying "none yet" until the deck
+// restarts.
+func (m Model) refreshSection() (tea.Model, tea.Cmd) {
+	is := *m.detail
+	if m.commenter == nil || is.ID == "" || m.commentsBusy[is.ID] {
+		return m, nil
+	}
+	// Keep the cached comments until the new ones land. Dropping them first meant
+	// a Linear blip blanked a write-up that was on screen a moment ago.
+	delete(m.commentsErr, is.ID)
+	m.commentsBusy[is.ID] = true
 	return m, m.fetchComments(is)
 }
 
@@ -2851,6 +2874,9 @@ func (m Model) renderDetail() string {
 	if m.commenter != nil {
 		hint += " · i investigation · P plan"
 	}
+	if m.detailView != linear.SectionDescription {
+		hint += " · r refresh"
+	}
 	hint += " · d/esc back"
 	fmt.Fprintf(&b, "\n%s", dimStyle.Render("↑/↓ scroll · "+hint+more))
 	return b.String()
@@ -2868,16 +2894,21 @@ func (m Model) detailBody(is linear.Issue, width int) string {
 	}
 
 	name := m.detailView.Label()
-	switch {
-	case m.commenter == nil:
+	if m.commenter == nil {
 		return dimStyle.Render("the " + name + " needs a live Linear connection")
-	case m.commentsBusy[is.ID]:
+	}
+	// A reading already on screen outranks both the spinner and the error: a
+	// refresh that fails must not blank the write-up you were reading. The failure
+	// goes in the byline instead.
+	_, loaded := m.comments[is.ID]
+	if !loaded && m.commentsBusy[is.ID] {
 		return dimStyle.Render("loading comments…")
-	case m.commentsErr[is.ID] != nil:
-		return errStyle.Render("couldn't load comments: " + m.commentsErr[is.ID].Error())
 	}
 	c, ok := linear.FindSection(m.comments[is.ID], m.detailView)
 	if !ok {
+		if err := m.commentsErr[is.ID]; err != nil {
+			return errStyle.Render("couldn't load comments: " + err.Error())
+		}
 		return dimStyle.Render("no " + name + " comment on " + is.Identifier + " yet")
 	}
 	byline := name
@@ -2886,6 +2917,9 @@ func (m Model) detailBody(is linear.Issue, width int) string {
 	}
 	if !c.CreatedAt.IsZero() {
 		byline += " · " + c.CreatedAt.Local().Format("2 Jan 15:04")
+	}
+	if err := m.commentsErr[is.ID]; err != nil {
+		byline += " · refresh failed: " + err.Error()
 	}
 	return dimStyle.Render(byline) + "\n" + renderMarkdown(linear.StripMarkers(c.Body), width)
 }

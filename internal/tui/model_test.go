@@ -1142,6 +1142,154 @@ func TestPRMarkShowsCount(t *testing.T) {
 	}
 }
 
+// commentFetcher is a fakeFetcher that also serves comments, so the overlay's
+// investigation/plan views can be driven without a live Linear connection.
+type commentFetcher struct {
+	fakeFetcher
+	comments []linear.Comment
+	err      error
+	calls    int
+}
+
+func (c *commentFetcher) FetchComments(context.Context, string) ([]linear.Comment, error) {
+	c.calls++
+	return c.comments, c.err
+}
+
+// plainView strips glamour's styling so a rendered body can be matched as text.
+func plainView(m Model) string { return ansiRe.ReplaceAllString(m.View(), "") }
+
+func sectionFixture() []linear.Issue {
+	return []linear.Issue{{
+		ID: "uuid-9", Identifier: "ZEN-9", Title: "needs a plan", Description: "the description body",
+		Priority: 1, StateName: "In Progress", StateType: "started",
+	}}
+}
+
+// loadedCommented opens the overlay on a ticket whose Linear comments hold an
+// investigation summary and a plan.
+func loadedCommented(t *testing.T, cf *commentFetcher) Model {
+	t.Helper()
+	cf.fakeFetcher = fakeFetcher{sectionFixture()}
+	m := New(cf, "", true, fakeBackend{})
+	next, _ := m.Update(refreshedMsg{issues: sectionFixture()})
+	m = next.(Model)
+	m.width, m.height = 100, 40
+	next, _ = m.Update(runes("d"))
+	return next.(Model)
+}
+
+func TestDetailSectionHotkeys(t *testing.T) {
+	cf := &commentFetcher{comments: []linear.Comment{
+		{ID: "1", Body: "## Investigation summary\n\nthe stock sync races\n\n<!-- investigate-summary -->", Author: "Claude"},
+		{ID: "2", Body: "## Implementation plan\n\nadd a row lock\n\n<!-- implementation-plan -->", Author: "Claude"},
+	}}
+	m := loadedCommented(t, cf)
+	if !strings.Contains(plainView(m), "the description body") {
+		t.Fatalf("the overlay should open on the description:\n%s", plainView(m))
+	}
+
+	// i fetches the comments once and shows the investigation.
+	next, cmd := m.Update(runes("i"))
+	m = next.(Model)
+	if m.detailView != linear.SectionInvestigation {
+		t.Fatal("i should switch the overlay to the investigation")
+	}
+	if cmd == nil {
+		t.Fatal("i should kick off the comment fetch")
+	}
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	if cf.calls != 1 {
+		t.Errorf("comments should be fetched once, got %d calls", cf.calls)
+	}
+	if v := plainView(m); !strings.Contains(v, "stock sync races") || strings.Contains(v, "the description body") {
+		t.Errorf("the investigation view should replace the description:\n%s", v)
+	}
+	if strings.Contains(plainView(m), "investigate-summary") {
+		t.Error("the hidden marker should not render")
+	}
+
+	// P swaps to the plan off the same cached fetch.
+	next, _ = m.Update(runes("P"))
+	m = next.(Model)
+	if v := plainView(m); !strings.Contains(v, "add a row lock") {
+		t.Errorf("P should show the plan:\n%s", v)
+	}
+	if cf.calls != 1 {
+		t.Errorf("the second section should reuse the cached comments, got %d calls", cf.calls)
+	}
+
+	// The same key toggles back to the description; esc backs out of a section
+	// rather than closing the overlay.
+	next, _ = m.Update(runes("P"))
+	m = next.(Model)
+	if m.detailView != linear.SectionDescription {
+		t.Error("pressing the section's key again should return to the description")
+	}
+	next, _ = m.Update(runes("i"))
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.detail == nil || m.detailView != linear.SectionDescription {
+		t.Error("esc in a section should return to the description, not close the overlay")
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if next.(Model).detail != nil {
+		t.Error("esc on the description should close the overlay")
+	}
+}
+
+func TestDetailSectionMissingAndFailed(t *testing.T) {
+	// A ticket that has comments but no plan yet says so rather than blanking.
+	cf := &commentFetcher{comments: []linear.Comment{{ID: "1", Body: "just a note"}}}
+	m := loadedCommented(t, cf)
+	next, cmd := m.Update(runes("P"))
+	next, _ = next.(Model).Update(cmd())
+	m = next.(Model)
+	if v := plainView(m); !strings.Contains(v, "no plan comment on ZEN-9 yet") {
+		t.Errorf("a missing plan should be named:\n%s", v)
+	}
+
+	// A failed fetch surfaces the error, and re-pressing retries.
+	cf = &commentFetcher{err: fmt.Errorf("rate limited")}
+	m = loadedCommented(t, cf)
+	next, cmd = m.Update(runes("i"))
+	next, _ = next.(Model).Update(cmd())
+	m = next.(Model)
+	if v := plainView(m); !strings.Contains(v, "rate limited") {
+		t.Errorf("a failed comment fetch should show the error:\n%s", v)
+	}
+	next, _ = m.Update(runes("i")) // back to description
+	next, cmd = next.(Model).Update(runes("i"))
+	if cmd == nil {
+		t.Fatal("a failed fetch should be retried on the next press")
+	}
+	next.(Model).Update(cmd()) //nolint // drains the retry fetch; calls is the assertion
+	if cf.calls != 2 {
+		t.Errorf("expected a retry, got %d calls", cf.calls)
+	}
+}
+
+func TestDetailSectionsHiddenWithoutLinear(t *testing.T) {
+	// --demo has no commenter: don't advertise keys that can't work.
+	m := loadedWith(t, sectionFixture())
+	m.width, m.height = 100, 40
+	next, _ := m.Update(runes("d"))
+	m = next.(Model)
+	if strings.Contains(plainView(m), "i investigation") {
+		t.Errorf("the section hints need a live Linear connection:\n%s", plainView(m))
+	}
+	next, cmd := m.Update(runes("i"))
+	m = next.(Model)
+	if cmd != nil {
+		t.Error("there is nothing to fetch without a commenter")
+	}
+	if !strings.Contains(plainView(m), "needs a live Linear connection") {
+		t.Errorf("the section view should explain why it's empty:\n%s", plainView(m))
+	}
+}
+
 func TestDetailPKeyOpensPicker(t *testing.T) {
 	m := loadedWith(t, prFixture())
 	next, _ := m.Update(runes("d")) // description overlay

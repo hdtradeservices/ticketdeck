@@ -85,6 +85,13 @@ type assigner interface {
 	Assign(ctx context.Context, issue linear.Issue, assigneeID string) error
 }
 
+// commenter is the optional read capability behind the overlay's investigation
+// and plan views, which live in the ticket's Linear comments rather than its
+// description. Live Linear implements it; --demo does not.
+type commenter interface {
+	FetchComments(ctx context.Context, issueID string) ([]linear.Comment, error)
+}
+
 const refreshEvery = 60 * time.Second
 
 // quotaEvery is how often the usage endpoint is polled — far slower than the
@@ -215,6 +222,15 @@ type assignWriteMsg struct {
 	err error
 }
 
+// commentsMsg carries a ticket's fetched comments, which back the overlay's
+// investigation and plan views.
+type commentsMsg struct {
+	issueID  string
+	key      string
+	comments []linear.Comment
+	err      error
+}
+
 type Model struct {
 	fetch         Fetcher
 	root          string         // default working dir for new sessions (repos-root fallback)
@@ -225,15 +241,20 @@ type Model struct {
 	offset        int             // index of the first visible row (scroll position)
 	collapsed     map[string]bool // priority label → manually collapsed (empty = all expanded)
 	backend       Backend
-	sessions      map[string]session.Status // ticket key → session status
-	statusSince   map[string]time.Time      // ticket key → when its current status was first seen
-	owners        map[string]account.Owner  // ticket key → which subscription runs its session
-	ownerCol      int                       // width of the account column (0 = one account, nothing to label)
-	otherSessions []session.SessionRef      // live sessions not tied to a visible ticket
-	demoStatuses  map[string]session.Status // --demo override; nil in real use
-	demoOwners    map[string]account.Owner  // --demo override; nil in real use
-	detail        *linear.Issue             // non-nil = showing the description overlay
-	detailOffset  int                       // scroll offset within the detail overlay
+	sessions      map[string]session.Status   // ticket key → session status
+	statusSince   map[string]time.Time        // ticket key → when its current status was first seen
+	owners        map[string]account.Owner    // ticket key → which subscription runs its session
+	ownerCol      int                         // width of the account column (0 = one account, nothing to label)
+	otherSessions []session.SessionRef        // live sessions not tied to a visible ticket
+	demoStatuses  map[string]session.Status   // --demo override; nil in real use
+	demoOwners    map[string]account.Owner    // --demo override; nil in real use
+	detail        *linear.Issue               // non-nil = showing the description overlay
+	detailOffset  int                         // scroll offset within the detail overlay
+	detailView    linear.Section              // which body the overlay shows: description, investigation, or plan
+	commenter     commenter                   // non-nil when comments can be fetched (live Linear)
+	comments      map[string][]linear.Comment // issue id → its comments, fetched on first i/P press
+	commentsErr   map[string]error            // issue id → why its comment fetch failed
+	commentsBusy  map[string]bool             // issue id → a fetch is in flight
 	loading       bool
 	underHerdr    bool                    // running as a herdr pane (the persistent deck) — q must not kill it
 	writer        statusWriter            // non-nil when the backing Fetcher can write status (live Linear)
@@ -291,7 +312,7 @@ type demoOwner interface {
 }
 
 func New(f Fetcher, root string, dry bool, backend Backend) Model {
-	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != ""}
+	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != "", comments: map[string][]linear.Comment{}, commentsErr: map[string]error{}, commentsBusy: map[string]bool{}}
 	// Resolved once, not per frame: All() globs the filesystem, and View runs on
 	// every keystroke.
 	m.acct = account.Current()
@@ -334,6 +355,9 @@ func New(f Fetcher, root string, dry bool, backend Backend) Model {
 	}
 	if a, ok := f.(assigner); ok {
 		m.assigner = a
+	}
+	if c, ok := f.(commenter); ok {
+		m.commenter = c
 	}
 	m.hideOpenHint = openHintDismissed()
 	if backend != nil {
@@ -693,6 +717,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// The ticket regroups into its new priority section on refresh.
 		return m, tea.Batch(m.refresh(), m.refreshStatuses())
 
+	case commentsMsg:
+		delete(m.commentsBusy, msg.issueID)
+		if msg.err != nil {
+			debugLog.Printf("comments fetch %s error: %v", msg.key, msg.err)
+			m.commentsErr[msg.issueID] = msg.err
+		} else {
+			m.comments[msg.issueID] = msg.comments
+		}
+
 	case usersMsg:
 		if msg.err != nil {
 			debugLog.Printf("users fetch error: %v", msg.err)
@@ -1000,14 +1033,25 @@ func (m Model) closeSession(s session.SessionRef) (tea.Model, tea.Cmd) {
 // updateDetail handles keys while the description overlay is open.
 func (m Model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "q", "esc", "d":
-		m.detail = nil
-		m.detailOffset = 0
+	case "esc":
+		// Back out one level: a section view returns to the description, the
+		// description closes the overlay.
+		if m.detailView != linear.SectionDescription {
+			m.detailView = linear.SectionDescription
+			m.detailOffset = 0
+			break
+		}
+		m.closeDetail()
+	case "q", "d":
+		m.closeDetail()
+	case "i":
+		return m.showSection(linear.SectionInvestigation)
+	case "P":
+		return m.showSection(linear.SectionPlan)
 	case "enter":
 		// Navigate straight to this ticket's Claude session from its description.
 		is := *m.detail
-		m.detail = nil
-		m.detailOffset = 0
+		m.closeDetail()
 		return m.launchIssue(is)
 	case "up", "k":
 		if m.detailOffset > 0 {
@@ -1030,10 +1074,53 @@ func (m Model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Close the description overlay first: with several PRs this opens the
 		// picker, and only one overlay renders at a time.
 		is := *m.detail
-		m.detail = nil
+		m.closeDetail()
 		return m.openPRFor(is)
 	}
 	return m, nil
+}
+
+// closeDetail dismisses the overlay, resetting it to the description view so it
+// reopens where the reader expects rather than mid-section.
+func (m *Model) closeDetail() {
+	m.detail = nil
+	m.detailOffset = 0
+	m.detailView = linear.SectionDescription
+}
+
+// showSection switches the overlay to a comment-backed view (the /investigate
+// summary or the /plan plan), toggling back to the description when that view is
+// already up. The ticket's comments are fetched once, on first use — they aren't
+// part of the list refresh, so nothing is spent on tickets nobody opens.
+func (m Model) showSection(s linear.Section) (tea.Model, tea.Cmd) {
+	if m.detailView == s {
+		m.detailView = linear.SectionDescription
+		m.detailOffset = 0
+		return m, nil
+	}
+	m.detailView = s
+	m.detailOffset = 0
+	is := *m.detail
+	if m.commenter == nil || is.ID == "" {
+		return m, nil
+	}
+	if _, loaded := m.comments[is.ID]; loaded || m.commentsBusy[is.ID] {
+		return m, nil
+	}
+	m.commentsBusy[is.ID] = true
+	delete(m.commentsErr, is.ID)
+	return m, m.fetchComments(is)
+}
+
+// fetchComments loads a ticket's Linear comments in the background.
+func (m Model) fetchComments(is linear.Issue) tea.Cmd {
+	c := m.commenter
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		cs, err := c.FetchComments(ctx, is.ID)
+		return commentsMsg{issueID: is.ID, key: is.Identifier, comments: cs, err: err}
+	}
 }
 
 // openPRFor handles the `p` key for a ticket. A single linked PR opens straight
@@ -2738,18 +2825,11 @@ func (m Model) renderDetail() string {
 	}
 	fmt.Fprint(&b, "\n")
 
-	desc := strings.TrimSpace(is.Description)
 	width := m.width
 	if width <= 0 {
 		width = 80
 	}
-	var wrapped string
-	if desc == "" {
-		wrapped = dimStyle.Render("(no description)")
-	} else {
-		wrapped = renderMarkdown(desc, width-2)
-	}
-	lines := strings.Split(strings.TrimRight(wrapped, "\n"), "\n")
+	lines := strings.Split(strings.TrimRight(m.detailBody(*is, width-2), "\n"), "\n")
 
 	// window the body to the available height (header: title, meta, session,
 	// url, PR lines, blank; plus the blank+footer at the bottom)
@@ -2780,9 +2860,46 @@ func (m Model) renderDetail() string {
 	if len(is.PRs) > 0 {
 		hint += " · p open PR"
 	}
+	if m.commenter != nil {
+		hint += " · i investigation · P plan"
+	}
 	hint += " · d/esc back"
 	fmt.Fprintf(&b, "\n%s", dimStyle.Render("↑/↓ scroll · "+hint+more))
 	return b.String()
+}
+
+// detailBody renders the overlay's active view: the ticket description, or the
+// /investigate or /plan comment, each with a line naming who wrote it and when.
+func (m Model) detailBody(is linear.Issue, width int) string {
+	if m.detailView == linear.SectionDescription {
+		desc := strings.TrimSpace(is.Description)
+		if desc == "" {
+			return dimStyle.Render("(no description)")
+		}
+		return renderMarkdown(desc, width)
+	}
+
+	name := m.detailView.Label()
+	switch {
+	case m.commenter == nil:
+		return dimStyle.Render("the " + name + " needs a live Linear connection")
+	case m.commentsBusy[is.ID]:
+		return dimStyle.Render("loading comments…")
+	case m.commentsErr[is.ID] != nil:
+		return errStyle.Render("couldn't load comments: " + m.commentsErr[is.ID].Error())
+	}
+	c, ok := linear.FindSection(m.comments[is.ID], m.detailView)
+	if !ok {
+		return dimStyle.Render("no " + name + " comment on " + is.Identifier + " yet")
+	}
+	byline := name
+	if c.Author != "" {
+		byline += " · " + c.Author
+	}
+	if !c.CreatedAt.IsZero() {
+		byline += " · " + c.CreatedAt.Local().Format("2 Jan 15:04")
+	}
+	return dimStyle.Render(byline) + "\n" + renderMarkdown(linear.StripMarkers(c.Body), width)
 }
 
 func (m Model) footer() string {

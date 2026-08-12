@@ -1271,6 +1271,57 @@ func TestDetailSectionMissingAndFailed(t *testing.T) {
 	}
 }
 
+// The comments are cached for the life of the deck, so "none yet" would stick
+// even after the agent in the next tab posted its write-up. r re-reads them.
+func TestSectionRefreshRefetches(t *testing.T) {
+	cf := &commentFetcher{comments: []linear.Comment{{ID: "1", Body: "just a note"}}}
+	m := loadedCommented(t, cf)
+	next, cmd := m.Update(runes("i"))
+	next, _ = next.(Model).Update(cmd())
+	m = next.(Model)
+	if v := plainView(m); !strings.Contains(v, "no investigation comment on ZEN-9 yet") {
+		t.Fatalf("expected the empty-section message:\n%s", v)
+	}
+
+	// The agent posts its summary while the overlay is open.
+	cf.comments = append(cf.comments, linear.Comment{ID: "2", Body: "## Investigation summary\n\nthe stock sync races"})
+	next, cmd = m.Update(runes("r"))
+	if cmd == nil {
+		t.Fatal("r should re-read the ticket's comments")
+	}
+	next, _ = next.(Model).Update(cmd())
+	m = next.(Model)
+	if cf.calls != 2 {
+		t.Errorf("expected a second fetch, got %d calls", cf.calls)
+	}
+	if v := plainView(m); !strings.Contains(v, "stock sync races") {
+		t.Errorf("the refreshed summary should show:\n%s", v)
+	}
+	if v := plainView(m); !strings.Contains(v, "r refresh") {
+		t.Errorf("a section view should advertise the refresh key:\n%s", v)
+	}
+
+	// A refresh that fails keeps the body it had and names the failure.
+	cf.err = fmt.Errorf("rate limited")
+	next, cmd = m.Update(runes("r"))
+	next, _ = next.(Model).Update(cmd())
+	m = next.(Model)
+	if v := plainView(m); !strings.Contains(v, "stock sync races") {
+		t.Errorf("a failed refresh blanked the write-up that was on screen:\n%s", v)
+	}
+	if v := plainView(m); !strings.Contains(v, "refresh failed: rate limited") {
+		t.Errorf("a failed refresh should say so:\n%s", v)
+	}
+	cf.err = nil
+
+	// r on the description does nothing — that body isn't comment-backed.
+	next, _ = m.Update(runes("i")) // back to the description
+	m = next.(Model)
+	if _, cmd = m.Update(runes("r")); cmd != nil {
+		t.Error("r on the description should not fetch comments")
+	}
+}
+
 func TestDetailSectionsHiddenWithoutLinear(t *testing.T) {
 	// --demo has no commenter: don't advertise keys that can't work.
 	m := loadedWith(t, sectionFixture())

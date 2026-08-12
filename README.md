@@ -127,7 +127,12 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
 - **Claude usage** — the title bar shows your Claude 5-hour and 7-day rate-limit
   utilization (`◷ 5h 52% · 7d 42%`), color-coded, with a rough reset countdown. Same source
   as Claude Code's status line (the OAuth usage endpoint); it's a metadata read, so it does
-  **not** spend model tokens. Shown only for OAuth logins (not API-key setups).
+  **not** spend model tokens. Shown only for OAuth logins (not API-key setups). Every deck on
+  the machine shares one reading per account through `~/.ticketdeck/usage.json`, refreshed at
+  most every 5 minutes — polling per deck earned 429s and blanked the line. When a reading is
+  missing the row says why: `rate limited` clears itself, `token expired` means that account's
+  token needs a refresh, which only happens when you next run Claude Code under it. A `~` after
+  the numbers means they're more than two intervals old.
 - **Backends** (`--backend claude|herdr|auto`, default `auto`): `herdr` gives the
   detach/re-attach + tab-per-ticket workflow; `claude` drives the `claude` CLI directly
   (foreground per ticket). `auto` uses herdr when it's installed.

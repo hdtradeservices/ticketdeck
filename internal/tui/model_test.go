@@ -1489,9 +1489,9 @@ func TestAccountColorsDifferBetweenAccounts(t *testing.T) {
 // switching decks.
 func TestOtherAccountQuotaShownInView(t *testing.T) {
 	m := twoAccounts(t)
-	m.usages = map[string]*quota.Usage{
-		"matt":    {FiveHourPct: 94, SevenDayPct: 61},
-		"support": {FiveHourPct: 12, SevenDayPct: 8},
+	m.quotas = map[string]quota.Entry{
+		"matt":    {Usage: &quota.Usage{FiveHourPct: 94, SevenDayPct: 61}, FetchedAt: time.Now()},
+		"support": {Usage: &quota.Usage{FiveHourPct: 12, SevenDayPct: 8}, FetchedAt: time.Now()},
 	}
 	line := m.otherQuotaLine()
 	if !strings.Contains(line, "support") || !strings.Contains(line, "12%") {
@@ -1507,15 +1507,31 @@ func TestOtherAccountQuotaShownInView(t *testing.T) {
 
 func TestQuotaMsgKeepsPriorReadingForFailedAccount(t *testing.T) {
 	m := twoAccounts(t)
-	m.usages = map[string]*quota.Usage{"support": {FiveHourPct: 12}}
-	// support failed this round (absent from the message); its bar must not blank.
-	next, _ := m.Update(quotaMsg{usages: map[string]*quota.Usage{"matt": {FiveHourPct: 50}}})
+	m.quotas = map[string]quota.Entry{"support": {Usage: &quota.Usage{FiveHourPct: 12}, FetchedAt: time.Now()}}
+	// support failed this round (a reason, no numbers); its bar must not blank.
+	next, _ := m.Update(quotaMsg{entries: map[string]quota.Entry{
+		"matt":    {Usage: &quota.Usage{FiveHourPct: 50}, FetchedAt: time.Now()},
+		"support": {Reason: "rate limited"},
+	}})
 	m = next.(Model)
-	if m.usages["support"] == nil {
+	if m.quotas["support"].Usage == nil {
 		t.Error("a transient failure blanked an account that was readable a moment ago")
 	}
-	if m.usages["matt"] == nil || m.usages["matt"].FiveHourPct != 50 {
+	if u := m.quotas["matt"].Usage; u == nil || u.FiveHourPct != 50 {
 		t.Error("new reading not applied")
+	}
+}
+
+// "usage unavailable" was the same words for a throttle that clears itself and
+// for a token only a re-login fixes. Whichever it is has to reach the row.
+func TestFailureReasonReachesTheOtherAccountsLine(t *testing.T) {
+	m := twoAccounts(t)
+	next, _ := m.Update(quotaMsg{entries: map[string]quota.Entry{
+		"support": {Reason: "token expired"},
+	}})
+	m = next.(Model)
+	if line := m.otherQuotaLine(); !strings.Contains(line, "token expired") {
+		t.Errorf("row should say why the reading is missing: %q", line)
 	}
 }
 
@@ -1647,7 +1663,7 @@ func TestHandoffNoticeUsesTheTargetsRealLaunchCommand(t *testing.T) {
 // how this reads to someone checking whether their second account is wired up.
 func TestOtherAccountShownEvenWithoutUsage(t *testing.T) {
 	m := twoAccounts(t)
-	m.usages = map[string]*quota.Usage{"matt": {FiveHourPct: 94}} // support failed
+	m.quotas = map[string]quota.Entry{"matt": {Usage: &quota.Usage{FiveHourPct: 94}, FetchedAt: time.Now()}} // support failed
 	line := m.otherQuotaLine()
 	if !strings.Contains(line, "support") {
 		t.Errorf("account vanished when its usage was unreadable: %q", line)
@@ -1660,38 +1676,29 @@ func TestOtherAccountShownEvenWithoutUsage(t *testing.T) {
 	}
 }
 
-// A 429 must push the next poll out. The budget is shared with Claude Code's own
-// status line, so holding the normal schedule just extends the throttle.
-func TestRateLimitBacksOffTheNextPoll(t *testing.T) {
+// The active account's own segment must say why it's blank too — an empty slot
+// there reads as "still loading", which is the one thing it isn't.
+func TestActiveAccountSegmentNamesTheFailure(t *testing.T) {
 	m := twoAccounts(t)
-	m.quotaNextAt = time.Now()
-	next, _ := m.Update(quotaMsg{usages: map[string]*quota.Usage{}, rateLimited: true})
-	got := next.(Model).quotaNextAt
-	if wait := time.Until(got); wait < quotaEvery {
-		t.Errorf("backoff = %v, want at least quotaEvery (%v)", wait, quotaEvery)
+	next, _ := m.Update(quotaMsg{entries: map[string]quota.Entry{"matt": {Reason: "rate limited"}}})
+	if seg := next.(Model).quotaSegment(); !strings.Contains(seg, "rate limited") {
+		t.Errorf("title segment should name the failure: %q", seg)
 	}
 }
 
-// Quota rides the slow tick but on its own longer schedule; a tick that isn't
-// due must not queue another usage round.
-func TestTickSkipsQuotaUntilDue(t *testing.T) {
-	// Assert on quotaNextAt rather than draining the batch: the tick command is a
-	// real 60s tea.Tick, and draining it would stall the suite for a minute.
-	// quotaNextAt is stamped exactly when a fetch is dispatched, so it's a
-	// faithful proxy.
+// A reading that survived several failed rounds is still shown — but marked, so
+// a stale 12%% isn't read as live headroom to hand a session to.
+func TestStaleReadingIsMarked(t *testing.T) {
 	m := twoAccounts(t)
-	armed := time.Now().Add(quotaEvery)
-	m.quotaNextAt = armed
-	next, _ := m.Update(tickMsg{})
-	if !next.(Model).quotaNextAt.Equal(armed) {
-		t.Error("a not-yet-due tick moved the quota schedule (so it fetched)")
+	m.quotas = map[string]quota.Entry{
+		"support": {Usage: &quota.Usage{FiveHourPct: 12}, FetchedAt: time.Now().Add(-time.Hour), Reason: "rate limited"},
 	}
-
-	// Once due, it fires and re-arms.
-	m.quotaNextAt = time.Now().Add(-time.Second)
-	next, _ = m.Update(tickMsg{})
-	if time.Until(next.(Model).quotaNextAt) < quotaEvery/2 {
-		t.Error("a due tick should re-arm the quota schedule")
+	line := m.otherQuotaLine()
+	if !strings.Contains(line, "12%") {
+		t.Errorf("last good reading should survive a failure: %q", line)
+	}
+	if !strings.Contains(line, "~") {
+		t.Errorf("an hour-old reading should be marked stale: %q", line)
 	}
 }
 

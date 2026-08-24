@@ -794,6 +794,121 @@ func TestAccountColumnAbsentWithOneSubscription(t *testing.T) {
 	}
 }
 
+// The dot says which deck holds a ticket; on its own that leaves "someone has
+// it" and nothing about whether they're working, idle, or waiting on input.
+func TestPeerDeckStateShowsOnTheRow(t *testing.T) {
+	m := ownedDeck(t) // ZEN-9: support, working, live — and no session here
+	is := linear.Issue{Identifier: "ZEN-9", Title: "urgent thing", Priority: 1}
+
+	st, _, remote := m.rowSession("ZEN-9")
+	if st != session.Working || !remote {
+		t.Errorf("rowSession(ZEN-9) = %v remote=%v, want Working remote=true", st, remote)
+	}
+	if row := m.renderIssue(is, false); !strings.Contains(row, "working") {
+		t.Errorf("row should badge the peer deck's live state:\n%q", row)
+	}
+	// (That the badge is then colored by deck rather than by status isn't
+	// assertable here — lipgloss emits no escapes without a TTY.)
+
+	// Time since the peer last wrote, which is what says whether a "working"
+	// session is working or wedged.
+	m.owners["ZEN-9"] = account.Owner{Name: "support", Status: session.Working, Live: true, LastActive: time.Now().Add(-7 * time.Minute)}
+	if _, elapsed, _ := m.rowSession("ZEN-9"); elapsed != "7m" {
+		t.Errorf("remote elapsed = %q, want 7m (transcript mtime)", elapsed)
+	}
+}
+
+// This deck's own backend is the better answer whenever it has one: the peer
+// poll is 3s stale and only sees transcript writes.
+func TestLocalSessionOutranksThePeerBadge(t *testing.T) {
+	m := ownedDeck(t)
+	m.sessions = map[string]session.Status{"ZEN-9": session.NeedsInput}
+	st, _, remote := m.rowSession("ZEN-9")
+	if st != session.NeedsInput || remote {
+		t.Errorf("rowSession = %v remote=%v, want NeedsInput remote=false", st, remote)
+	}
+}
+
+// Opening a ticket a second deck already runs forks its transcript — the one
+// divergence account.HandOff has no way to undo. Enter must not do it silently.
+func TestOpenGatedWhenAnotherDeckRunsTheTicket(t *testing.T) {
+	m := ownedDeck(t) // ZEN-9 working under ⦿support
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.conflict == nil || cmd != nil {
+		t.Fatal("Enter on a ticket another deck runs should gate the launch")
+	}
+	view := m.View()
+	for _, want := range []string{"ZEN-9", "support", "working right now", "deck --account support"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("conflict overlay should mention %q:\n%s", want, view)
+		}
+	}
+
+	// Enter backs out — a reflexive keypress must not be what forks a session.
+	next, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.conflict != nil || cmd != nil {
+		t.Fatal("Enter in the gate should cancel, not launch")
+	}
+	if !strings.Contains(m.notice, "deck --account support") {
+		t.Errorf("canceling should point at the deck that owns it, got %q", m.notice)
+	}
+
+	// "o" is the deliberate override. This deck is dry, so the launch lands as a
+	// plan in the notice rather than an exec.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next, _ = next.(Model).Update(runes("o"))
+	m = next.(Model)
+	if m.conflict != nil || !strings.Contains(m.notice, "--name ZEN-9") {
+		t.Fatalf("o should override the gate and launch, got conflict=%v notice=%q", m.conflict, m.notice)
+	}
+}
+
+// Triage starts the session when there isn't one here, so it forks a ticket
+// another deck holds exactly as an open would.
+func TestTriageGatedWhenAnotherDeckRunsTheTicket(t *testing.T) {
+	rec := &recBackend{}
+	m := ownedDeck(t)
+	m.backend = rec
+	next, cmd := m.Update(runes("t"))
+	m = next.(Model)
+	if m.conflict == nil || cmd != nil {
+		t.Fatal("t on a ticket another deck runs should gate the triage")
+	}
+	if !strings.Contains(m.View(), triageCmd) {
+		t.Errorf("the override should name what it would run:\n%s", m.View())
+	}
+	next, cmd = m.Update(runes("o"))
+	if next.(Model).conflict != nil || cmd == nil {
+		t.Fatal("o should override and triage")
+	}
+	cmd()
+	if rec.triaged != "ZEN-9" {
+		t.Errorf("override should triage ZEN-9, got %q", rec.triaged)
+	}
+}
+
+// Two cases that look like the conflict but aren't: a session this deck already
+// runs (Plan attaches to it) and a peer's stopped one (nothing to collide with).
+func TestOpenNotGatedWithoutALiveRemoteSession(t *testing.T) {
+	m := ownedDeck(t)
+	m.sessions = map[string]session.Status{"ZEN-9": session.Working}
+	if _, ok := m.blockingOwner("ZEN-9"); ok {
+		t.Error("a session running on this deck is not a conflict")
+	}
+
+	m = ownedDeck(t)
+	m.owners["ZEN-9"] = account.Owner{Name: "support", Status: session.Stopped}
+	if _, ok := m.blockingOwner("ZEN-9"); ok {
+		t.Error("a peer's stopped session is not a conflict")
+	}
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if got := next.(Model); got.conflict != nil || !strings.Contains(got.notice, "--name ZEN-9") {
+		t.Fatalf("Enter should launch when no other deck is running the ticket, got conflict=%v notice=%q", got.conflict, got.notice)
+	}
+}
+
 // Ownership comes from disk and the peer workspaces, not from the backend, so a
 // failed status poll must not blank it.
 func TestOwnersSurviveAFailedStatusPoll(t *testing.T) {

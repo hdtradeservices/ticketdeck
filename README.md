@@ -120,10 +120,24 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   bar. Both decks show the same Linear tickets; switching is just detach + launch
   the other, and background sessions keep running. Tool auth (`gh`/`gcloud`/…) is
   shared. See [`SETUP.md`](SETUP.md#multiple-claude-subscriptions-accounts).
-- **Which account is on a ticket** — every ticket with a session carries a `⦿` dot in the
-  owning subscription's color, and the highlighted row spells out the name. That includes
-  sessions running under the *other* account, which a deck otherwise can't see: ownership is
-  read from each account's transcripts and its herdr workspace. One subscription, no column.
+- **Which account is on a ticket, and what it's doing** — every ticket with a session carries
+  a `⦿` dot in the owning subscription's color, and the highlighted row spells out the name.
+  That includes sessions running under the *other* accounts, which a deck otherwise can't see:
+  ownership is read from each account's transcripts and its herdr workspace. One subscription,
+  no column.
+
+  A session another deck holds badges its state right on the row — `● working`, `◆ needs
+  input`, `○ idle`, `↻ resumable` — with how long since it last wrote, so a peer that's wedged
+  looks different from one that's busy. Those badges are colored by **deck** rather than by
+  status: the words already say the state, and what a glance needs from someone else's row is
+  whose it is. Refreshed every 3s.
+- **One deck per ticket** — `⏎` (and `t`) on a ticket another deck is actively running stops
+  and says so instead of opening it. A second session would fork the ticket: the session id
+  comes from the ticket key alone, so both decks would append to their own copy of one
+  transcript and diverge with no way to merge them — and two agents would work the ticket at
+  once. `⏎`/`esc` leaves it alone, `p` opens its PR instead, and `o` overrides. A session
+  *this* deck already runs is not a conflict (it re-attaches), nor is a stopped one elsewhere
+  (nothing to collide with — the row badges it `↻` in that deck's color).
 - **Claude usage** — the title bar shows your Claude 5-hour and 7-day rate-limit
   utilization (`◷ 5h 52% · 7d 42%`), color-coded, with a rough reset countdown. Same source
   as Claude Code's status line (the OAuth usage endpoint); it's a metadata read, so it does

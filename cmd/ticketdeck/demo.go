@@ -41,9 +41,10 @@ func (demoFetcher) DemoSessions() map[string]session.Status {
 	return map[string]session.Status{
 		"DEMO-101": session.Working,
 		"DEMO-102": session.NeedsInput,
-		"DEMO-103": session.Idle,
 		"DEMO-106": session.Completed,
 		"DEMO-104": session.Stopped,
+		// DEMO-103 is deliberately absent: its session runs on another deck, which
+		// this deck's own backend can't see. DemoOwners is what badges it.
 	}
 }
 
@@ -53,7 +54,10 @@ func (demoFetcher) DemoOwners() map[string]account.Owner {
 	return map[string]account.Owner{
 		"DEMO-101": {Name: "default", Status: session.Working, Live: true},
 		"DEMO-102": {Name: "support", Status: session.NeedsInput, Live: true},
-		"DEMO-103": {Name: "support", Status: session.Idle, Live: true},
+		// Only the other deck has this one, so its row is the cross-deck case: the
+		// badge is that deck's live status, colored like the deck rather than the
+		// status, and pressing ⏎ on it hits the one-deck-per-ticket gate.
+		"DEMO-103": {Name: "support", Status: session.Working, Live: true, LastActive: time.Now().Add(-11 * time.Minute)},
 		"DEMO-104": {Name: "default", Status: session.Stopped},
 		"DEMO-106": {Name: "support", Status: session.Completed},
 	}

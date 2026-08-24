@@ -270,6 +270,7 @@ type Model struct {
 	handoffKey    string                 // ticket awaiting a hand-off confirm ("" = overlay closed)
 	handoffCands  []account.Account      // accounts that ticket can be handed to
 	handoffCursor int                    // index into handoffCands
+	conflict      *conflict              // non-nil = a launch is held back because another deck runs the ticket
 	err           error
 	notice        string // transient status line (e.g. dry-run launch plan)
 	lastSync      time.Time
@@ -742,6 +743,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.handoffKey != "" {
 			return m.updateHandoff(msg)
 		}
+		if m.conflict != nil {
+			return m.updateConflict(msg)
+		}
 		if m.openHintSpec != nil {
 			return m.updateOpenHint(msg)
 		}
@@ -880,6 +884,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// conflict is a launch held back because another deck is already running that
+// ticket's session. It carries the ticket and which action was asked for, so
+// "do it anyway" resumes exactly what was interrupted.
+type conflict struct {
+	issue  linear.Issue
+	owner  account.Owner
+	triage bool // the ask was `t` (background /triage), not open
+}
+
+// blockingOwner reports the other deck already running this ticket, when
+// starting it here would fork the session instead of attaching to it.
+//
+// A session this deck already runs is never a conflict: Plan attaches to it.
+// The peer's status comes from the 3-second ownership poll, so a session
+// started elsewhere in the last few seconds can still slip through — this
+// catches the mistake people actually make (opening a ticket another deck has
+// been working for minutes), not a race.
+func (m Model) blockingOwner(key string) (account.Owner, bool) {
+	if isRunning(m.sessions[key]) {
+		return account.Owner{}, false
+	}
+	o := m.owners[key]
+	if o.Name == "" || o.Name == m.acct.Name || !o.Live || !o.Status.Running() {
+		return account.Owner{}, false
+	}
+	return o, true
+}
+
 // launchSelected plans and runs (or dry-prints) the session for the cursor's
 // ticket.
 func (m Model) launchSelected() (tea.Model, tea.Cmd) {
@@ -890,9 +922,20 @@ func (m Model) launchSelected() (tea.Model, tea.Cmd) {
 	return m.launchIssue(is)
 }
 
-// launchIssue plans and runs (or dry-prints) the session for a specific ticket,
-// so it can be triggered from the list or from the description overlay.
+// launchIssue opens a ticket's session, first checking that no other deck is
+// already running it (see renderConflict for why that matters).
 func (m Model) launchIssue(is linear.Issue) (tea.Model, tea.Cmd) {
+	if o, ok := m.blockingOwner(is.Identifier); ok {
+		m.conflict = &conflict{issue: is, owner: o}
+		m.notice = ""
+		return m, nil
+	}
+	return m.launchIssueNow(is)
+}
+
+// launchIssueNow plans and runs (or dry-prints) the session for a specific
+// ticket, so it can be triggered from the list or from the description overlay.
+func (m Model) launchIssueNow(is linear.Issue) (tea.Model, tea.Cmd) {
 	spec, err := m.backend.Plan(toTicket(is), m.root)
 	if err != nil {
 		debugLog.Printf("plan error for %s: %v", is.Identifier, err)
@@ -909,6 +952,92 @@ func (m Model) launchIssue(is linear.Issue) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m.runSpec(spec, is.Identifier)
+}
+
+// updateConflict handles the "another deck is running this" gate. Cancel is the
+// default — Enter and Esc both back out — so a reflexive keypress can't be the
+// thing that forks a session. Only "o" overrides.
+func (m Model) updateConflict(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	c := *m.conflict
+	switch msg.String() {
+	case "o":
+		m.conflict = nil
+		if c.triage {
+			return m.triageTicketNow(c.issue)
+		}
+		return m.launchIssueNow(c.issue)
+	case "p":
+		m.conflict = nil
+		return m.openPRFor(c.issue)
+	default:
+		m.conflict = nil
+		m.notice = c.issue.Identifier + " left to ⦿" + c.owner.Name + " · " + m.deckCmd(c.owner.Name)
+	}
+	return m, nil
+}
+
+// deckCmd is the command that opens another account's deck, for pointing the
+// user at the deck that owns a session. Falls back to the flag form when that
+// account isn't in this deck's list (a peer that appeared mid-run).
+func (m Model) deckCmd(name string) string {
+	for _, a := range m.accounts {
+		if a.Name == name {
+			return a.LaunchCmd()
+		}
+	}
+	return "deck --account " + name
+}
+
+// renderConflict draws the gate shown when another deck already runs the
+// selected ticket's session. Two things go wrong if it opens here anyway, and
+// the overlay names both: the session id derives from the ticket key alone, so
+// each deck ends up appending to its own copy of one transcript (see
+// account.HandOff — divergence has no fix), and two agents work the ticket at
+// once.
+func (m Model) renderConflict() string {
+	c := m.conflict
+	glyph, _, _ := sessionStyle(c.owner.Status)
+	state := statusPhrase(c.owner.Status)
+	if e := elapsedLabel(c.owner.LastActive); e != "" {
+		state += ", last wrote " + e + " ago"
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s\n\n", titleStyle.Render("Already open on another deck"), idStyle.Render(c.issue.Identifier))
+	fmt.Fprintf(&b, "  %s   %s\n\n", m.acctStyle(c.owner.Name).Bold(true).Render("⦿ "+c.owner.Name), glyph+" "+state)
+	// The blank line stays outside the Render: lipgloss pads every line of a
+	// multi-line block to the widest one, including a trailing empty line, and
+	// then emits no closing newline — so the next line would start mid-row.
+	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render(
+		"  A session here would be a second one on the same ticket: both decks\n"+
+			"  append to their own copy of one transcript, which then diverge with no\n"+
+			"  way to merge them, and two agents work the ticket at once."))
+	anyway := "open it"
+	if c.triage {
+		anyway = "run " + triageCmd
+	}
+	fmt.Fprintf(&b, "%s\n", selStyle.Render(" ⏎  leave it to ⦿"+c.owner.Name+" "))
+	fmt.Fprint(&b, "  p  open its PR here instead\n")
+	fmt.Fprintf(&b, "  o  %s here anyway\n", anyway)
+	fmt.Fprintf(&b, "\n%s\n", dimStyle.Render("  esc  cancel"))
+	fmt.Fprint(&b, dimStyle.Render("  work it where it lives:  "+m.deckCmd(c.owner.Name)))
+	return b.String()
+}
+
+// statusPhrase spells a peer session's status for prose, where the row badge's
+// clipped label ("needs input") reads as a fragment.
+func statusPhrase(s session.Status) string {
+	switch s {
+	case session.Working:
+		return "working right now"
+	case session.NeedsInput:
+		return "waiting on input"
+	case session.Idle:
+		return "idle"
+	default:
+		_, label, _ := sessionStyle(s)
+		return label
+	}
 }
 
 // updateOpenHint handles the "how to get back" reminder shown before a session
@@ -981,6 +1110,17 @@ func (m Model) sendToSession(name, text string) (tea.Model, tea.Cmd) {
 // triageTicket runs /triage against a ticket's session in the background,
 // starting the session (unfocused) if it isn't running, without leaving the deck.
 func (m Model) triageTicket(is linear.Issue) (tea.Model, tea.Cmd) {
+	// Triage starts the session when there isn't one here, so it forks a ticket
+	// another deck holds just as an open would.
+	if o, ok := m.blockingOwner(is.Identifier); ok {
+		m.conflict = &conflict{issue: is, owner: o, triage: true}
+		m.notice = ""
+		return m, nil
+	}
+	return m.triageTicketNow(is)
+}
+
+func (m Model) triageTicketNow(is linear.Issue) (tea.Model, tea.Cmd) {
 	m.notice = "triaging " + is.Identifier + " in the background…"
 	backend := m.backend
 	t := toTicket(is)
@@ -1968,6 +2108,9 @@ func (m Model) View() string {
 	if m.handoffKey != "" {
 		return m.renderHandoff()
 	}
+	if m.conflict != nil {
+		return m.renderConflict()
+	}
 	if m.openHintSpec != nil {
 		return m.renderOpenHint()
 	}
@@ -2376,10 +2519,41 @@ func (m Model) elapsedInStatus(key string, st session.Status) string {
 	return elapsedLabel(m.statusSince[key])
 }
 
+// rowSession resolves which session a ticket row badges, and how long it has
+// been in that state.
+//
+// This deck's own backend answers first. When it has nothing, the ownership poll
+// still might: `deck --account NAME` isolates each subscription's workspace, so
+// a ticket another deck is working reads as untouched here — the exact mistake
+// the account dot was added to prevent, only half-solved, because the dot names
+// a deck without saying what that deck is doing. remote marks that second case
+// (a session that exists, elsewhere), which renders in its deck's color and
+// gates an open (see blockingOwner).
+//
+// The elapsed figure differs by source, and both are the useful one: locally,
+// how long the session has held its current state; remotely, how long since it
+// last wrote to its transcript — which is what says whether a "working" peer is
+// working or wedged.
+func (m Model) rowSession(key string) (st session.Status, elapsed string, remote bool) {
+	if local := m.sessions[key]; local != session.None {
+		return local, m.elapsedInStatus(key, local), false
+	}
+	o := m.owners[key]
+	if o.Name == "" {
+		return session.None, "", false
+	}
+	return o.Status, elapsedLabel(o.LastActive), o.Name != m.acct.Name
+}
+
 func (m Model) renderIssue(is linear.Issue, selected bool) string {
-	st := m.sessions[is.Identifier]
-	cell, color := sessionCellText(st, m.elapsedInStatus(is.Identifier, st))
+	st, elapsed, remote := m.rowSession(is.Identifier)
+	cell, color := sessionCellText(st, elapsed)
 	own, ownColor := m.ownerCell(m.owners[is.Identifier].Name, selected)
+	if remote {
+		// Color the badge like its deck, not like its status: the words already say
+		// working/idle, and what a glance needs from a remote row is whose it is.
+		color = ownColor
+	}
 	id := fmt.Sprintf("%-9s", is.Identifier)
 	prG, prC := prMark(is.PRs)
 	tagText, tagColor := validationTag(is.Labels)
@@ -2443,9 +2617,15 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 	}
 	// Working tickets are already being handled — de-emphasize the whole row
 	// (uniform dim, no cyan id / bright title) so the eye is drawn to the
-	// tickets that still need attention.
+	// tickets that still need attention. A peer deck's working row is
+	// de-emphasized for the same reason, but its badge keeps the deck color:
+	// "someone else is on this" is exactly what must survive the dim.
 	if st == session.Working {
-		return "  " + ownR + workingRowStyle.Render(fmt.Sprintf("%s %s %s %s", cell, id, prG, title)) + tag + noteR
+		badge := workingRowStyle.Render(cell)
+		if remote {
+			badge = lipgloss.NewStyle().Foreground(ownColor).Render(cell)
+		}
+		return "  " + ownR + badge + workingRowStyle.Render(fmt.Sprintf(" %s %s %s", id, prG, title)) + tag + noteR
 	}
 	badge := lipgloss.NewStyle().Foreground(color).Render(cell)
 	pr := lipgloss.NewStyle().Foreground(prC).Render(prG)

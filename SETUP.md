@@ -63,7 +63,7 @@ running in their background tabs.
 | goal | key |
 |---|---|
 | move / page / top-bottom | `↑`/`↓` (`j`/`k`) · `PgUp`/`PgDn` · `g`/`G` |
-| open the ticket (launch/attach its session) | `Enter` — the first time, a reminder shows how to get back (`Ctrl+b 1`); `⏎` proceeds, `d` proceeds and never shows it again |
+| open the ticket (launch/attach its session) | `Enter` — the first time, a reminder shows how to get back (`Ctrl+b 1`); `⏎` proceeds, `d` proceeds and never shows it again. If **another deck is already running that ticket**, it stops and shows that deck's live state instead of forking the session — see [One deck per ticket](#multiple-claude-subscriptions-accounts). |
 | show the ticket's **description** (rendered markdown) | `d` (in the overlay: `Enter` opens the session, `o` browser, `p` PR, `↑`/`↓` scroll, `esc` closes) |
 | show the ticket's **investigation** or **implementation plan** | `i` / `P`, inside the description overlay. Those write-ups live in the ticket's Linear comments, not its description, so the deck fetches that ticket's comments the first time you press one of these keys and reuses them after. It shows the newest `## Investigation summary` (`/investigate`) or `## Implementation plan` (`/plan`) comment, with a line naming who wrote it and when. Pressing the same key again goes back to the description, as does `esc`; `d` closes the overlay outright. Says so plainly when the ticket has no such comment yet — and `r` re-reads the comments, for when the agent posts its write-up while you're looking. |
 | open the ticket in the **web browser** | `o` |
@@ -72,7 +72,7 @@ running in their background tabs.
 | **change priority** → Urgent / High / Medium / Low / None | `P`, then `u`/`h`/`m`/`l`/`0` — **write; write-scoped key** |
 | **assign / reassign / unassign** | `a` opens a picker — type to filter people, `↑`/`↓` select, `⏎` assign (top row = **Unassign**), `esc` cancel — **writes to Linear; write-scoped key** (reassigning away from you drops the ticket off the list) |
 | open an **ad-hoc Claude session** not tied to any ticket (own tab) | `n` |
-| **`/triage` in the background** | `t` — starts the ticket's session in its own (unfocused) tab if it isn't running, submits `/triage`, and keeps you on the deck (**runs a Claude turn**; herdr backend). On an "Other sessions" row it just submits `/triage` to that session. |
+| **`/triage` in the background** | `t` — starts the ticket's session in its own (unfocused) tab if it isn't running, submits `/triage`, and keeps you on the deck (**runs a Claude turn**; herdr backend). On an "Other sessions" row it just submits `/triage` to that session. Gated the same way `Enter` is when another deck is running the ticket. |
 | **fold/unfold** a priority section (collapsed shows a ticket count) | `Space` (toggle) · `←` collapse · `→` expand |
 | **search / filter the list** | `/` — type to filter tickets by key or title (live, case-insensitive; all matching groups expand). `⏎` keeps the filter and returns to list nav; `esc` clears it. While a filter is applied the footer shows `filter "…" · esc clear`. |
 | **hand the session to another Claude subscription** | `H` — for when this subscription hits a limit mid-task. Stops the session here, copies its transcript to the other account, and it becomes resumable in that deck. `⏎` confirms, `1`-`9` picks a target, `esc` cancels. Only offered when a second subscription exists — see [Multiple Claude subscriptions](#multiple-claude-subscriptions-accounts). |
@@ -210,11 +210,11 @@ TicketDeck  ⦿ matt  assigned · open only  ◷ 5h 94% (12m) · 7d 61%
 So when one account is throttled you can see the other has room without
 switching decks to go look.
 
-**Seeing which account is on a ticket.** Every ticket with a session carries a
-`⦿` dot in the owning subscription's color, in the column left of the status
-badge — including sessions running under the *other* account, which this deck
-otherwise can't see. Move the cursor onto a row and the dot is labelled with the
-account name:
+**Seeing which account is on a ticket, and what it's doing.** Every ticket with
+a session carries a `⦿` dot in the owning subscription's color, in the column
+left of the status badge — including sessions running under the *other* accounts,
+which this deck otherwise can't see. Move the cursor onto a row and the dot is
+labelled with the account name:
 
 ```
           ⦿ ● working 4m    ZEN-3395  ●  fix shipworks sweep
@@ -227,11 +227,61 @@ title that much width on every line), but the column is reserved either way, so
 moving the cursor never shifts the columns. A deck with one subscription doesn't
 render the column at all.
 
+The **badge is filled in for other decks' sessions too** — `● working`,
+`◆ needs input`, `○ idle`, `↻ resumable` — so a ticket someone else's deck is
+part-way through doesn't read as untouched. Two things differ from a badge for
+one of this deck's own sessions:
+
+- **It's colored like the deck, not like the status.** The words already say the
+  state; what a glance needs from someone else's row is whose it is. So a remote
+  `● working` is `support`-colored, not green.
+- **The time is "since it last wrote", not "time in this state."** Locally the
+  deck knows when a status changed. For another account it reads the transcript's
+  mtime, which is the more useful number anyway: a `● working` session that last
+  wrote 40m ago is wedged, not busy.
+
 Ownership is read from each account's transcripts on disk plus its herdr
-workspace, so an account whose deck isn't running still shows up. When a ticket
-has been worked under both accounts — a hand-off leaves the transcript behind in
-the source — the dot names the live session, or the one that wrote most
-recently.
+workspace, so an account whose deck isn't running still shows up (as `↻
+resumable`). Live status needs that account's herdr server to be up. Refreshed
+every 3 seconds, alongside this deck's own badges. When a ticket has been worked
+under both accounts — a hand-off leaves the transcript behind in the source — the
+dot names the live session, or the one that wrote most recently.
+
+**One deck per ticket.** `⏎` on a ticket that another deck is *actively running*
+stops and shows what's there instead of opening it:
+
+```
+Already open on another deck  ZEN-3401
+
+  ⦿ support   ● working right now, last wrote 2m ago
+
+  A session here would be a second one on the same ticket: both decks
+  append to their own copy of one transcript, which then diverge with no
+  way to merge them, and two agents work the ticket at once.
+
+ ⏎  leave it to ⦿support
+  p  open its PR here instead
+  o  open it here anyway
+
+  esc  cancel
+  work it where it lives:  deck --account support
+```
+
+Both `⏎` and `esc` back out — a reflexive keypress must not be the thing that
+forks a session — and the footer then reminds you which deck to launch. Only `o`
+overrides. `t` (background `/triage`) goes through the same gate, because it
+starts the session when there isn't one here.
+
+Two cases that look similar but aren't gated: a session **this** deck already
+runs (`⏎` re-attaches it, nothing forks) and another deck's **stopped** session
+(nothing to collide with — the row badges it `↻` in that deck's color, and
+opening it here starts fresh). To pick up a stopped session's context, hand it
+over from the deck that has it with `H`.
+
+The gate reads the same 3-second ownership poll the badges do, so a session
+started elsewhere in the last couple of seconds can still slip past it. It
+catches the mistake people actually make: opening a ticket another deck has been
+working on for minutes.
 
 **Handing a session to the other subscription.** `H` on a ticket moves its
 session to another account — for when the current subscription hits a limit

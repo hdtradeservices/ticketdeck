@@ -160,7 +160,7 @@ func (HerdBackend) Sessions() ([]session.SessionRef, error) {
 }
 
 func (HerdBackend) ScratchSpec(cwd string) session.LaunchSpec {
-	agents, _ := herd.List() // best-effort; naming just needs the current count
+	agents, _ := herd.List() // best-effort; naming just needs the live scratch names
 	return herd.ScratchSpec(herd.Sessions(agents), cwd)
 }
 

@@ -381,3 +381,38 @@ func TestTicketKeyRE(t *testing.T) {
 		}
 	}
 }
+
+// A closed scratch leaves a gap, and reissuing a live name costs a failed launch.
+func TestScratchSpecPicksLowestFreeName(t *testing.T) {
+	refs := func(names ...string) []session.SessionRef {
+		out := make([]session.SessionRef, 0, len(names))
+		for _, n := range names {
+			out = append(out, session.SessionRef{Name: n})
+		}
+		return out
+	}
+	cases := []struct {
+		name string
+		live []session.SessionRef
+		want string
+	}{
+		{"none live", nil, "scratch-1"},
+		{"one live", refs("scratch-1"), "scratch-2"},
+		{"gap at 1", refs("ZEN-4112", "scratch-2"), "scratch-1"},
+		{"contiguous", refs("scratch-1", "scratch-2", "scratch-3"), "scratch-4"},
+		{"out of order", refs("scratch-3", "scratch-1"), "scratch-2"},
+		{"non-numeric suffix does not reserve", refs("scratch-notes"), "scratch-1"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ScratchSpec(c.live, "/repos")
+			if got.Name != c.want || got.Label != c.want {
+				t.Errorf("name/label = %q/%q, want %q", got.Name, got.Label, c.want)
+			}
+			want := strings.Join([]string{"agent", "start", c.want, "--cwd", "/repos", "--", "claude"}, " ")
+			if strings.Join(got.Args, " ") != want {
+				t.Errorf("args = %q, want %q", strings.Join(got.Args, " "), want)
+			}
+		})
+	}
+}

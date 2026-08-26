@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -149,17 +150,39 @@ func Plan(t session.Ticket, agents []Agent, defaultCwd string) (session.LaunchSp
 
 // ScratchSpec builds a launch for an ad-hoc Claude session not tied to any
 // ticket: a bare `claude` (no session id, no ticket system prompt) opened in its
-// own new tab. The name is unique among existing scratch-N agents.
+// own new tab. The name is the lowest scratch-N not currently live: the live
+// scratches are not necessarily scratch-1..scratch-N, and herdr refuses a start
+// whose name is still in use (agent_name_taken).
 func ScratchSpec(agents []session.SessionRef, cwd string) session.LaunchSpec {
-	n := 1
+	taken := map[int]bool{}
 	for _, a := range agents {
-		if strings.HasPrefix(a.Name, "scratch-") {
-			n++
+		if i, ok := scratchNum(a.Name); ok {
+			taken[i] = true
 		}
+	}
+	n := 1
+	for taken[n] {
+		n++
 	}
 	name := fmt.Sprintf("scratch-%d", n)
 	args := []string{"agent", "start", name, "--cwd", cwd, "--", "claude"}
 	return session.LaunchSpec{Args: args, Cwd: cwd, Name: name, Label: name, Action: "scratch"}
+}
+
+// scratchNumRE matches the ad-hoc session names ScratchSpec issues, so a
+// user-named agent that merely starts with "scratch-" never reserves a number.
+var scratchNumRE = regexp.MustCompile(`^scratch-([0-9]+)$`)
+
+func scratchNum(name string) (int, bool) {
+	m := scratchNumRE.FindStringSubmatch(strings.ToLower(strings.TrimSpace(name)))
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	return n, true
 }
 
 // FocusSpec switches the workspace to an existing session's pane.

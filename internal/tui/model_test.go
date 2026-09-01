@@ -717,9 +717,9 @@ func TestOtherSessionsSectionCloseAndScratch(t *testing.T) {
 func TestWorkingTicketDeEmphasized(t *testing.T) {
 	m := loaded(t)
 	is := linear.Issue{Identifier: "ZEN-9", Title: "thing", Priority: 1}
-	normal := m.renderIssue(is, false)
+	normal := m.renderIssue(is, false, 0)
 	m.sessions = map[string]session.Status{"ZEN-9": session.Working}
-	working := m.renderIssue(is, false)
+	working := m.renderIssue(is, false, 0)
 	// Both keep the same visible text…
 	if !strings.Contains(working, "ZEN-9") || !strings.Contains(working, "thing") {
 		t.Fatalf("working row lost its content:\n%q", working)
@@ -749,7 +749,7 @@ func TestAccountColumnNamesTheOwnerOnTheSelectedRow(t *testing.T) {
 
 	// Unselected: a dot, no name — naming every row would spend the title
 	// column's width on something that rarely changes.
-	row := m.renderIssue(is, false)
+	row := m.renderIssue(is, false, 0)
 	if !strings.Contains(row, "⦿") {
 		t.Errorf("row with a session should carry an account dot:\n%q", row)
 	}
@@ -757,14 +757,14 @@ func TestAccountColumnNamesTheOwnerOnTheSelectedRow(t *testing.T) {
 		t.Errorf("unselected row should not spell out the account:\n%q", row)
 	}
 	// Selected: the name, which is the whole point of the column.
-	if sel := m.renderIssue(is, true); !strings.Contains(sel, "support") {
+	if sel := m.renderIssue(is, true, 0); !strings.Contains(sel, "support") {
 		t.Errorf("selected row should name the owning account:\n%q", sel)
 	}
 
 	// A ticket nobody has a session for gets blank padding, not a dot.
 	other := linear.Issue{Identifier: "ZEN-1", Title: "high a", Priority: 2}
-	if strings.Contains(m.renderIssue(other, false), "⦿") {
-		t.Errorf("ticket with no session anywhere should have no dot:\n%q", m.renderIssue(other, false))
+	if strings.Contains(m.renderIssue(other, false, 0), "⦿") {
+		t.Errorf("ticket with no session anywhere should have no dot:\n%q", m.renderIssue(other, false, 0))
 	}
 }
 
@@ -789,7 +789,7 @@ func TestAccountColumnAbsentWithOneSubscription(t *testing.T) {
 	}
 	m := loaded(t)
 	m.accounts, m.ownerCol = one, 0
-	if row := m.renderIssue(linear.Issue{Identifier: "ZEN-9", Title: "x", Priority: 1}, false); strings.Contains(row, "⦿") {
+	if row := m.renderIssue(linear.Issue{Identifier: "ZEN-9", Title: "x", Priority: 1}, false, 0); strings.Contains(row, "⦿") {
 		t.Errorf("single-account deck should render no account column:\n%q", row)
 	}
 }
@@ -804,7 +804,7 @@ func TestPeerDeckStateShowsOnTheRow(t *testing.T) {
 	if st != session.Working || !remote {
 		t.Errorf("rowSession(ZEN-9) = %v remote=%v, want Working remote=true", st, remote)
 	}
-	if row := m.renderIssue(is, false); !strings.Contains(row, "working") {
+	if row := m.renderIssue(is, false, 0); !strings.Contains(row, "working") {
 		t.Errorf("row should badge the peer deck's live state:\n%q", row)
 	}
 	// (That the badge is then colored by deck rather than by status isn't
@@ -1580,7 +1580,7 @@ func TestStatusPollCoversFilteredOutTickets(t *testing.T) {
 	next, _ = m.Update(runes("ZEN-2")) // only ZEN-2 is rendered now
 	m = next.(Model)
 
-	keys := m.issueKeys()
+	keys := m.sessionKeys()
 	for _, want := range []string{"ZEN-9", "ZEN-1", "ZEN-2", "ZEN-5"} {
 		if !slices.Contains(keys, want) {
 			t.Errorf("status poll should still cover %s while a filter hides it; got %v", want, keys)
@@ -1943,7 +1943,7 @@ func TestRowNeverOverrunsItsWidth(t *testing.T) {
 		{Identifier: "ZEN-4", Title: "🎉 an emoji leads this title", Priority: 2},
 	} {
 		for _, sel := range []bool{false, true} {
-			got := runewidth.StringWidth(ansiRe.ReplaceAllString(m.renderIssue(is, sel), ""))
+			got := runewidth.StringWidth(ansiRe.ReplaceAllString(m.renderIssue(is, sel, 0), ""))
 			if got > m.rowWidth() {
 				t.Errorf("%s (selected=%v) rendered %d columns, row width is %d",
 					is.Identifier, sel, got, m.rowWidth())

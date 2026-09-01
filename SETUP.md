@@ -53,12 +53,26 @@ as a sibling pane; start work, **detach** (herdr keybinding) to leave it running
 and Enter another ticket. Detaching/quitting herdr leaves the server and all ticket sessions
 running in the background.
 
-**Layout:** the deck lives in **tab 1**; each ticket you open lands in **its own tab**, so only
-one thing is visible at a time and tickets never pile up as split panes. Open a ticket → you're
-taken to its tab → work → jump back to the deck (tab 1) → open the next ticket. Agents keep
-running in their background tabs.
+**Layout:** the deck lives in **tab 1**; each ticket — or project — you open lands in **its own
+tab**, so only one thing is visible at a time and nothing piles up as split panes. Open a ticket
+→ you're taken to its tab → work → jump back to the deck (tab 1) → open the next one. Agents
+keep running in their background tabs. A project's tab is titled by the project's name; a
+ticket's by `KEY  short title`.
 
 **TicketDeck keys** (inside the deck):
+
+The table below describes the keys on a **ticket** row. A **project** row (the `PROJECTS`
+section at the top) takes the same keys against the project: `⏎` opens/attaches the
+project's own session, `d` its detail overlay (progress, dates, lead, your tickets in it,
+its description), `o` the Linear project page, `p` the PRs across all its tickets, `H`
+hands the session to another Claude subscription, and the writes land on the project's own
+fields — `s` status (Planned / In Progress / Blocked / Completed / Cancel, confirm-gated),
+`P` priority, `a` **lead** (a project's nearest thing to an assignee). Completing or
+cancelling a project closes its session, like Done does for a ticket.
+
+`t` is the one ticket key that does **not** carry over: `/triage` triages a single issue,
+so on a project row it says so and does nothing. Unfold the project and triage one of its
+tickets instead.
 
 | goal | key |
 |---|---|
@@ -73,7 +87,7 @@ running in their background tabs.
 | **assign / reassign / unassign** | `a` opens a picker — type to filter people, `↑`/`↓` select, `⏎` assign (top row = **Unassign**), `esc` cancel — **writes to Linear; write-scoped key** (reassigning away from you drops the ticket off the list) |
 | open an **ad-hoc Claude session** not tied to any ticket (own tab) | `n` |
 | **`/triage` in the background** | `t` — starts the ticket's session in its own (unfocused) tab if it isn't running, submits `/triage`, and keeps you on the deck (**runs a Claude turn**; herdr backend). On an "Other sessions" row it just submits `/triage` to that session. Gated the same way `Enter` is when another deck is running the ticket. |
-| **fold/unfold** a priority section (collapsed shows a ticket count) | `Space` (toggle) · `←` collapse · `→` expand |
+| **fold/unfold** a priority section (collapsed shows a ticket count) | `Space` (toggle) · `←` collapse · `→` expand — on the `PROJECTS` header this folds the whole section; on a project row (or one of its tickets) it folds that project's ticket list |
 | **search / filter the list** | `/` — type to filter tickets by key or title (live, case-insensitive; all matching groups expand). `⏎` keeps the filter and returns to list nav; `esc` clears it. While a filter is applied the footer shows `filter "…" · esc clear`. |
 | **hand the session to another Claude subscription** | `H` — for when this subscription hits a limit mid-task. Stops the session here, copies its transcript to the other account, and it becomes resumable in that deck. `⏎` confirms, `1`-`9` picks a target, `esc` cancels. Only offered when a second subscription exists — see [Multiple Claude subscriptions](#multiple-claude-subscriptions-accounts). |
 | refresh | `r` — a manual refresh. Session badges also refresh on their own every few seconds, and the instant the deck regains focus, so you don't have to. |
@@ -247,6 +261,10 @@ every 3 seconds, alongside this deck's own badges. When a ticket has been worked
 under both accounts — a hand-off leaves the transcript behind in the source — the
 dot names the live session, or the one that wrote most recently.
 
+All of this applies to **project** rows too: a project's session carries the same
+`⦿` dot and live badge, so you can see which subscription is working a project
+without switching decks.
+
 **One deck per ticket.** `⏎` on a ticket that another deck is *actively running*
 stops and shows what's there instead of opening it:
 
@@ -283,10 +301,12 @@ started elsewhere in the last couple of seconds can still slip past it. It
 catches the mistake people actually make: opening a ticket another deck has been
 working on for minutes.
 
-**Handing a session to the other subscription.** `H` on a ticket moves its
-session to another account — for when the current subscription hits a limit
-mid-task. It stops the session here, copies its transcript into the other
-account's config dir, and the session becomes resumable in that deck.
+**Handing a session to the other subscription.** `H` on a ticket — or on a
+**project** — moves its session to another account, for when the current
+subscription hits a limit mid-task. It stops the session here, copies its
+transcript into the other account's config dir, and the session becomes
+resumable in that deck. A project hands off exactly as a ticket does: the move
+is keyed on the session id, which doesn't care which kind of work it holds.
 
 Three things to know:
 

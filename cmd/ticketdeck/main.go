@@ -249,7 +249,28 @@ func runDump(f tui.Fetcher) {
 		fmt.Fprintln(os.Stderr, "ticketdeck:", err)
 		os.Exit(1)
 	}
-	for _, g := range linear.GroupByPriorityThenStatus(linear.FilterVisible(issues)) {
+	visible := linear.FilterVisible(issues)
+
+	// Projects lead the dump, and their tickets are listed under them rather
+	// than in the priority groups — the same split the deck renders, so `--dump`
+	// stays a faithful plain-text view of it.
+	if pf, ok := f.(interface {
+		FetchMyProjects(context.Context) ([]linear.Project, error)
+	}); ok {
+		mine, err := pf.FetchMyProjects(context.Background())
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ticketdeck: projects:", err)
+		}
+		for _, p := range linear.FilterVisibleProjects(linear.AugmentProjects(mine, visible)) {
+			fmt.Printf("\n▛ %s  [%s · %d%%]\n", p.Name, p.StatusName, p.ProgressPct())
+			for _, is := range linear.SortProjectIssues(p.Issues) {
+				fmt.Printf("    %-10s %-12s %s\n", is.Identifier, is.StateName, is.Title)
+			}
+		}
+		visible = linear.IssuesWithoutProject(visible)
+	}
+
+	for _, g := range linear.GroupByPriorityThenStatus(visible) {
 		fmt.Printf("\n▛ %s\n", g.PrioLabel)
 		for _, sb := range g.Statuses {
 			fmt.Printf("  %s\n", sb.Status)

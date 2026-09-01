@@ -83,6 +83,18 @@ type Issue struct {
 	Labels      []string   // issue label names (e.g. "validation-inconclusive")
 	CompletedAt time.Time  // when a completed-type issue was finished (zero if not)
 	BlockedBy   []Relation // issues blocking this one (inverseRelations, type "blocks")
+
+	// The project this issue belongs to, if any. An issue with a project is
+	// rendered under that project's row instead of in the priority sections, so
+	// ProjectID is what routes it (see IssuesWithoutProject). The rest is here
+	// so a project nobody fetched — someone else's, holding a ticket of mine —
+	// can still be given a row (see AugmentProjects).
+	ProjectID         string
+	ProjectName       string
+	ProjectSlugID     string
+	ProjectURL        string
+	ProjectStatus     string
+	ProjectStatusType string
 }
 
 // Relation is a linked issue (a "blocks" dependency in either direction). ID and

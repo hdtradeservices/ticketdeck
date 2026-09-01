@@ -65,6 +65,7 @@ query AssignedOpen($after: String, $since: DateTimeOrDuration) {
         attachments { nodes { url title subtitle metadata } }
         labels { nodes { name } }
         inverseRelations { nodes { type issue { identifier state { name type } } } }
+        project { id name slugId url status { name type } }
       }
       pageInfo { hasNextPage endCursor }
     }
@@ -124,6 +125,16 @@ type issueNode struct {
 			} `json:"issue"`
 		} `json:"nodes"`
 	} `json:"inverseRelations"`
+	Project *struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		SlugID string `json:"slugId"`
+		URL    string `json:"url"`
+		Status struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"status"`
+	} `json:"project"`
 }
 
 // toIssue maps a GraphQL node to the Issue TicketDeck renders.
@@ -165,6 +176,10 @@ func (n issueNode) toIssue() Issue {
 	}
 	for _, l := range n.Labels.Nodes {
 		issue.Labels = append(issue.Labels, l.Name)
+	}
+	if p := n.Project; p != nil {
+		issue.ProjectID, issue.ProjectName, issue.ProjectSlugID = p.ID, p.Name, p.SlugID
+		issue.ProjectURL, issue.ProjectStatus, issue.ProjectStatusType = p.URL, p.Status.Name, p.Status.Type
 	}
 	// inverseRelations of type "blocks": the other issue blocks this one, i.e.
 	// this issue is blocked by it.
@@ -236,6 +251,160 @@ func (c *Client) FetchAssignedOpen(ctx context.Context) ([]Issue, error) {
 		after = ai.PageInfo.EndCursor
 	}
 	return out, nil
+}
+
+// myProjectsQuery fetches the projects I lead. Linear has no "assigned
+// project", and lead is the field that means it: membership is broad enough to
+// include everything you were ever added to, which is a reading list rather
+// than a work queue. Read-only (BR-2b). Paginated.
+//
+// Completed/canceled projects are not filtered server-side: a project that
+// finished within DoneVisibleFor lingers on the deck like a done ticket, and
+// ProjectHidden makes that call once, client-side, where it can also see
+// whether the project still holds open tickets of mine.
+const myProjectsQuery = `
+query MyProjects($after: String) {
+  projects(
+    first: 50
+    after: $after
+    orderBy: updatedAt
+    filter: { lead: { isMe: { eq: true } } }
+  ) {
+    nodes {
+      id
+      name
+      slugId
+      url
+      description
+      content
+      priority
+      priorityLabel
+      progress
+      scope
+      health
+      startDate
+      targetDate
+      completedAt
+      updatedAt
+      status { name type }
+      lead { id displayName name }
+      teams { nodes { key } }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}`
+
+type projectNode struct {
+	ID            string  `json:"id"`
+	Name          string  `json:"name"`
+	SlugID        string  `json:"slugId"`
+	URL           string  `json:"url"`
+	Description   string  `json:"description"`
+	Content       string  `json:"content"`
+	Priority      int     `json:"priority"`
+	PriorityLabel string  `json:"priorityLabel"`
+	Progress      float64 `json:"progress"`
+	Scope         float64 `json:"scope"`
+	Health        string  `json:"health"`
+	StartDate     string  `json:"startDate"`
+	TargetDate    string  `json:"targetDate"`
+	CompletedAt   string  `json:"completedAt"`
+	UpdatedAt     string  `json:"updatedAt"`
+	Status        struct {
+		Name string `json:"name"`
+		Type string `json:"type"`
+	} `json:"status"`
+	Lead *struct {
+		ID          string `json:"id"`
+		DisplayName string `json:"displayName"`
+		Name        string `json:"name"`
+	} `json:"lead"`
+	Teams struct {
+		Nodes []struct {
+			Key string `json:"key"`
+		} `json:"nodes"`
+	} `json:"teams"`
+}
+
+func (n projectNode) toProject() Project {
+	p := Project{
+		ID:          n.ID,
+		Name:        n.Name,
+		SlugID:      n.SlugID,
+		URL:         n.URL,
+		Summary:     n.Description,
+		Content:     n.Content,
+		Priority:    n.Priority,
+		PrioLabel:   n.PriorityLabel,
+		Progress:    n.Progress,
+		Scope:       n.Scope,
+		Health:      n.Health,
+		StartDate:   n.StartDate,
+		TargetDate:  n.TargetDate,
+		CompletedAt: parseTS(n.CompletedAt),
+		UpdatedAt:   n.UpdatedAt,
+		StatusName:  n.Status.Name,
+		StatusType:  n.Status.Type,
+		Mine:        true,
+	}
+	if n.Lead != nil {
+		p.LeadID = n.Lead.ID
+		p.LeadName = firstNonEmpty(n.Lead.DisplayName, n.Lead.Name)
+	}
+	for _, t := range n.Teams.Nodes {
+		p.TeamKeys = append(p.TeamKeys, t.Key)
+	}
+	return p
+}
+
+// FetchMyProjects returns every project I lead, following pagination.
+func (c *Client) FetchMyProjects(ctx context.Context) ([]Project, error) {
+	var out []Project
+	var after string
+	for {
+		raw, err := c.postGraphQL(ctx, myProjectsQuery, map[string]any{"after": nullable(after)})
+		if err != nil {
+			return nil, err
+		}
+		var parsed struct {
+			Data struct {
+				Projects struct {
+					Nodes    []projectNode `json:"nodes"`
+					PageInfo struct {
+						HasNextPage bool   `json:"hasNextPage"`
+						EndCursor   string `json:"endCursor"`
+					} `json:"pageInfo"`
+				} `json:"projects"`
+			} `json:"data"`
+			Errors []struct {
+				Message string `json:"message"`
+			} `json:"errors"`
+		}
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			return nil, fmt.Errorf("linear: decode projects: %w", err)
+		}
+		if len(parsed.Errors) > 0 {
+			return nil, fmt.Errorf("linear: %s", parsed.Errors[0].Message)
+		}
+		for _, n := range parsed.Data.Projects.Nodes {
+			out = append(out, n.toProject())
+		}
+		if !parsed.Data.Projects.PageInfo.HasNextPage {
+			break
+		}
+		after = parsed.Data.Projects.PageInfo.EndCursor
+	}
+	return out, nil
+}
+
+// firstNonEmpty returns the first non-empty string, or "".
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // issueByKeyQuery fetches a single issue by its human key (team key + number),
@@ -347,7 +516,7 @@ func (c *Client) postGraphQL(ctx context.Context, query string, vars map[string]
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	raw, _ := io.ReadAll(res.Body)
 
 	if res.StatusCode == http.StatusTooManyRequests {

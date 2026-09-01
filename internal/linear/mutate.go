@@ -219,6 +219,139 @@ mutation SetPriority($id: String!, $priority: Int!) {
   issueUpdate(id: $id, input: { priority: $priority }) { success }
 }`
 
+const projectUpdateMutation = `
+mutation UpdateProject($id: String!, $input: ProjectUpdateInput!) {
+  projectUpdate(id: $id, input: $input) { success }
+}`
+
+// updateProject runs one projectUpdate and checks it landed. The three project
+// writes (status, lead, priority) differ only in the input they send.
+func (c *Client) updateProject(ctx context.Context, p Project, input map[string]any, what string) error {
+	if p.ID == "" {
+		return fmt.Errorf("missing project id for %q (refresh and retry)", p.Name)
+	}
+	raw, err := c.postGraphQL(ctx, projectUpdateMutation, map[string]any{"id": p.ID, "input": input})
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Data struct {
+			ProjectUpdate struct {
+				Success bool `json:"success"`
+			} `json:"projectUpdate"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return fmt.Errorf("decode projectUpdate: %w", err)
+	}
+	if len(resp.Errors) > 0 {
+		return fmt.Errorf("%s (a write-scoped LINEAR_API_KEY is required)", resp.Errors[0].Message)
+	}
+	if !resp.Data.ProjectUpdate.Success {
+		return fmt.Errorf("linear rejected the %s change", what)
+	}
+	return nil
+}
+
+// SetProjectStatus moves a project to a target status ("In Progress",
+// "Completed", …), resolving the workspace's status id by name.
+func (c *Client) SetProjectStatus(ctx context.Context, p Project, target string) error {
+	statusID, err := c.resolveProjectStatusID(ctx, target)
+	if err != nil {
+		return err
+	}
+	return c.updateProject(ctx, p, map[string]any{"statusId": statusID}, "status")
+}
+
+// SetProjectLead sets a project's lead. An empty userID clears it.
+func (c *Client) SetProjectLead(ctx context.Context, p Project, userID string) error {
+	var lead any // null clears the lead
+	if userID != "" {
+		lead = userID
+	}
+	return c.updateProject(ctx, p, map[string]any{"leadId": lead}, "lead")
+}
+
+// SetProjectPriority sets a project's priority (0=None, 1=Urgent … 4=Low).
+func (c *Client) SetProjectPriority(ctx context.Context, p Project, priority int) error {
+	return c.updateProject(ctx, p, map[string]any{"priority": priority}, "priority")
+}
+
+const projectStatusesQuery = `
+query ProjectStatuses {
+  projectStatuses { nodes { id name type position } }
+}`
+
+// resolveProjectStatusID finds a project status id by name. Project statuses
+// are workspace-wide (unlike issue workflow states, which are per-team), so
+// there is no team to scope this by — but a workspace can define several of one
+// type, so an exact name match wins before the type fallback.
+func (c *Client) resolveProjectStatusID(ctx context.Context, target string) (string, error) {
+	raw, err := c.postGraphQL(ctx, projectStatusesQuery, map[string]any{})
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Data struct {
+			ProjectStatuses struct {
+				Nodes []struct {
+					ID       string  `json:"id"`
+					Name     string  `json:"name"`
+					Type     string  `json:"type"`
+					Position float64 `json:"position"`
+				} `json:"nodes"`
+			} `json:"projectStatuses"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", fmt.Errorf("decode project statuses: %w", err)
+	}
+	if len(resp.Errors) > 0 {
+		return "", fmt.Errorf("%s", resp.Errors[0].Message)
+	}
+	statuses := resp.Data.ProjectStatuses.Nodes
+	for _, s := range statuses {
+		if strings.EqualFold(s.Name, target) {
+			return s.ID, nil
+		}
+	}
+	// Fall back to the lowest-positioned status of the wanted type, so a
+	// workspace that renamed the default ("Done" for "Completed", say) still
+	// resolves rather than erroring.
+	wantType := ""
+	switch strings.ToLower(target) {
+	case "completed", "done":
+		wantType = "completed"
+	case "canceled", "cancelled":
+		wantType = "canceled"
+	case "in progress", "started":
+		wantType = "started"
+	case "planned":
+		wantType = "planned"
+	}
+	if wantType != "" {
+		best, bestPos := "", 0.0
+		for _, s := range statuses {
+			if s.Type != wantType {
+				continue
+			}
+			if best == "" || s.Position < bestPos {
+				best, bestPos = s.ID, s.Position
+			}
+		}
+		if best != "" {
+			return best, nil
+		}
+	}
+	return "", fmt.Errorf("no %q project status in this workspace", target)
+}
+
 // Users lists active workspace members for the assignee picker.
 func (c *Client) Users(ctx context.Context) ([]User, error) {
 	raw, err := c.postGraphQL(ctx, usersQuery, map[string]any{})

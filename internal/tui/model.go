@@ -90,6 +90,21 @@ type commenter interface {
 	FetchComments(ctx context.Context, issueID string) ([]linear.Comment, error)
 }
 
+// projectFetcher is the optional read capability behind the Projects section.
+// Live Linear implements it; a Fetcher that doesn't simply gets no section, and
+// every ticket keeps grouping by priority as before.
+type projectFetcher interface {
+	FetchMyProjects(ctx context.Context) ([]linear.Project, error)
+}
+
+// projectWriter is the optional write capability for project rows — the
+// project-side equivalents of the ticket `s`, `a`, and `P` hotkeys.
+type projectWriter interface {
+	SetProjectStatus(ctx context.Context, p linear.Project, target string) error
+	SetProjectLead(ctx context.Context, p linear.Project, userID string) error
+	SetProjectPriority(ctx context.Context, p linear.Project, priority int) error
+}
+
 const refreshEvery = 60 * time.Second
 
 // statusRefreshEvery can be far tighter than refreshEvery because the status
@@ -115,19 +130,47 @@ const (
 	rowSpacer
 	rowSessionHeader // "Other sessions" header
 	rowSession       // a non-ticket / off-list session row
+	rowProjectHeader // the "Projects" section header
+	rowProject       // one of my Linear projects
 )
 
 type row struct {
-	kind  rowKind
-	text  string             // for headers
-	count int                // for rowPrio/rowSessionHeader: item count
-	issue linear.Issue       // for rowIssue
-	ref   session.SessionRef // for rowSession
+	kind    rowKind
+	text    string             // for headers
+	count   int                // for rowPrio/rowSessionHeader/rowProjectHeader: item count
+	issue   linear.Issue       // for rowIssue
+	ref     session.SessionRef // for rowSession
+	project linear.Project     // for rowProject
+	indent  int                // extra leading columns (a ticket nested under its project)
 }
 
 type refreshedMsg struct {
 	issues []linear.Issue
 	err    error
+}
+
+// projectsMsg carries the projects I lead or belong to. It rides its own
+// message rather than refreshedMsg because it is a separate Linear query: a
+// projects failure must not blank the ticket list, or vice versa.
+type projectsMsg struct {
+	projects []linear.Project
+	err      error
+}
+
+// projectWriteMsg is the result of a project status/lead/priority write.
+type projectWriteMsg struct {
+	key   string // the project's session key, for tearing its session down
+	name  string // the project's name, for the notice
+	what  string // "status" | "lead" | "priority"
+	value string
+	err   error
+}
+
+// isTerminalProjectStatus reports whether a project status change takes the
+// project off the deck (so its session should be closed), mirroring
+// isTerminalTarget for tickets.
+func isTerminalProjectStatus(status string) bool {
+	return status == "Completed" || status == "Canceled"
 }
 
 type statusesMsg struct {
@@ -222,6 +265,13 @@ type Model struct {
 	root          string         // default working dir for new sessions (repos-root fallback)
 	dry           bool           // print the launch command instead of running it
 	allIssues     []linear.Issue // last fetched issues (for re-grouping on collapse)
+	myProjects    []linear.Project
+	projects      []linear.Project // myProjects + the ones my tickets belong to, sorted
+	projFetch     projectFetcher   // non-nil when projects can be fetched (live Linear)
+	projWriter    projectWriter    // non-nil when projects can be written (live Linear)
+	projExpanded  map[string]bool  // project key → its tickets are unfolded (default: folded)
+	projFolded    bool             // the whole Projects section is folded
+	detailProj    *linear.Project  // non-nil = showing the project detail overlay
 	rows          []row
 	cursor        int             // index into rows; a cursorable row (issue, or collapsed header)
 	offset        int             // index of the first visible row (scroll position)
@@ -250,6 +300,7 @@ type Model struct {
 	priorityMenu  bool                   // priority-change overlay is open
 	assignMenu    bool                   // assignee-picker overlay is open
 	assignIssue   linear.Issue           // ticket being reassigned (captured when the picker opens)
+	assignProj    *linear.Project        // non-nil = the picker is setting a project's lead, not a ticket's assignee
 	assignQuery   string                 // filter text in the assignee picker
 	assignCursor  int                    // index into the filtered picker options (0 = Unassign)
 	searchMode    bool                   // "/" search input is active (captures typing)
@@ -298,7 +349,7 @@ type demoOwner interface {
 }
 
 func New(f Fetcher, root string, dry bool, backend Backend) Model {
-	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != "", comments: map[string][]linear.Comment{}, commentsErr: map[string]error{}, commentsBusy: map[string]bool{}}
+	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, projExpanded: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != "", comments: map[string][]linear.Comment{}, commentsErr: map[string]error{}, commentsBusy: map[string]bool{}}
 	// Resolved once, not per frame: All() globs the filesystem, and View runs on
 	// every keystroke.
 	m.acct = account.Current()
@@ -341,6 +392,12 @@ func New(f Fetcher, root string, dry bool, backend Backend) Model {
 	if c, ok := f.(commenter); ok {
 		m.commenter = c
 	}
+	if p, ok := f.(projectFetcher); ok {
+		m.projFetch = p
+	}
+	if p, ok := f.(projectWriter); ok {
+		m.projWriter = p
+	}
 	m.hideOpenHint = openHintDismissed()
 	if backend != nil {
 		debugLog.Printf("start: backend=%s root=%q dry=%v", backend.Bin(), root, dry)
@@ -362,11 +419,20 @@ func Preview(f Fetcher, height int) (string, error) {
 	m := New(f, "", true, ClaudeBackend{})
 	m.height = height
 	next, _ := m.Update(refreshedMsg{issues: issues})
-	return next.(Model).View(), nil
+	m = next.(Model)
+	if m.projFetch != nil {
+		// A projects failure degrades to a deck without the section, exactly as
+		// it does in the live TUI — it must not take the whole frame down.
+		if ps, err := m.projFetch.FetchMyProjects(context.Background()); err == nil {
+			next, _ = m.Update(projectsMsg{projects: ps})
+			m = next.(Model)
+		}
+	}
+	return m.View(), nil
 }
 
 func (m Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.refresh(), tick(), checkUpdate(), m.fetchQuota()}
+	cmds := []tea.Cmd{m.refresh(), m.refreshProjects(), tick(), checkUpdate(), m.fetchQuota()}
 	// Name the OS window/tab after the account, so you can tell two decks apart
 	// from the taskbar without focusing either one.
 	if m.acct.Name != "" {
@@ -422,10 +488,25 @@ func (m Model) refresh() tea.Cmd {
 	}
 }
 
+// refreshProjects fetches the projects I lead or belong to. Nil when the
+// backing Fetcher has no project support, which simply leaves the section off.
+func (m Model) refreshProjects() tea.Cmd {
+	if m.projFetch == nil {
+		return nil
+	}
+	pf := m.projFetch
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		ps, err := pf.FetchMyProjects(ctx)
+		return projectsMsg{projects: ps, err: err}
+	}
+}
+
 // refreshStatuses fetches per-ticket session statuses from the active backend
 // (or the demo override). Read-only; no model calls.
 func (m Model) refreshStatuses() tea.Cmd {
-	keys := m.issueKeys()
+	keys := m.sessionKeys()
 	if m.demoStatuses != nil {
 		ds, owners := m.demoStatuses, m.demoOwners
 		return func() tea.Msg {
@@ -463,16 +544,22 @@ func (m Model) refreshSessions() tea.Cmd {
 	}
 }
 
-// issueKeys is the set of tickets to poll statuses for. It deliberately reads
-// allIssues rather than the rendered rows: a search filter or a folded group hides
-// rows, and polling only those would make statusesMsg replace m.sessions with a
-// partial map — blanking the hidden tickets' badges and resetting their
-// time-in-state timers.
-func (m Model) issueKeys() []string {
+// sessionKeys is the set of session keys to poll statuses for: every visible
+// ticket, plus every project (whose rows open sessions of their own). It
+// deliberately reads allIssues rather than the rendered rows: a search filter or
+// a folded group hides rows, and polling only those would make statusesMsg
+// replace m.sessions with a partial map — blanking the hidden tickets' badges
+// and resetting their time-in-state timers.
+func (m Model) sessionKeys() []string {
 	vis := linear.FilterVisible(m.allIssues)
-	keys := make([]string, 0, len(vis))
+	keys := make([]string, 0, len(vis)+len(m.projects))
 	for _, is := range vis {
 		keys = append(keys, is.Identifier)
+	}
+	// m.projects is what regroup last rendered, so the polled set and the badged
+	// rows can never drift apart.
+	for _, p := range m.projects {
+		keys = append(keys, p.Key())
 	}
 	return keys
 }
@@ -503,7 +590,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// also how a deck that skipped a round — another deck held the poll lock —
 		// picks up the answer. A per-deck timer here would only put the decks back
 		// in lockstep — the state that earns the 429s.
-		return m, tea.Batch(m.refresh(), m.refreshStatuses(), m.refreshSessions(), tick(), m.fetchQuota())
+		return m, tea.Batch(m.refresh(), m.refreshProjects(), m.refreshStatuses(), m.refreshSessions(), tick(), m.fetchQuota())
 
 	case statusTickMsg:
 		// Deliberately no Linear fetch or quota call — those stay on the slow tick.
@@ -527,7 +614,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		debugLog.Printf("handoff %s → %s ok", msg.key, msg.to)
-		m.notice = fmt.Sprintf("%s → ⦿%s ✓ resume it there (%s)", msg.key, msg.to, msg.cmd)
+		m.notice = fmt.Sprintf("%s → ⦿%s ✓ resume it there (%s)", m.label(msg.key), msg.to, msg.cmd)
 		// The session is stopped here now, so refresh badges to show it.
 		return m, tea.Batch(m.refreshStatuses(), m.refreshSessions())
 
@@ -558,6 +645,50 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastSync = time.Now()
 		m.rebuild(msg.issues)
 		return m, tea.Batch(m.refreshStatuses(), m.refreshSessions())
+
+	case projectsMsg:
+		if msg.err != nil {
+			// Keep the last good project list, exactly as the ticket list does on
+			// error — and don't set m.err, which is the ticket list's status line.
+			debugLog.Printf("projects refresh error: %v", msg.err)
+			break
+		}
+		m.myProjects = msg.projects
+		prevID, _ := m.selectedID()
+		prevKey := ""
+		if p, ok := m.selectedProject(); ok {
+			prevKey = p.Key()
+		}
+		prevIdx := m.cursor
+		m.regroup()
+		m.applyDemoStatuses()
+		m.restoreCursor(prevID, prevKey, prevIdx)
+		m.ensureVisible()
+		// New project rows mean new session keys to badge.
+		return m, m.refreshStatuses()
+
+	case projectWriteMsg:
+		if msg.err != nil {
+			debugLog.Printf("project %s %s → %s failed: %v", msg.name, msg.what, msg.value, msg.err)
+			m.err = fmt.Errorf("%s %s: %v", msg.name, msg.what, msg.err)
+			m.notice = ""
+			return m, nil
+		}
+		debugLog.Printf("project %s %s → %s ok", msg.name, msg.what, msg.value)
+		m.notice = fmt.Sprintf("%s → %s ✓", truncCols(msg.name, 40), msg.value)
+		m.err = nil
+		cmds := []tea.Cmd{m.refreshProjects(), m.refresh()}
+		// Finishing a project drops its row off the deck, so tear its session
+		// down too — the same courtesy a ticket moved to Done gets. The
+		// transcript persists either way.
+		if msg.what == "status" && isTerminalProjectStatus(msg.value) && msg.key != "" && isRunning(m.sessions[msg.key]) {
+			key, backend := msg.key, m.backend
+			cmds = append(cmds, func() tea.Msg {
+				out, err := backend.CloseByName(key)
+				return detachedDoneMsg{action: "closed " + msg.name, err: err, output: strings.TrimSpace(out)}
+			})
+		}
+		return m, tea.Batch(cmds...)
 
 	case statusesMsg:
 		// Ownership is resolved from disk and the peer workspaces, not from the
@@ -728,6 +859,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.detail != nil {
 			return m.updateDetail(msg)
 		}
+		if m.detailProj != nil {
+			return m.updateProjectDetail(msg)
+		}
 		if m.statusMenu {
 			return m.updateStatus(msg)
 		}
@@ -751,6 +885,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.searchMode {
 			return m.updateSearch(msg)
+		}
+		// A project row takes the same action keys a ticket row does, resolved
+		// against the project. Keys it doesn't own (navigation, folding, search,
+		// refresh, quit) fall through to the shared handling below.
+		if p, ok := m.selectedProject(); ok {
+			if next, cmd, handled := m.projectKey(msg, p); handled {
+				return next, cmd
+			}
 		}
 		switch msg.String() {
 		case "/":
@@ -888,9 +1030,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // ticket's session. It carries the ticket and which action was asked for, so
 // "do it anyway" resumes exactly what was interrupted.
 type conflict struct {
-	issue  linear.Issue
-	owner  account.Owner
-	triage bool // the ask was `t` (background /triage), not open
+	issue linear.Issue
+	// project is set instead of issue when the held-back launch was a project
+	// row. A project session forks exactly as a ticket's does, so it takes the
+	// same gate.
+	project *linear.Project
+	owner   account.Owner
+	triage  bool // the ask was `t` (background /triage), not open
+}
+
+// name is how to refer to whatever the conflict is about.
+func (c conflict) name() string {
+	if c.project != nil {
+		return truncCols(c.project.Name, 40)
+	}
+	return c.issue.Identifier
 }
 
 // blockingOwner reports the other deck already running this ticket, when
@@ -962,16 +1116,23 @@ func (m Model) updateConflict(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "o":
 		m.conflict = nil
+		// A project is never held back for triage — `t` doesn't apply to one.
+		if c.project != nil {
+			return m.launchProjectNow(*c.project)
+		}
 		if c.triage {
 			return m.triageTicketNow(c.issue)
 		}
 		return m.launchIssueNow(c.issue)
 	case "p":
 		m.conflict = nil
+		if c.project != nil {
+			return m.openProjectPRs(*c.project)
+		}
 		return m.openPRFor(c.issue)
 	default:
 		m.conflict = nil
-		m.notice = c.issue.Identifier + " left to ⦿" + c.owner.Name + " · " + m.deckCmd(c.owner.Name)
+		m.notice = c.name() + " left to ⦿" + c.owner.Name + " · " + m.deckCmd(c.owner.Name)
 	}
 	return m, nil
 }
@@ -1003,7 +1164,7 @@ func (m Model) renderConflict() string {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s %s\n\n", titleStyle.Render("Already open on another deck"), idStyle.Render(c.issue.Identifier))
+	fmt.Fprintf(&b, "%s %s\n\n", titleStyle.Render("Already open on another deck"), idStyle.Render(c.name()))
 	fmt.Fprintf(&b, "  %s   %s\n\n", m.acctStyle(c.owner.Name).Bold(true).Render("⦿ "+c.owner.Name), glyph+" "+state)
 	// The blank line stays outside the Render: lipgloss pads every line of a
 	// multi-line block to the widest one, including a trailing empty line, and
@@ -1440,7 +1601,7 @@ func (m Model) updateAssign(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.String() {
 	case "esc":
-		m.assignMenu = false
+		m.assignMenu, m.assignProj = false, nil
 		m.notice = "assignee change canceled"
 	case "up", "ctrl+p":
 		if m.assignCursor > 0 {
@@ -1461,6 +1622,15 @@ func (m Model) updateAssign(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.assignCursor > 0 && m.assignCursor-1 < len(filtered) {
 			u := filtered[m.assignCursor-1]
 			id, who = u.ID, u.Label()
+		}
+		// A project has a lead where a ticket has an assignee; the picker is the
+		// same, only the field it writes differs.
+		if proj := m.assignProj; proj != nil {
+			if id == "" {
+				who = "no lead"
+			}
+			m.assignMenu, m.assignProj = false, nil
+			return m.setProjectLead(*proj, id, who)
 		}
 		m.assignMenu = false
 		m.notice = fmt.Sprintf("assigning %s → %s…", is.Identifier, who)
@@ -1483,28 +1653,19 @@ func (m Model) updateAssign(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // updatePriority handles the priority-change menu: a single keypress picks a
 // priority and writes it (low-risk and reversible, so no separate confirm).
 func (m Model) updatePriority(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if proj, ok := m.selectedProject(); ok {
+		return m.updateProjectPriority(msg, proj)
+	}
 	is, ok := m.selected()
 	if !ok {
 		m.priorityMenu = false
 		return m, nil
 	}
-	var p int
-	var label string
-	switch msg.String() {
-	case "u":
-		p, label = 1, "Urgent"
-	case "h":
-		p, label = 2, "High"
-	case "m":
-		p, label = 3, "Medium"
-	case "l":
-		p, label = 4, "Low"
-	case "0", "n":
-		p, label = 0, "No priority"
-	case "esc", "q", "P":
-		m.priorityMenu = false
-		return m, nil
-	default:
+	p, label, hit := priorityFor(msg.String())
+	if !hit {
+		if s := msg.String(); s == "esc" || s == "q" || s == "P" {
+			m.priorityMenu = false
+		}
 		return m, nil // ignore other keys; stay in the menu
 	}
 	m.priorityMenu = false
@@ -1518,8 +1679,29 @@ func (m Model) updatePriority(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// priorityFor maps a menu keypress to a Linear priority and its label. The same
+// scale and the same keys serve tickets and projects.
+func priorityFor(key string) (priority int, label string, ok bool) {
+	switch key {
+	case "u":
+		return 1, "Urgent", true
+	case "h":
+		return 2, "High", true
+	case "m":
+		return 3, "Medium", true
+	case "l":
+		return 4, "Low", true
+	case "0", "n":
+		return 0, "No priority", true
+	}
+	return 0, "", false
+}
+
 // keystrokes are the guard against an accidental write.
 func (m Model) updateStatus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if proj, ok := m.selectedProject(); ok {
+		return m.updateProjectStatus(msg, proj)
+	}
 	is, ok := m.selected()
 	if !ok {
 		m.statusMenu = false
@@ -1621,32 +1803,47 @@ func (m *Model) rebuild(issues []linear.Issue) {
 	m.reconcileCollapse()
 	m.regroup()
 
-	// Demo statuses resolve synchronously so --preview shows badges; real
-	// backends populate m.sessions asynchronously via statusesMsg.
-	if m.demoStatuses != nil {
-		keys := m.issueKeys()
-		out := make(map[string]session.Status, len(keys))
-		for _, k := range keys {
-			out[k] = m.demoStatuses[k]
-		}
-		m.sessions = out
-	}
-
+	m.applyDemoStatuses()
 	m.restoreCursor(prevID, "", prevIdx)
 	m.ensureVisible()
 }
 
-// restoreCursor puts the cursor back on the same ticket (prevID) or session
-// (prevRef) across a rebuild. When that row is gone — e.g. the selected ticket
-// was moved to Done and dropped off the list — it stays near the old position
-// (prevIdx) rather than snapping to the top, so you keep working down the list.
-func (m *Model) restoreCursor(prevID, prevRef string, prevIdx int) {
+// applyDemoStatuses resolves --demo's canned session statuses synchronously, so
+// --preview shows badges without an event loop. Real backends populate
+// m.sessions asynchronously via statusesMsg, and this is a no-op for them. It
+// runs after every regroup, because the key set it fills grows when the project
+// rows arrive.
+func (m *Model) applyDemoStatuses() {
+	if m.demoStatuses == nil {
+		return
+	}
+	keys := m.sessionKeys()
+	out := make(map[string]session.Status, len(keys))
+	for _, k := range keys {
+		out[k] = m.demoStatuses[k]
+	}
+	m.sessions = out
+}
+
+// restoreCursor puts the cursor back on the same ticket (prevID), or on the
+// same session or project row (prevName), across a rebuild. When that row is
+// gone — e.g. the selected ticket was moved to Done and dropped off the list —
+// it stays near the old position (prevIdx) rather than snapping to the top, so
+// you keep working down the list.
+func (m *Model) restoreCursor(prevID, prevName string, prevIdx int) {
 	for i, r := range m.rows {
 		if prevID != "" && r.kind == rowIssue && r.issue.Identifier == prevID {
 			m.cursor = i
 			return
 		}
-		if prevRef != "" && r.kind == rowSession && r.ref.Name == prevRef {
+		if prevName == "" {
+			continue
+		}
+		if r.kind == rowSession && r.ref.Name == prevName {
+			m.cursor = i
+			return
+		}
+		if r.kind == rowProject && r.project.Key() == prevName {
 			m.cursor = i
 			return
 		}
@@ -1681,7 +1878,10 @@ const topFocus = 10
 // tickets close/move the folding follows. A section holding at least one top
 // ticket stays expanded; empty sections aren't shown at all.
 func (m *Model) reconcileCollapse() {
-	groups := linear.GroupByPriorityThenStatus(linear.FilterVisible(m.allIssues))
+	// Only the tickets the priority sections actually render count toward focus.
+	// Project tickets live under their project row, so letting them consume the
+	// top-10 slots would fold priority groups over work that isn't shown there.
+	groups := linear.GroupByPriorityThenStatus(linear.IssuesWithoutProject(linear.FilterVisible(m.allIssues)))
 	inFocus := map[string]bool{}
 	n := 0
 	for _, g := range groups {
@@ -1711,12 +1911,35 @@ func (m *Model) reconcileCollapse() {
 // A collapsed priority renders as a single header row (with a ticket count) and
 // its statuses/issues are omitted.
 func (m *Model) regroup() {
+	searching := m.searching()
+	var rows []row
+
+	// The Projects section leads the deck: a project is the unit you open a
+	// session against, and its tickets are deliberately absent from the priority
+	// groups below (they hang off their project row instead, see
+	// linear.IssuesWithoutProject).
+	m.projects = m.visibleProjects()
+	if len(m.projects) > 0 {
+		rows = append(rows, row{kind: rowProjectHeader, text: "Projects", count: len(m.projects)})
+		// While searching, always expand so no match hides inside a fold.
+		if !m.projFolded || searching {
+			for _, p := range m.projects {
+				rows = append(rows, row{kind: rowProject, project: p})
+				if !m.projExpanded[p.Key()] && !searching {
+					continue
+				}
+				for _, is := range linear.SortProjectIssues(p.Issues) {
+					rows = append(rows, row{kind: rowIssue, issue: is, indent: 2})
+				}
+			}
+		}
+		rows = append(rows, row{kind: rowSpacer})
+	}
+
 	// Defensive BR-2a: never render Done/Cancelled/Duplicate tickets, whatever
 	// the source (the Linear client already filters, but --demo and future
 	// feeds might not).
-	groups := linear.GroupByPriorityThenStatus(m.visibleIssues())
-	searching := m.searching()
-	var rows []row
+	groups := linear.GroupByPriorityThenStatus(linear.IssuesWithoutProject(m.visibleIssues()))
 	for gi, g := range groups {
 		if gi > 0 {
 			rows = append(rows, row{kind: rowSpacer})
@@ -1744,6 +1967,10 @@ func (m *Model) regroup() {
 	visible := map[string]bool{}
 	for _, is := range linear.FilterVisible(m.allIssues) {
 		visible[is.Identifier] = true
+	}
+	// A project's session is represented by its own row, so it isn't "other".
+	for _, p := range m.projects {
+		visible[p.Key()] = true
 	}
 	var others []session.SessionRef
 	for _, s := range m.otherSessions {
@@ -1774,8 +2001,17 @@ func (m Model) cursorable(i int) bool {
 	// A collapsed header is a cursor target so it can be expanded — but search
 	// force-expands every group without clearing m.collapsed, so during a search
 	// those headers must not be targets or the cursor lands on one instead of the
-	// first match (leaving Enter a no-op).
-	return r.kind == rowIssue || r.kind == rowSession || (r.kind == rowPrio && m.collapsed[r.text] && !m.searching())
+	// first match (leaving Enter a no-op). A project row is always a target: it
+	// opens a session, quite apart from folding its tickets.
+	switch r.kind {
+	case rowIssue, rowSession, rowProject:
+		return true
+	case rowPrio:
+		return m.collapsed[r.text] && !m.searching()
+	case rowProjectHeader:
+		return m.projFolded && !m.searching()
+	}
+	return false
 }
 
 func (m Model) firstCursorable() int {
@@ -1863,6 +2099,12 @@ func (m Model) currentPrioLabel() string {
 // or "expand" forces a direction; "" toggles. After regrouping, the cursor lands
 // on the group's header (collapsed) or its first ticket (expanded).
 func (m *Model) toggleCollapse(mode string) {
+	// Inside the Projects section, folding means the project (or the whole
+	// section), not a priority group — there is no priority header above these
+	// rows to act on.
+	if m.foldProjects(mode) {
+		return
+	}
 	label := m.currentPrioLabel()
 	if label == "" {
 		return
@@ -2099,6 +2341,9 @@ func (m Model) View() string {
 	if m.detail != nil {
 		return m.renderDetail()
 	}
+	if m.detailProj != nil {
+		return m.renderProjectDetail()
+	}
 	if m.assignMenu {
 		return m.renderAssign()
 	}
@@ -2146,7 +2391,11 @@ func (m Model) View() string {
 		case rowStatus:
 			fmt.Fprintf(&b, "%s\n", statusStyle.Render("▏ "+strings.ToUpper(r.text)))
 		case rowIssue:
-			fmt.Fprintf(&b, "%s\n", m.renderIssue(r.issue, i == m.cursor))
+			fmt.Fprintf(&b, "%s\n", m.renderIssue(r.issue, i == m.cursor, r.indent))
+		case rowProjectHeader:
+			fmt.Fprintf(&b, "%s\n", m.renderProjectHeader(r, i == m.cursor))
+		case rowProject:
+			fmt.Fprintf(&b, "%s\n", m.renderProject(r.project, i == m.cursor))
 		case rowSessionHeader:
 			fmt.Fprintf(&b, "%s\n", sectionStyle.Render(fmt.Sprintf("Other sessions (%d)", r.count)))
 		case rowSession:
@@ -2197,6 +2446,15 @@ func (m Model) otherAccounts() []account.Account {
 // another subscription. Refuses early when there is nothing to move or nowhere
 // to move it, so the overlay never appears without a usable action.
 func (m Model) openHandoff(is linear.Issue) (tea.Model, tea.Cmd) {
+	return m.openHandoffFor(is.Identifier, is.Identifier)
+}
+
+// openHandoffFor is openHandoff addressed by session key, so a project row
+// hands off exactly as a ticket does — the transcript move is keyed on the
+// session id, which knows nothing about which kind of work it holds. label is
+// what to call it on screen, since a project's key is a slug nobody would
+// recognise.
+func (m Model) openHandoffFor(key, label string) (tea.Model, tea.Cmd) {
 	if m.demoStatuses != nil {
 		m.notice = "hand-off needs a live backend"
 		return m, nil
@@ -2206,11 +2464,11 @@ func (m Model) openHandoff(is linear.Issue) (tea.Model, tea.Cmd) {
 		m.notice = "only one Claude subscription found — see `deck --account` in SETUP.md"
 		return m, nil
 	}
-	if st := m.sessions[is.Identifier]; st == session.None {
-		m.notice = is.Identifier + " has no session to hand off"
+	if st := m.sessions[key]; st == session.None {
+		m.notice = label + " has no session to hand off"
 		return m, nil
 	}
-	m.handoffKey = is.Identifier
+	m.handoffKey = key
 	m.handoffCands = cands
 	m.handoffCursor = 0
 	m.notice = ""
@@ -2246,7 +2504,7 @@ func (m Model) confirmHandoff(i int) (tea.Model, tea.Cmd) {
 	}
 	key, to := m.handoffKey, m.handoffCands[i]
 	m.handoffKey, m.handoffCands, m.handoffCursor = "", nil, 0
-	m.notice = fmt.Sprintf("handing %s to ⦿%s…", key, to.Name)
+	m.notice = fmt.Sprintf("handing %s to ⦿%s…", m.label(key), to.Name)
 	return m, m.handOff(key, to)
 }
 
@@ -2545,7 +2803,10 @@ func (m Model) rowSession(key string) (st session.Status, elapsed string, remote
 	return o.Status, elapsedLabel(o.LastActive), o.Name != m.acct.Name
 }
 
-func (m Model) renderIssue(is linear.Issue, selected bool) string {
+// renderIssue draws one ticket row. indent is extra leading columns, used to
+// nest a ticket under its project row; 0 is a top-level row in a priority group.
+func (m Model) renderIssue(is linear.Issue, selected bool, indent int) string {
+	pad := strings.Repeat(" ", indent)
 	st, elapsed, remote := m.rowSession(is.Identifier)
 	cell, color := sessionCellText(st, elapsed)
 	own, ownColor := m.ownerCell(m.owners[is.Identifier].Name, selected)
@@ -2562,7 +2823,7 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 	// Truncate the title to what's left after the fixed columns:
 	// indent(2) + owner + badge + space + id(9) + space + prmark(2) + space, minus
 	// the trailing validation tag and blocked-by note (each with a leading space).
-	avail := m.rowWidth() - (2 + m.ownerCol + sessionCol + 1 + 9 + 1 + prMarkCol + 1)
+	avail := m.rowWidth() - (2 + indent + m.ownerCol + sessionCol + 1 + 9 + 1 + prMarkCol + 1)
 	if tagText != "" {
 		avail -= cols(tagText) + 1
 	}
@@ -2576,7 +2837,7 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 
 	if selected {
 		// Plain text (no inner colors) so the selection bg spans the whole row.
-		content := fmt.Sprintf("▶ %s%s %s %s %s", own, cell, id, prG, title)
+		content := fmt.Sprintf("%s▶ %s%s %s %s %s", pad, own, cell, id, prG, title)
 		if tagText != "" {
 			content += " " + tagText
 		}
@@ -2609,7 +2870,7 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 		gap := doneRowStyle.Strikethrough(false)
 		idText := strings.TrimRight(id, " ")
 		idPad := id[len(idText):]
-		row := "  " + ownR + strike.Render(cell) + gap.Render(" ") +
+		row := "  " + pad + ownR + strike.Render(cell) + gap.Render(" ") +
 			strike.Render(idText) + gap.Render(idPad+" ") +
 			strike.Render(prG) + gap.Render(" ") +
 			strike.Render(title)
@@ -2625,11 +2886,11 @@ func (m Model) renderIssue(is linear.Issue, selected bool) string {
 		if remote {
 			badge = lipgloss.NewStyle().Foreground(ownColor).Render(cell)
 		}
-		return "  " + ownR + badge + workingRowStyle.Render(fmt.Sprintf(" %s %s %s", id, prG, title)) + tag + noteR
+		return "  " + pad + ownR + badge + workingRowStyle.Render(fmt.Sprintf(" %s %s %s", id, prG, title)) + tag + noteR
 	}
 	badge := lipgloss.NewStyle().Foreground(color).Render(cell)
 	pr := lipgloss.NewStyle().Foreground(prC).Render(prG)
-	return fmt.Sprintf("  %s%s %s %s %s", ownR, badge, idStyle.Render(id), pr, title) + tag + noteR
+	return fmt.Sprintf("  %s%s%s %s %s %s", pad, ownR, badge, idStyle.Render(id), pr, title) + tag + noteR
 }
 
 // blockedNote returns a compact "⛔ blocker keys" note for a Blocked ticket that
@@ -2861,7 +3122,7 @@ func (m Model) renderAssign() string {
 // than continuing a live process.
 func (m Model) renderHandoff() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s %s\n", titleStyle.Render("Hand off session"), idStyle.Render(m.handoffKey))
+	fmt.Fprintf(&b, "%s %s\n", titleStyle.Render("Hand off session"), idStyle.Render(m.label(m.handoffKey)))
 	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render("↑/↓ select · ⏎ hand off · 1-9 pick · esc cancel"))
 
 	fmt.Fprintf(&b, "  from  %s\n\n", m.acctStyle(m.acct.Name).Bold(true).Render("⦿ "+m.acct.Name))
@@ -3106,6 +3367,13 @@ func (m Model) detailBody(is linear.Issue, width int) string {
 
 func (m Model) footer() string {
 	if m.statusMenu {
+		if p, ok := m.selectedProject(); ok {
+			name := truncCols(p.Name, 30)
+			if m.statusPend == "" {
+				return noticeStyle.Render(fmt.Sprintf("  move %s →  p Planned · i In Progress · b Blocked · d Completed · c Cancel · esc", name))
+			}
+			return noticeStyle.Render(fmt.Sprintf("  move %s → %s?   y confirm · esc cancel", name, m.statusPend))
+		}
 		is, _ := m.selected()
 		if m.statusPend == "" {
 			return noticeStyle.Render(fmt.Sprintf("  move %s →  d Done · v Validate · m Monitoring · b Blocked · c Cancel · esc", is.Identifier))
@@ -3113,8 +3381,13 @@ func (m Model) footer() string {
 		return noticeStyle.Render(fmt.Sprintf("  move %s → %s?   y confirm · esc cancel", is.Identifier, m.statusPend))
 	}
 	if m.priorityMenu {
-		is, _ := m.selected()
-		return noticeStyle.Render(fmt.Sprintf("  priority %s →  u Urgent · h High · m Medium · l Low · 0 None · esc", is.Identifier))
+		subject := ""
+		if p, ok := m.selectedProject(); ok {
+			subject = truncCols(p.Name, 30)
+		} else if is, ok := m.selected(); ok {
+			subject = is.Identifier
+		}
+		return noticeStyle.Render(fmt.Sprintf("  priority %s →  u Urgent · h High · m Medium · l Low · 0 None · esc", subject))
 	}
 	if m.searchMode {
 		return noticeStyle.Render(fmt.Sprintf("  /%s▏   type to filter · ⏎ apply · esc clear", m.searchQuery))
@@ -3138,11 +3411,23 @@ func (m Model) footer() string {
 	if m.assigner != nil {
 		statusHint += "a assign · "
 	}
-	// Advertise the count when the cursor ticket has several PRs, so it's clear
-	// `p` opens a picker rather than one guessed link.
+	// Advertise the count when the cursor row has several PRs, so it's clear `p`
+	// opens a picker rather than one guessed link. A project's PRs are the union
+	// across its tickets.
 	prHint := "p PR"
 	if is, ok := m.selected(); ok && len(is.PRs) > 1 {
 		prHint = fmt.Sprintf("p PRs (%d)", len(is.PRs))
+	}
+	if p, ok := m.selectedProject(); ok {
+		if n := len(linear.ProjectPRs(p)); n > 1 {
+			prHint = fmt.Sprintf("p PRs (%d)", n)
+		}
+		// Name the project-side field each shared write lands on, so `s`/`a` on a
+		// project row don't read as the ticket actions they sit beside.
+		statusHint = ""
+		if m.projWriter != nil {
+			statusHint = "s status · P prio · a lead · "
+		}
 	}
 	filterHint := ""
 	if m.searchQuery != "" {
@@ -3158,7 +3443,12 @@ func (m Model) footer() string {
 	default:
 		handoffHint = "H hand off · "
 	}
-	help := dimStyle.Render(fmt.Sprintf("%s↑↓ move · ⏎ open · d desc · o web · %s · t %s · %s%s/ search · n new · ␣/←→ fold · r refresh · %s · synced %s", filterHint, prHint, triageCmd, statusHint, handoffHint, quitHint, sync))
+	// `t` only applies to a ticket, so a project row doesn't offer it.
+	triageHint := "t " + triageCmd + " · "
+	if _, ok := m.selectedProject(); ok {
+		triageHint = ""
+	}
+	help := dimStyle.Render(fmt.Sprintf("%s↑↓ move · ⏎ open · d desc · o web · %s · %s%s%s/ search · n new · ␣/←→ fold · r refresh · %s · synced %s", filterHint, prHint, triageHint, statusHint, handoffHint, quitHint, sync))
 	var status string
 	switch {
 	case m.err != nil:

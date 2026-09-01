@@ -259,7 +259,7 @@ func writeCache(accounts map[string]Entry) {
 	if err != nil {
 		return
 	}
-	defer os.Remove(tmp.Name())
+	defer func() { _ = os.Remove(tmp.Name()) }()
 	if _, err := tmp.Write(b); err != nil {
 		_ = tmp.Close()
 		return
@@ -337,7 +337,7 @@ func Fetch(ctx context.Context, configDir string) (Usage, error) {
 	if err != nil {
 		return Usage{}, err
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode == http.StatusTooManyRequests {
 		return Usage{}, ErrRateLimited
 	}

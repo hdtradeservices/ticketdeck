@@ -572,7 +572,7 @@ func TestAssignPicker(t *testing.T) {
 	af.assignedTo = ""
 	next, _ = m.Update(runes("a"))
 	m = next.(Model)
-	next, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
 		t.Fatal("enter should unassign")
 	}
@@ -649,7 +649,7 @@ func TestTriageTicketInBackground(t *testing.T) {
 	m := New(fakeFetcher{fixture()}, "", true, rec)
 	next, _ := m.Update(refreshedMsg{issues: fixture()})
 	m = next.(Model) // cursor on ZEN-9
-	next, cmd := m.Update(runes("t"))
+	_, cmd := m.Update(runes("t"))
 	if cmd == nil {
 		t.Fatal("t should return a triage command")
 	}
@@ -669,7 +669,7 @@ func TestTriageTicketInBackground(t *testing.T) {
 	if _, ok := m.selectedSession(); !ok {
 		t.Fatal("cursor should be on the session row")
 	}
-	next, cmd = m.Update(runes("t"))
+	_, cmd = m.Update(runes("t"))
 	if cmd == nil {
 		t.Fatal("t on a session row should send /triage")
 	}

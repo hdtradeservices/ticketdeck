@@ -24,7 +24,7 @@ func TestLiveSendAndEnterSubmits(t *testing.T) {
 	if paneID == "" {
 		t.Fatalf("no pane id in: %s", out)
 	}
-	defer exec.Command(herdrBin, "pane", "close", paneID).Run()
+	defer func() { _ = exec.Command(herdrBin, "pane", "close", paneID).Run() }()
 
 	_ = exec.Command(herdrBin, "agent", "wait", name, "--status", "idle", "--timeout", "60000").Run()
 	waitForPrompt(name)

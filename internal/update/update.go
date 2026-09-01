@@ -104,7 +104,7 @@ func fetchLatest() string {
 	if err != nil {
 		return ""
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode != http.StatusOK {
 		return ""
 	}

@@ -1,8 +1,9 @@
 # TicketDeck
 
-A terminal dashboard for your assigned [Linear](https://linear.app) tickets that launches and
-re-attaches a [Claude Code](https://claude.com/claude-code) session per ticket — grouped by
-priority, with live session status, linked PRs, and one-key status/assignee changes.
+A terminal dashboard for your [Linear](https://linear.app) work that launches and re-attaches
+a [Claude Code](https://claude.com/claude-code) session per **project** and per **ticket** —
+your projects up top with their progress, the loose tickets grouped by priority below, with
+live session status, linked PRs, and one-key status/assignee changes.
 
 It runs on top of [herdr](https://github.com/ogulcancelik/herdr) (an agent-aware terminal
 multiplexer) so you can start work on a ticket, detach and leave it running, and jump to
@@ -75,13 +76,39 @@ ticketdeck --demo --dump        # plain-text grouped list
 | change priority (Urgent/High/Medium/Low/None) | `P` → key |
 | assign / reassign / unassign | `a` |
 | open an ad-hoc (non-ticket) session | `n` |
-| fold/unfold a priority section | `Space` · `←`/`→` |
+| fold/unfold a priority section, the **Projects** section, or one project's tickets | `Space` · `←`/`→` |
 | refresh · quit | `r` · `q` |
+
+On a **project** row the same keys act on the project: `⏎` opens its session, `d` its
+detail, `o` the project page, `p` the PRs across its tickets, `H` hands it to another
+account, and the three writes resolve to the project's own fields — `s` status, `P`
+priority, `a` **lead**. `t` is the exception: `/triage` triages one issue, so it stays
+ticket-only.
 
 Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
 
 ## How it works
 
+- **Projects come first.** The deck opens with a `PROJECTS` section listing the Linear
+  projects that are yours — the ones you **lead** — each with a progress bar, its
+  open-ticket count, the PRs across its tickets, and an `⚑ overdue` / `⚑ at risk` flag.
+  Every project row **opens a Claude session of its own** (`⏎`), with the same badges,
+  account dot, and hotkeys a ticket row has.
+
+  A ticket that belongs to a project is **removed from the priority sections below** and
+  hangs off its project instead, folded away by default (`Space` on the project unfolds
+  it). So the priority sections become just the loose tickets — the work that isn't
+  already tracked by a project.
+
+  Nothing gets lost in the move: if one of your tickets sits in a project you *don't*
+  lead, that project still gets a row (dimmed, progress `n/a`) so the ticket is still
+  reachable. Progress never rounds up — Linear reports 0.999 for a project with one
+  ticket left, and the deck shows `99%`.
+- A project session is bound to the project's **slug**, not its name, so renaming a
+  project in Linear doesn't orphan its conversation. Its identity prompt is seeded with
+  the project's summary, progress, target date, and the keys of your open tickets in it
+  — so the session starts knowing its own scope. As with tickets, no prompt is
+  auto-submitted: the first token spend is your first message.
 - Fetches **assigned + open** issues (hides `completed`/`canceled`/`duplicate` — Done,
   Cancelled, Duplicate — but keeps `Validate`, a completed-type QA gate that's still
   actionable). Groups **priority → status**, newest-updated first, and auto-folds priority
@@ -131,13 +158,14 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   looks different from one that's busy. Those badges are colored by **deck** rather than by
   status: the words already say the state, and what a glance needs from someone else's row is
   whose it is. Refreshed every 3s.
-- **One deck per ticket** — `⏎` (and `t`) on a ticket another deck is actively running stops
+- **One deck per ticket, and per project** — `⏎` (and `t`) on a ticket another deck is actively running stops
   and says so instead of opening it. A second session would fork the ticket: the session id
   comes from the ticket key alone, so both decks would append to their own copy of one
   transcript and diverge with no way to merge them — and two agents would work the ticket at
   once. `⏎`/`esc` leaves it alone, `p` opens its PR instead, and `o` overrides. A session
   *this* deck already runs is not a conflict (it re-attaches), nor is a stopped one elsewhere
-  (nothing to collide with — the row badges it `↻` in that deck's color).
+  (nothing to collide with — the row badges it `↻` in that deck's color). Project rows take
+  the same gate for the same reason: a project's session id comes from its slug alone.
 - **Claude usage** — the title bar shows your Claude 5-hour and 7-day rate-limit
   utilization (`◷ 5h 52% · 7d 42%`), color-coded, with a rough reset countdown. Same source
   as Claude Code's status line (the OAuth usage endpoint); it's a metadata read, so it does
@@ -153,13 +181,18 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
 
 ## Writes to Linear
 
-TicketDeck is read-only by default. The status-change (`s`) and assignee (`a`) hotkeys are the
-only writes, are confirm-gated, and need a **write-scoped** `LINEAR_API_KEY`. Moving a ticket
-to a terminal state (Done/Cancel) also closes its Claude session (the transcript persists).
+TicketDeck is read-only by default. The status (`s`), priority (`P`) and assignee (`a`)
+hotkeys are the only writes, are confirm-gated, and need a **write-scoped**
+`LINEAR_API_KEY`. Moving a ticket to a terminal state (Done/Cancel) also closes its Claude
+session (the transcript persists).
 
-Some defaults are tuned for the author's Linear workspace — the status targets
-(Done/Validate/Monitoring/Blocked), the `validation-*` labels, and the `/triage` command.
-They're easy to adjust in the source.
+On a project row those three keys write the project instead: its **status**
+(Planned / In Progress / Blocked / Completed / Cancel), its **priority**, and its **lead**.
+Completing or cancelling a project closes its session too.
+
+Some defaults are tuned for the author's Linear workspace — the ticket status targets
+(Done/Validate/Monitoring/Blocked), the project status targets, the `validation-*` labels,
+and the `/triage` command. They're easy to adjust in the source.
 
 ## Credits & license
 

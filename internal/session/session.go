@@ -172,9 +172,14 @@ type SessionRef struct {
 	Ref    string
 }
 
-// Ticket carries the fields seeded into the context file. No description is
-// fetched here (zero extra Linear calls); the URL lets Claude pull the full
-// ticket on the user's first turn.
+// Ticket carries the fields seeded into a launched session's identity. No
+// description is fetched here (zero extra Linear calls); the URL lets Claude
+// pull the full record on the user's first turn.
+//
+// It covers both units of work the deck opens a session for: a Linear issue and
+// a Linear project. Project is what tells them apart — everything downstream
+// (session id, herdr agent name, resume) is keyed on Key alone and doesn't care
+// which it is.
 type Ticket struct {
 	Key       string
 	Title     string
@@ -183,6 +188,13 @@ type Ticket struct {
 	Status    string
 	PrioLabel string
 	Team      string
+	// Project marks this unit as a Linear project rather than an issue, which
+	// changes only how the identity prompt reads.
+	Project bool
+	// Context is extra identity a project needs and an issue doesn't: its
+	// summary, and the keys of my open tickets in it, so the session starts
+	// knowing its own scope instead of having to go find it.
+	Context string
 }
 
 // LaunchSpec is a fully-resolved command for TicketDeck to run.
@@ -206,6 +218,9 @@ func Bin() string { return claudeBin }
 // auto-submitted prompt or a shared context dir (BR-3: session config, not a
 // turn). First token spend is still the user's first message.
 func SystemPrompt(t Ticket) string {
+	if t.Project {
+		return projectSystemPrompt(t)
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "You are working on Linear ticket %s: %s.", t.Key, t.Title)
 	if t.Status != "" {
@@ -224,6 +239,32 @@ func SystemPrompt(t Ticket) string {
 	return b.String()
 }
 
+// projectSystemPrompt is the identity for a project session. It names the
+// project by title, never by Key: the key is a synthetic "proj-<slug>" the user
+// never sees, so telling the model that is its subject would be actively
+// misleading.
+func projectSystemPrompt(t Ticket) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "You are working on the Linear project %q.", t.Title)
+	if t.Status != "" {
+		fmt.Fprintf(&b, " Status: %s.", t.Status)
+	}
+	if t.PrioLabel != "" {
+		fmt.Fprintf(&b, " Priority: %s.", t.PrioLabel)
+	}
+	if t.Team != "" {
+		fmt.Fprintf(&b, " Team: %s.", t.Team)
+	}
+	if t.Context != "" {
+		fmt.Fprintf(&b, " %s", t.Context)
+	}
+	if t.URL != "" {
+		fmt.Fprintf(&b, " Project page (description, milestones, issues): %s — fetch it via the Linear MCP when you need detail.", t.URL)
+	}
+	fmt.Fprintf(&b, " When the user says \"this project\" they mean %q. A ticket named without a project means one of this project's tickets.", t.Title)
+	return b.String()
+}
+
 // LaunchArgs are the claude args that seed a session's ticket identity.
 func LaunchArgs(t Ticket) []string {
 	return []string{"--append-system-prompt", SystemPrompt(t)}
@@ -237,6 +278,11 @@ func TabLabel(t Ticket) string {
 	title := strings.TrimSpace(t.Title)
 	if title == "" {
 		return t.Key
+	}
+	// A project's key is a synthetic "proj-<slug>" that means nothing to a
+	// reader, so its tab is titled by name alone.
+	if t.Project {
+		return truncRunes(title, 32)
 	}
 	return truncRunes(t.Key+"  "+title, 32)
 }

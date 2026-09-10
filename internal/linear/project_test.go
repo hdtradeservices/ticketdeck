@@ -115,24 +115,27 @@ func TestAugmentProjectsGroupsDiscoveredTickets(t *testing.T) {
 	}
 }
 
-func TestIssuesWithoutProject(t *testing.T) {
+func TestIssuesOutsideProjects(t *testing.T) {
 	issues := []Issue{
 		{Identifier: "ZEN-1", ProjectID: "p1"},
 		{Identifier: "ZEN-2"},
 		{Identifier: "ZEN-3", ProjectID: "p2"},
 		{Identifier: "ZEN-4"},
 	}
-	got := IssuesWithoutProject(issues)
+	shown := []Project{{ID: "p1"}}
+	got := IssuesOutsideProjects(issues, shown)
 	var keys []string
 	for _, is := range got {
 		keys = append(keys, is.Identifier)
 	}
-	if !slices.Equal(keys, []string{"ZEN-2", "ZEN-4"}) {
-		t.Errorf("want the project-less tickets, got %v", keys)
+	// ZEN-3's project dropped off the deck, so the priority sections take its
+	// ticket back rather than losing it with the row.
+	if !slices.Equal(keys, []string{"ZEN-2", "ZEN-3", "ZEN-4"}) {
+		t.Errorf("want the tickets no shown project owns, got %v", keys)
 	}
 }
 
-func TestSortProjectsLiveWorkFirst(t *testing.T) {
+func TestSortProjectsByPriorityThenLiveWork(t *testing.T) {
 	got := SortProjects([]Project{
 		{Name: "backlog-low", StatusType: "backlog", Priority: 4},
 		{Name: "started-med", StatusType: "started", Priority: 3},
@@ -144,9 +147,26 @@ func TestSortProjectsLiveWorkFirst(t *testing.T) {
 	for _, p := range got {
 		names = append(names, p.Name)
 	}
-	want := []string{"started-urgent", "started-med", "planned-urgent", "backlog-urgent", "backlog-low"}
+	want := []string{"started-urgent", "planned-urgent", "backlog-urgent", "started-med", "backlog-low"}
 	if !slices.Equal(names, want) {
 		t.Errorf("order = %v, want %v", names, want)
+	}
+}
+
+func TestSortProjectsSinksFinishedWork(t *testing.T) {
+	got := SortProjects([]Project{
+		{Name: "done-urgent", StatusType: "completed", Priority: 1},
+		{Name: "backlog-none", StatusType: "backlog"},
+		{Name: "started-low", StatusType: "started", Priority: 4},
+	})
+	var names []string
+	for _, p := range got {
+		names = append(names, p.Name)
+	}
+	// Urgent, but finished: it is struck through and on its way off the deck, so
+	// it must not sit above work that still has to be done.
+	if !slices.Equal(names, []string{"started-low", "backlog-none", "done-urgent"}) {
+		t.Errorf("order = %v, want finished last", names)
 	}
 }
 
@@ -173,12 +193,16 @@ func TestProjectHiddenKeepsWorkVisible(t *testing.T) {
 	if ProjectHidden(Project{StatusType: "completed", CompletedAt: time.Now().Add(-time.Hour)}) {
 		t.Error("a just-finished project should linger like a done ticket")
 	}
-	// A finished project still holding open tickets of mine must stay: hiding it
-	// would hide those tickets, which no longer appear in the priority sections.
+	// A long-finished project drops off even holding open tickets of mine —
+	// IssuesOutsideProjects hands those tickets back to the priority sections.
 	stillWorking := done
 	stillWorking.Issues = []Issue{{Identifier: "ZEN-1", StateType: "started"}}
-	if ProjectHidden(stillWorking) {
-		t.Error("a project holding open tickets must stay visible whatever its status")
+	if !ProjectHidden(stillWorking) {
+		t.Error("a finished project should drop off once its window is up")
+	}
+	canceled := Project{StatusType: "canceled", Issues: []Issue{{Identifier: "ZEN-1", StateType: "started"}}}
+	if !ProjectHidden(canceled) {
+		t.Error("a canceled project should drop off like a canceled ticket")
 	}
 	if ProjectHidden(Project{StatusType: "started"}) {
 		t.Error("a live project should never be hidden")

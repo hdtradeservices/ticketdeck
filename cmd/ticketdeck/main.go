@@ -261,13 +261,14 @@ func runDump(f tui.Fetcher) {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "ticketdeck: projects:", err)
 		}
-		for _, p := range linear.FilterVisibleProjects(linear.AugmentProjects(mine, visible)) {
+		projects := linear.FilterVisibleProjects(linear.AugmentProjects(mine, visible))
+		for _, p := range projects {
 			fmt.Printf("\n▛ %s  [%s · %d%%]\n", p.Name, p.StatusName, p.ProgressPct())
 			for _, is := range linear.SortProjectIssues(p.Issues) {
 				fmt.Printf("    %-10s %-12s %s\n", is.Identifier, is.StateName, is.Title)
 			}
 		}
-		visible = linear.IssuesWithoutProject(visible)
+		visible = linear.IssuesOutsideProjects(visible, projects)
 	}
 
 	for _, g := range linear.GroupByPriorityThenStatus(visible) {

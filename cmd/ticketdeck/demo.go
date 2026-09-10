@@ -63,6 +63,19 @@ func (demoFetcher) FetchMyProjects(context.Context) ([]linear.Project, error) {
 			LeadName:   "You", TeamKeys: []string{"DEMO"}, Mine: true,
 			UpdatedAt: "2026-07-15T12:00:00Z",
 		},
+		{
+			// Finished within the last few hours: it lingers struck through, then
+			// drops off once DoneVisibleFor is up.
+			ID: "demo-p4", Name: "Tax engine cutover", SlugID: "demo0004",
+			URL:      "https://linear.app/acme/project/tax-engine-cutover-demo0004",
+			Summary:  "Move tax calculation onto the shared engine and retire the legacy tables.",
+			Priority: 1, PrioLabel: "Urgent",
+			Progress: 1, Scope: 21,
+			StatusName: "Completed", StatusType: "completed",
+			CompletedAt: time.Now().Add(-3 * time.Hour),
+			LeadName:    "You", TeamKeys: []string{"DEMO"}, Mine: true,
+			UpdatedAt: "2026-07-16T09:00:00Z",
+		},
 	}, nil
 }
 

@@ -1881,7 +1881,7 @@ func (m *Model) reconcileCollapse() {
 	// Only the tickets the priority sections actually render count toward focus.
 	// Project tickets live under their project row, so letting them consume the
 	// top-10 slots would fold priority groups over work that isn't shown there.
-	groups := linear.GroupByPriorityThenStatus(linear.IssuesWithoutProject(linear.FilterVisible(m.allIssues)))
+	groups := linear.GroupByPriorityThenStatus(linear.IssuesOutsideProjects(linear.FilterVisible(m.allIssues), m.deckProjects()))
 	inFocus := map[string]bool{}
 	n := 0
 	for _, g := range groups {
@@ -1917,7 +1917,8 @@ func (m *Model) regroup() {
 	// The Projects section leads the deck: a project is the unit you open a
 	// session against, and its tickets are deliberately absent from the priority
 	// groups below (they hang off their project row instead, see
-	// linear.IssuesWithoutProject).
+	// linear.IssuesOutsideProjects). Set m.projects first — it is what tells the
+	// groups below which tickets are already spoken for.
 	m.projects = m.visibleProjects()
 	if len(m.projects) > 0 {
 		rows = append(rows, row{kind: rowProjectHeader, text: "Projects", count: len(m.projects)})
@@ -1939,7 +1940,7 @@ func (m *Model) regroup() {
 	// Defensive BR-2a: never render Done/Cancelled/Duplicate tickets, whatever
 	// the source (the Linear client already filters, but --demo and future
 	// feeds might not).
-	groups := linear.GroupByPriorityThenStatus(linear.IssuesWithoutProject(m.visibleIssues()))
+	groups := linear.GroupByPriorityThenStatus(linear.IssuesOutsideProjects(m.visibleIssues(), m.projects))
 	for gi, g := range groups {
 		if gi > 0 {
 			rows = append(rows, row{kind: rowSpacer})

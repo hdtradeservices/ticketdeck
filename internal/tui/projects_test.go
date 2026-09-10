@@ -6,9 +6,12 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
+	"github.com/muesli/termenv"
 
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
@@ -459,3 +462,65 @@ func TestNoProjectsRendersUnchanged(t *testing.T) {
 		t.Error("no project rows, no section header")
 	}
 }
+
+// A finished project drops off the deck when its linger window is up — and its
+// still-open tickets must land back in the priority sections rather than
+// disappearing with the row.
+func TestFinishedProjectDropsOffAndReturnsItsTickets(t *testing.T) {
+	issues := []linear.Issue{
+		{Identifier: "ZEN-1", Title: "still open", Priority: 1, PrioLabel: "Urgent", StateName: "Triage", StateType: "started",
+			ProjectID: "p1", ProjectName: "Mine", ProjectSlugID: "s1"},
+	}
+	done := fixtureProjects()
+	done[0].StatusName, done[0].StatusType = "Completed", "completed"
+	done[0].CompletedAt = time.Now().Add(-2 * linear.DoneVisibleFor)
+
+	f := projFetcher{fakeFetcher{issues}}
+	m := New(f, "", true, fakeBackend{})
+	next, _ := m.Update(refreshedMsg{issues: issues})
+	next, _ = next.(Model).Update(projectsMsg{projects: done})
+	m = next.(Model)
+	m.width, m.height = 120, 40
+	for k := range m.collapsed {
+		m.collapsed[k] = false
+	}
+	m.regroup()
+
+	for _, r := range m.rows {
+		if r.kind == rowProject {
+			t.Fatalf("a project finished %v ago should be off the deck", linear.DoneVisibleFor*2)
+		}
+	}
+	if got := issueRows(m); !slices.Equal(got, []string{"ZEN-1"}) {
+		t.Errorf("the ticket should be back in the priority sections, got %v", got)
+	}
+}
+
+// Inside the window it stays, struck through like a done ticket.
+func TestRecentlyFinishedProjectRendersStruckThrough(t *testing.T) {
+	// Under `go test` there is no TTY, so lipgloss renders every style as plain
+	// text and the assertion below would pass on any row. Force a profile that
+	// emits the attribute.
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI)
+	defer lipgloss.SetColorProfile(prev)
+
+	done := fixtureProjects()[0]
+	done.StatusName, done.StatusType = "Completed", "completed"
+	done.CompletedAt = time.Now().Add(-time.Hour)
+
+	m := loadedProjects(t)
+	if row := m.renderProject(done, false); !struckThrough(row) {
+		t.Errorf("a just-finished project row should be struck through: %q", row)
+	}
+	if struckThrough(m.renderProject(fixtureProjects()[0], false)) {
+		t.Error("a live project row must not be struck through")
+	}
+}
+
+// strikeRE matches SGR 9 (strikethrough) wherever it sits in an escape
+// sequence: lipgloss folds it in with the faint and color attributes, so the
+// bare "\x1b[9m" a row never actually carries is the wrong thing to look for.
+var strikeRE = regexp.MustCompile("\x1b\\[(?:[0-9]+;)*9m")
+
+func struckThrough(s string) bool { return strikeRE.MatchString(s) }

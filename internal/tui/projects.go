@@ -27,14 +27,24 @@ import (
 
 // ── derivation ───────────────────────────────────────────────────────────────
 
-// visibleProjects is the render source for the Projects section: my projects
+// deckProjects is the Projects section before the search filter: my projects
 // plus any project holding tickets of mine, each carrying its own tickets, with
-// finished ones dropped and the search filter applied.
-func (m Model) visibleProjects() []linear.Project {
+// the finished ones that have aged out dropped.
+//
+// It is also the answer to "which tickets does the Projects section own", which
+// is why the unfiltered list exists separately: a ticket whose project is not in
+// here belongs back in the priority groups.
+func (m Model) deckProjects() []linear.Project {
 	if len(m.myProjects) == 0 && !m.anyIssueHasProject() {
 		return nil
 	}
-	ps := linear.FilterVisibleProjects(linear.AugmentProjects(m.myProjects, linear.FilterVisible(m.allIssues)))
+	return linear.FilterVisibleProjects(linear.AugmentProjects(m.myProjects, linear.FilterVisible(m.allIssues)))
+}
+
+// visibleProjects is the render source for the Projects section: deckProjects
+// with the search filter applied.
+func (m Model) visibleProjects() []linear.Project {
+	ps := m.deckProjects()
 	if !m.searching() {
 		return ps
 	}
@@ -543,7 +553,13 @@ func progressCellFor(p linear.Project) string {
 // its validation label. An overdue target date outranks a health signal: the
 // date is a fact, the health is someone's last self-report.
 func projectFlag(p linear.Project) (string, lipgloss.Color) {
-	if overdue(p.TargetDate) && !p.IsDone() {
+	// A finished project is counting down to dropping off the deck. Neither a
+	// missed date nor a stale health self-report is something to act on now, and
+	// the row is struck through to say the work is over.
+	if p.Finished() {
+		return "", lipgloss.Color("")
+	}
+	if overdue(p.TargetDate) {
 		return "⚑ overdue", lipgloss.Color("203")
 	}
 	switch p.Health {
@@ -582,6 +598,7 @@ func (m Model) renderProject(p linear.Project, selected bool) string {
 	prG, prC := prMark(prs)
 	prog := progressCellFor(p)
 	flagText, flagColor := projectFlag(p)
+	prio := prioMark(p.Priority)
 
 	count := ""
 	if n := p.OpenIssueCount(); n > 0 {
@@ -596,8 +613,9 @@ func (m Model) renderProject(p linear.Project, selected bool) string {
 	}
 
 	// Same column budget as a ticket row, with the progress cell standing in for
-	// the identifier so the two line up.
-	avail := m.rowWidth() - (2 + m.ownerCol + sessionCol + 1 + 9 + 1 + prMarkCol + 1 + 2)
+	// the identifier so the two line up. The last 4 are the caret and the
+	// priority mark, each with its trailing space.
+	avail := m.rowWidth() - (2 + m.ownerCol + sessionCol + 1 + 9 + 1 + prMarkCol + 1 + 4)
 	if flagText != "" {
 		avail -= cols(flagText) + 1
 	}
@@ -610,14 +628,37 @@ func (m Model) renderProject(p linear.Project, selected bool) string {
 	name := truncCols(p.Name, avail)
 
 	if selected {
-		content := fmt.Sprintf("▶ %s%s %s %s %s %s", own, cell, prog, prG, caret, name)
+		content := fmt.Sprintf("▶ %s%s %s %s %s %s %s", own, cell, prog, prG, caret, prio, name)
 		if count != "" {
 			content += " " + count
 		}
 		if flagText != "" {
 			content += " " + flagText
 		}
-		return selStyle.Width(m.rowWidth()).Render(content)
+		style := selStyle
+		if p.Finished() {
+			style = style.Strikethrough(true)
+		}
+		return style.Width(m.rowWidth()).Render(content)
+	}
+
+	// A finished project lingers struck through for the rest of its window, the
+	// same way a done ticket does, then drops off. Strike the text tokens only —
+	// not the column gaps, and never the account dot, which is the one thing on
+	// the row that has to stay readable at a glance.
+	if p.Finished() {
+		strike := doneRowStyle
+		gap := doneRowStyle.Strikethrough(false)
+		out := "  " + lipgloss.NewStyle().Foreground(ownColor).Render(own) +
+			strike.Render(cell) + gap.Render(" ") +
+			strike.Render(prog) + gap.Render(" ") +
+			strike.Render(prG) + gap.Render(" ") +
+			gap.Render(caret+" "+prio+" ") +
+			strike.Render(name)
+		if count != "" {
+			out += gap.Render(" ") + strike.Render(count)
+		}
+		return out
 	}
 
 	nameStyle := lipgloss.NewStyle()
@@ -626,12 +667,13 @@ func (m Model) renderProject(p linear.Project, selected bool) string {
 		// project. Dimming says so without spending a column on it.
 		nameStyle = dimStyle
 	}
-	out := fmt.Sprintf("  %s%s %s %s %s %s",
+	out := fmt.Sprintf("  %s%s %s %s %s %s %s",
 		lipgloss.NewStyle().Foreground(ownColor).Render(own),
 		lipgloss.NewStyle().Foreground(color).Render(cell),
 		lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Render(prog),
 		lipgloss.NewStyle().Foreground(prC).Render(prG),
 		dimStyle.Render(caret),
+		lipgloss.NewStyle().Foreground(prioColor(p.PrioLabel)).Render(prio),
 		nameStyle.Render(name))
 	if count != "" {
 		out += " " + dimStyle.Render(count)
@@ -640,6 +682,18 @@ func (m Model) renderProject(p linear.Project, selected bool) string {
 		out += " " + lipgloss.NewStyle().Foreground(flagColor).Render(flagText)
 	}
 	return out
+}
+
+// prioMark is the one-column priority tick on a project row, colored by
+// prioColor. The Projects section is ordered by priority and has no priority
+// headers to say so — without this the order looks arbitrary. A project with no
+// priority set gets a blank, which keeps every row's columns aligned and says
+// "nothing here" rather than asserting a level.
+func prioMark(priority int) string {
+	if priority == 0 {
+		return " "
+	}
+	return "▌"
 }
 
 // renderProjectDetail draws the overlay for a project: its status, progress,

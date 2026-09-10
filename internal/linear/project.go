@@ -96,18 +96,23 @@ func (p Project) OpenIssueCount() int {
 // mirroring the ticket rule (BR-2a).
 var hiddenProjectStatusTypes = map[string]bool{"completed": true, "canceled": true}
 
+// Finished reports whether a project has reached a terminal status — completed
+// or canceled — and is therefore on its way off the deck.
+func (p Project) Finished() bool { return hiddenProjectStatusTypes[p.StatusType] }
+
 // ProjectHidden reports whether a project should be filtered from the view. A
-// completed project lingers for DoneVisibleFor like a done ticket; a project
-// still holding open tickets of mine always stays, since hiding it would hide
-// those tickets with it.
+// completed project lingers for DoneVisibleFor, struck through like a done
+// ticket, and then drops off for good.
+//
+// It drops off even while it still holds open tickets of mine. Those tickets go
+// back to the priority sections instead (see IssuesOutsideProjects, which routes
+// a ticket by whether its project is still on the deck), so nothing is lost and
+// a finished project doesn't sit at the top of the deck forever.
 func ProjectHidden(p Project) bool {
-	if p.OpenIssueCount() > 0 {
+	if !p.Finished() {
 		return false
 	}
-	if p.RecentlyDone(time.Now()) {
-		return false
-	}
-	return hiddenProjectStatusTypes[p.StatusType]
+	return !p.RecentlyDone(time.Now())
 }
 
 // FilterVisibleProjects drops completed/canceled projects (BR-2a).
@@ -137,18 +142,24 @@ func projectStatusRank(t string) int {
 	return 4 // completed / canceled
 }
 
-// SortProjects orders projects the way you work them: live before planned,
-// then by priority, then by the nearest target date, then by name. Returns a
-// sorted copy.
+// SortProjects orders projects by priority, the way the ticket sections below
+// them are ordered: Urgent first, No priority last. Within one priority, live
+// work leads planned and backlogged work, then the nearest target date, then
+// name. A finished project sorts below everything: it is struck through and
+// counting down to dropping off, so it never sits above work you still have to
+// do. Returns a sorted copy.
 func SortProjects(ps []Project) []Project {
 	out := make([]Project, len(ps))
 	copy(out, ps)
 	sort.SliceStable(out, func(i, j int) bool {
 		a, b := out[i], out[j]
-		if ra, rb := projectStatusRank(a.StatusType), projectStatusRank(b.StatusType); ra != rb {
-			return ra < rb
+		if fa, fb := a.Finished(), b.Finished(); fa != fb {
+			return fb
 		}
 		if ra, rb := prioRank(a.Priority), prioRank(b.Priority); ra != rb {
+			return ra < rb
+		}
+		if ra, rb := projectStatusRank(a.StatusType), projectStatusRank(b.StatusType); ra != rb {
 			return ra < rb
 		}
 		// Empty target dates sort last: a project with a deadline is the more
@@ -213,13 +224,21 @@ func AugmentProjects(projects []Project, issues []Issue) []Project {
 	return SortProjects(out)
 }
 
-// IssuesWithoutProject returns the issues that belong to no project — the ones
-// that still group into the priority sections. Everything else is reachable
-// under its project row instead.
-func IssuesWithoutProject(issues []Issue) []Issue {
+// IssuesOutsideProjects returns the issues the priority sections own: the ones
+// that belong to no project, plus the ones whose project is not on the deck.
+// Everything else is reachable under its project row instead.
+//
+// That second half is what stops a ticket vanishing with its project. A finished
+// project drops off after DoneVisibleFor, and its still-open tickets have to
+// land somewhere — the priority sections are where they came from.
+func IssuesOutsideProjects(issues []Issue, shown []Project) []Issue {
+	ids := make(map[string]bool, len(shown))
+	for _, p := range shown {
+		ids[p.ID] = true
+	}
 	out := issues[:0:0]
 	for _, is := range issues {
-		if is.ProjectID == "" {
+		if is.ProjectID == "" || !ids[is.ProjectID] {
 			out = append(out, is)
 		}
 	}

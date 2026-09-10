@@ -100,6 +100,16 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   it). So the priority sections become just the loose tickets — the work that isn't
   already tracked by a project.
 
+  Projects are **ordered by priority**, the way the ticket sections below them are —
+  Urgent first, no-priority last — with live work ahead of planned work within one
+  priority, then the nearest target date. A colored tick before the name is the row's
+  priority, since the section has no priority headers to say so.
+
+  A project moved to **Completed lingers struck-through for 12h**, like a done ticket,
+  then drops off the deck for good — including one that still holds open tickets of
+  yours. Those tickets aren't lost with it: they go back to the priority sections they
+  came from. Cancelling a project drops it immediately, same as a cancelled ticket.
+
   Nothing gets lost in the move: if one of your tickets sits in a project you *don't*
   lead, that project still gets a row (dimmed, progress `n/a`) so the ticket is still
   reachable. Progress never rounds up — Linear reports 0.999 for a project with one

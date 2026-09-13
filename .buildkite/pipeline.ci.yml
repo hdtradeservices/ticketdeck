@@ -1,0 +1,51 @@
+steps:
+  - group: ":go: checks"
+    key: checks
+    steps:
+      - label: ":gofmt: check-fmt"
+        key: check-fmt
+        command:
+          - zt-ci go-setup
+          - test -z "$(gofmt -l .)" || { echo "not gofmt-clean:"; gofmt -l .; exit 1; }
+        agents: { queue: go }
+        plugins: &go_pod
+          - kubernetes:
+              podSpecPatch:
+                containers:
+                  - name: container-0
+                    envFrom:
+                      # GITHUB_TOKEN for private module fetches. gitEnvFrom reaches the
+                      # checkout container only, so the command container needs its own.
+                      - secretRef: { name: buildkite-ci-secrets }
+                    resources:
+                      requests: { cpu: "2", memory: 4Gi }
+                      limits: { memory: 8Gi }
+
+      - label: ":golangci-lint: lint"
+        key: lint
+        command:
+          - zt-ci go-setup
+          - go vet ./...
+          - golangci-lint run --timeout 8m ./...
+        agents: { queue: go }
+        plugins: *go_pod
+
+      - label: ":hammer: build"
+        key: build
+        command:
+          - zt-ci go-setup
+          - go build ./cmd/ticketdeck
+        agents: { queue: go }
+        plugins: *go_pod
+
+      - label: ":test_tube: test"
+        key: test
+        command:
+          - zt-ci go-setup
+          - go test ./...
+        env:
+          # Go sizes -p and GOMAXPROCS from the node's CPU count, not this pod's cgroup, so
+          # it starts far more test packages at once than 2 CPU can serve.
+          GOMAXPROCS: "2"
+        agents: { queue: go }
+        plugins: *go_pod

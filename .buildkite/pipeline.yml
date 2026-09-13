@@ -1,0 +1,30 @@
+# Entry point. `zt-ci plan go` diffs against the base branch and uploads only the
+# sub-pipelines the diff can affect.
+#
+# Checks only: this repo has no terraform/ and no image, so there is nothing to deploy.
+# .github/workflows/release.yml stays — it fires on `v*` tag pushes to cut a GitHub
+# release, which is not something CI duplicates.
+env:
+  CI_CACHE_BUCKET: "zt-ci-cache"
+
+  # go.mod requires go >= 1.26.1 and the ci-go image ships 1.25.x with GOTOOLCHAIN=local,
+  # so every go command fails before doing any work. ticketdeck is the only repo in the
+  # fleet past 1.25, so it fetches its own toolchain rather than the image moving the
+  # whole fleet's Go version for one repo. go-setup caches GOMODCACHE to GCS, which is
+  # where the downloaded toolchain lands, so this costs a download on cache miss only.
+  GOTOOLCHAIN: "auto"
+
+steps:
+  - label: ":pipeline: plan"
+    key: plan
+    command: zt-ci plan go
+    agents:
+      queue: go
+    plugins:
+      - kubernetes:
+          podSpecPatch:
+            containers:
+              - name: container-0
+                envFrom:
+                  # GITHUB_TOKEN, so this step can fetch the base branch to diff against.
+                  - secretRef: { name: buildkite-ci-secrets }

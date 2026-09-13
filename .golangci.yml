@@ -1,0 +1,30 @@
+# Matches the set the other Go libraries use: govet, misspell, staticcheck.
+#
+# errcheck is deliberately not in the set. golangci-lint v1 shipped default exclusion
+# presets, EXC0001 among them, which waived the unchecked-error warning on Close; v2
+# dropped those presets. Naming the linters explicitly is what the rest of the fleet does.
+version: "2"
+run:
+  modules-download-mode: readonly
+linters:
+  default: none
+  enable:
+    - govet
+    - misspell
+    - staticcheck
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

@@ -45,6 +45,49 @@ const sampleAgentsJSON = `{"id":"cli:agent:list","result":{"agents":[
   {"agent_status":"idle","cwd":"/home/matthew/Repos/etp","name":"ZEN-3181","pane_id":"w1:p3"}
 ]},"type":"agent_list"}`
 
+// sampleAgents09JSON is the envelope herdr 0.9.0 returns. Two differences from
+// 0.7.4 above, both load-bearing: there is no `name` at all, and the label a
+// pane reported for itself arrives under `agent`.
+const sampleAgents09JSON = `{"id":"cli:agent:list","result":{"agents":[
+  {"agent_status":"working","cwd":"/home/matthew/Repos/walmart","agent":"ZEN-3175","pane_id":"w1:p1"},
+  {"agent_status":"unknown","cwd":"/home/matthew/Repos","agent":"deck","pane_id":"w1:p2"}
+]},"type":"agent_list"}`
+
+// Reading only `name` made every 0.9.0 agent anonymous: Sessions() skipped the
+// whole list, CloseByName matched nothing, and focusDeck found no deck.
+func TestParseAgentsReadsHerdr09AgentField(t *testing.T) {
+	agents, err := parseAgents([]byte(sampleAgents09JSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("want 2 agents, got %d", len(agents))
+	}
+	if agents[0].Name != "ZEN-3175" {
+		t.Errorf("0.9.0 agent name = %q, want ZEN-3175", agents[0].Name)
+	}
+	if agents[1].Name != "deck" {
+		t.Errorf("0.9.0 deck name = %q, want deck", agents[1].Name)
+	}
+	// Sessions() excludes the deck by name, which only works once the name resolves.
+	if got := Sessions(agents); len(got) != 1 || got[0].Name != "ZEN-3175" {
+		t.Errorf("Sessions() = %+v, want just ZEN-3175", got)
+	}
+}
+
+// 0.7.4 still sends `name`, and it must keep winning: an entry carrying both
+// must not be renamed by the fallback.
+func TestParseAgentsPrefersNameOverAgent(t *testing.T) {
+	agents, err := parseAgents([]byte(`{"result":{"agents":[
+	  {"name":"ZEN-1","agent":"claude","pane_id":"w1:p1"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agents[0].Name != "ZEN-1" {
+		t.Errorf("name = %q, want ZEN-1 (agent must not override it)", agents[0].Name)
+	}
+}
+
 func TestStatusMapping(t *testing.T) {
 	cases := map[string]session.Status{
 		"working": session.Working,

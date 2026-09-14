@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # deck — open the herdr workspace with TicketDeck pinned to tab #1.
 #
-# Ensures a herdr server is running, launches TicketDeck as the 'deck' agent
-# (reusing a live one so its tab number stays stable), then attaches. The deck
-# is kept at tab #1 so "Ctrl+b 1" always jumps back to the ticket list.
+# Ensures a herdr server is running, launches TicketDeck in a pane labelled
+# 'deck' (reusing a live one so its tab number stays stable), then attaches.
+# The deck is kept at tab #1 so "Ctrl+b 1" always jumps back to the ticket list.
 # Detaching/quitting herdr leaves the server + ticket sessions running.
 #
 # Usage:
@@ -117,31 +117,111 @@ if ! server_running; then
   for _ in $(seq 1 50); do server_running && break; sleep 0.1; done
 fi
 
+# ── finding and building the deck pane ───────────────────────────────────────
+# herdr 0.8.0 redefined `agent start`. It now means "attach a SUPPORTED agent kind
+# (claude, codex, gemini, …) to an existing pane": it dropped --cwd and no longer
+# takes an arbitrary argv, so it cannot launch the deck's respawn loop at all. It
+# fails with `unknown option: --cwd`, and that call used to end in `|| true`, so on
+# 0.8+ the deck silently never started and herdr came up showing a bare shell.
+#
+# `tab create`, `workspace create`, `pane rename`, `pane run` and `tab focus` all
+# exist unchanged in 0.7.x and 0.9.x, so the deck is built the same way on every
+# version rather than branching on one. There is no version to parse and nothing
+# to keep current the next time the agent API moves.
+DECK_CMD='while true; do ticketdeck || sleep 1; done'
+# `pane run` types into the pane's own $SHELL, where `agent start` used to exec a
+# command directly. A fish or nushell login shell cannot parse that while/do loop, and
+# `pane run` reports success either way, leaving a bare terminal. Handing the loop to
+# bash keeps the outer shell's share of the syntax down to
+# `exec bash -c '<single-quoted string>'`, which all three parse, and exec makes the
+# loop the pane's process as it was before.
+DECK_RUN="exec bash -c '${DECK_CMD}'"
+
+# The deck is found by its pane LABEL now. A deck started by an older copy of this
+# script is still an agent named "deck", so look for that first: upgrading
+# mid-session must not fail to see the live deck and start a second one.
 deck_pane() {
-  herdr agent list 2>/dev/null | python3 -c 'import sys, json
+  local id
+  id="$(herdr agent list 2>/dev/null | python3 -c 'import sys, json
 try: d = json.load(sys.stdin)
 except Exception: raise SystemExit
 for a in d.get("result", {}).get("agents", []):
     if a.get("name") == "deck":
-        print(a.get("pane_id", "")); break' 2>/dev/null
+        print(a.get("pane_id", "")); break' 2>/dev/null)"
+  [ -n "$id" ] && { printf '%s\n' "$id"; return; }
+  herdr pane list 2>/dev/null | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: raise SystemExit
+for p in d.get("result", {}).get("panes", []):
+    if p.get("label") == "deck":
+        print(p.get("pane_id", "")); break' 2>/dev/null
 }
 
-# 3. reuse a live 'deck' agent if present (keeps its tab number stable); only
-#    start a fresh one when absent (fresh server / after a restart), where it
-#    becomes tab #1 as the first agent started. Do NOT close+recreate — that is
-#    what drifted the deck off tab #1.
-if [ -z "$(deck_pane)" ]; then
-  # Respawn loop: the deck is the persistent hub pinned to tab #1. If ticketdeck
-  # ever exits (Ctrl+c, a crash, a transient Linear error), bring it right back
-  # so tab #1 is never orphaned. The `sleep` avoids a tight loop on hard failure.
-  herdr agent start deck --cwd "$LAUNCH_ROOT" -- \
-    bash -c 'while true; do ticketdeck || sleep 1; done' >/dev/null 2>&1 || true
+pane_tab() {
+  herdr pane list 2>/dev/null | PANE="$1" python3 -c 'import os, sys, json
+try: d = json.load(sys.stdin)
+except Exception: raise SystemExit
+for p in d.get("result", {}).get("panes", []):
+    if p.get("pane_id") == os.environ["PANE"]:
+        print(p.get("tab_id", "")); break' 2>/dev/null
+}
+
+# Prints the new pane id. Every failure is reported and fatal: a deck that cannot
+# be built is the whole point of running this script, and swallowing that is what
+# made the 0.8 breakage present as "herdr opens with a terminal" instead of an error.
+start_deck() {
+  local json pane
+  if herdr workspace list 2>/dev/null | grep -q '"workspace_id"'; then
+    json="$(herdr tab create --cwd "$LAUNCH_ROOT" --focus 2>&1)"
+  else
+    # A server with no workspace yet — `tab create` answers workspace_not_found there.
+    json="$(herdr workspace create --cwd "$LAUNCH_ROOT" --focus 2>&1)"
+  fi
+  pane="$(printf '%s' "$json" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: raise SystemExit
+print(d.get("result", {}).get("root_pane", {}).get("pane_id", "") or "")' 2>/dev/null)"
+  if [ -z "$pane" ]; then
+    echo "deck: could not create the TicketDeck pane. herdr said:" >&2
+    printf '%s\n' "$json" >&2
+    return 1
+  fi
+  # Close the half-built pane on any failure below. Once it carries the `deck` label
+  # the NEXT run's deck_pane() finds it and takes the reuse path, which starts nothing
+  # — so an aborted launch would come back as a bare terminal on every later retry,
+  # the exact symptom this script exists to prevent, made permanent.
+  abandon_pane() { herdr pane close "$pane" >/dev/null 2>&1 || true; }
+  # The label is load-bearing: it is the only way deck_pane() finds this pane again,
+  # because a shell running ticketdeck is not an "agent" that `agent list` reports.
+  herdr pane rename "$pane" deck >/dev/null 2>&1 || {
+    abandon_pane; echo "deck: could not label pane $pane as the deck" >&2; return 1; }
+  # Also report it as an agent called "deck". ticketdeck's own Go code finds the deck
+  # by agent name three times over — the focus-back after CloseByName (Done/Cancel) and
+  # after a triage hand-off — and a labelled pane alone is invisible to `agent list`.
+  # Without this those calls silently no-op and focus is left on a neighbour tab.
+  herdr pane report-agent "$pane" --source ticketdeck-deck --agent deck --state unknown \
+    >/dev/null 2>&1 || true
+  # Respawn loop: the deck is the persistent hub pinned to tab #1. If ticketdeck ever
+  # exits (Ctrl+c, a crash, a transient Linear error), bring it right back so tab #1 is
+  # never orphaned. The `sleep` avoids a tight loop on hard failure.
+  herdr pane run "$pane" "$DECK_RUN" >/dev/null 2>&1 || {
+    abandon_pane; echo "deck: could not start ticketdeck in pane $pane" >&2; return 1; }
+  printf '%s\n' "$pane"
+}
+
+# 3. reuse a live deck if present (keeps its tab number stable); only build a fresh
+#    one when absent (fresh server / after a restart), where it becomes tab #1 as
+#    the first tab created. Do NOT close+recreate — that is what drifted the deck
+#    off tab #1.
+DECK_PANE="$(deck_pane)"
+if [ -z "$DECK_PANE" ]; then
+  DECK_PANE="$(start_deck)" || exit 1
 else
-  # Reusing the agent above also reuses whatever binary it started with, so
+  # Reusing the pane above also reuses whatever binary it started with, so
   # `ticketdeck update` appeared to do nothing: the deck kept running the
   # replaced file for as long as the pane lived. Kill the stale process — the
-  # respawn loop restarts it from the new binary within a second, and the agent,
-  # its pane and tab #1 all survive, which closing the agent would not.
+  # respawn loop restarts it from the new binary within a second, and the pane
+  # and tab #1 both survive, which closing the pane would not.
   # Linux-only: on macOS there is no /proc and readlink finds nothing, so this
   # no-ops rather than misfiring.
   # `|| true`: no match is the normal case, not an error. A `for` list doesn't
@@ -155,10 +235,12 @@ else
 fi
 
 # 3b. close any non-agent (default shell) panes so the workspace shows only the
-#     deck + ticket sessions. Never touches ticket panes (they are agents).
+#     deck + ticket sessions. Never touches ticket panes (they are agents), and
+#     never the deck: a shell running ticketdeck is not an agent, so without the
+#     explicit skip this step would close the pane step 3 just built.
 AGENTS_JSON="$(herdr agent list 2>/dev/null)"
 PANES_JSON="$(herdr pane list 2>/dev/null)"
-for p in $(AGENTS="$AGENTS_JSON" PANES="$PANES_JSON" python3 - <<'PY' 2>/dev/null
+for p in $(AGENTS="$AGENTS_JSON" PANES="$PANES_JSON" DECK="$DECK_PANE" python3 - <<'PY' 2>/dev/null
 import os, json
 try:
     panes = json.loads(os.environ.get("PANES", "") or "{}").get("result", {}).get("panes", [])
@@ -166,6 +248,7 @@ try:
 except Exception:
     panes, agents = [], []
 agent_panes = {a.get("pane_id") for a in agents}
+agent_panes.add(os.environ.get("DECK", ""))
 print("\n".join(p["pane_id"] for p in panes if p.get("pane_id") not in agent_panes))
 PY
 ); do
@@ -173,6 +256,8 @@ PY
 done
 
 # 4. focus the deck so attach lands on the ticket list, then attach (foreground;
-#    detach leaves everything running).
-herdr agent focus deck >/dev/null 2>&1 || true
+#    detach leaves everything running). Focus by tab rather than `agent focus deck`:
+#    the deck is a labelled pane, not an agent, on every version now.
+DECK_TAB="$(pane_tab "$DECK_PANE")"
+[ -n "$DECK_TAB" ] && herdr tab focus "$DECK_TAB" >/dev/null 2>&1 || true
 exec herdr

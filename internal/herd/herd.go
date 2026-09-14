@@ -44,7 +44,13 @@ func Available() bool {
 // Agent is one entry from `herdr agent list`'s result.agents[]. Unknown fields
 // are ignored.
 type Agent struct {
-	Name        string `json:"name"`
+	Name string `json:"name"`
+	// Label is herdr's reported-agent field. herdr 0.8.0 dropped `name` from
+	// `agent list` and reports the label under `agent` instead, so a build that
+	// reads only Name sees every agent as unnamed there: Sessions() skips them
+	// all, focusDeck never matches, and CloseByName closes nothing. parseAgents
+	// folds this into Name so the rest of the package keeps one field.
+	Label       string `json:"agent"`
 	Cwd         string `json:"cwd"`
 	AgentStatus string `json:"agent_status"` // idle | working | blocked | unknown
 	PaneID      string `json:"pane_id"`
@@ -85,6 +91,11 @@ func parseAgents(b []byte) ([]Agent, error) {
 	var resp agentListResp
 	if err := json.Unmarshal(b, &resp); err != nil {
 		return nil, fmt.Errorf("decode herdr agents json: %w", err)
+	}
+	for i := range resp.Result.Agents {
+		if resp.Result.Agents[i].Name == "" {
+			resp.Result.Agents[i].Name = resp.Result.Agents[i].Label
+		}
 	}
 	return resp.Result.Agents, nil
 }
@@ -226,8 +237,8 @@ func CloseByName(agents []Agent, name string) (string, error) {
 			// Closing a ticket's own tab makes herdr focus the neighbor tab; pull
 			// focus back to the deck so a Done/Cancel from the list lands on the
 			// ticket list rather than on some adjacent session.
-			if err == nil && hasAgent(agents, "deck") {
-				_ = exec.Command(herdrBin, "agent", "focus", "deck").Run()
+			if err == nil {
+				focusDeck(agents)
 			}
 			return string(out), err
 		}
@@ -236,6 +247,20 @@ func CloseByName(agents []Agent, name string) (string, error) {
 }
 
 // hasAgent reports whether an agent named `name` is in the list.
+// focusDeck pulls focus back to the deck's pane. herdr 0.8.0 stopped resolving a
+// reported agent label as a focus target — `agent focus deck` answers "agent target
+// deck not found" there — so the deck is focused by its pane id, which both the old
+// and the new targeting accept. A deck that is not in the list (someone closed it)
+// is not an error: there is nowhere to put focus, and that is the whole operation.
+func focusDeck(agents []Agent) {
+	for _, a := range agents {
+		if strings.EqualFold(a.Name, "deck") && a.PaneID != "" {
+			_ = exec.Command(herdrBin, "agent", "focus", a.PaneID).Run()
+			return
+		}
+	}
+}
+
 func hasAgent(agents []Agent, name string) bool {
 	for _, a := range agents {
 		if strings.EqualFold(a.Name, name) {
@@ -495,12 +520,12 @@ func Triage(agents []Agent, t session.Ticket, cwd string) (string, error) {
 	// Wait until Claude is up and its prompt is painted, then submit /triage.
 	_ = exec.Command(herdrBin, "agent", "wait", t.Key, "--status", "idle", "--timeout", "60000").Run()
 	if !waitForPrompt(t.Key) {
-		_ = exec.Command(herdrBin, "agent", "focus", "deck").Run()
+		focusDeck(agents)
 		return "", fmt.Errorf("%s has a prompt of its own open (trust dialog?) — clear it in its tab, then triage again", t.Key)
 	}
 	out, err := sendAndEnter(t.Key, paneID, "/triage")
 	// Make sure focus is back on the deck regardless of what the new tab did.
-	_ = exec.Command(herdrBin, "agent", "focus", "deck").Run()
+	focusDeck(agents)
 	if err != nil {
 		return out, err
 	}

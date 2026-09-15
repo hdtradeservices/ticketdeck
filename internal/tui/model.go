@@ -1067,6 +1067,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.loading = true
 			m.notice = ""
+			// The pooled Fetcher answers from the shared list until the
+			// interval lapses, which would make this key a no-op for up to a
+			// minute. Asking for it puts the pool back on the due side first.
+			if f, ok := m.fetch.(interface{ Refresh() }); ok {
+				f.Refresh()
+			}
 			return m, tea.Batch(m.refresh(), m.refreshStatuses())
 		case "enter":
 			if s, ok := m.selectedSession(); ok {

@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"golang.org/x/term"
 
+	"github.com/hdtradeservices/ticketdeck/internal/cache"
 	"github.com/hdtradeservices/ticketdeck/internal/herd"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/tui"
@@ -240,7 +241,9 @@ func buildFetcher(demo bool) (tui.Fetcher, error) {
 	if key == "" {
 		return nil, fmt.Errorf("LINEAR_API_KEY not set (or pass --demo)")
 	}
-	return linear.NewClient(key), nil
+	// Pooled, not bare: every deck on the machine polls the same two queries
+	// against one key's hourly budget, so they share one fetch (see internal/cache).
+	return cache.Wrap(linear.NewClient(key)), nil
 }
 
 func runDump(f tui.Fetcher) {

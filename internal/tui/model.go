@@ -325,6 +325,7 @@ type Model struct {
 	err           error
 	notice        string // transient status line (e.g. dry-run launch plan)
 	lastSync      time.Time
+	inView        bool // the deck pane is the focused one — see the tickMsg gate
 	width         int
 	height        int
 	quitting      bool
@@ -349,7 +350,7 @@ type demoOwner interface {
 }
 
 func New(f Fetcher, root string, dry bool, backend Backend) Model {
-	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, projExpanded: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != "", comments: map[string][]linear.Comment{}, commentsErr: map[string]error{}, commentsBusy: map[string]bool{}}
+	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, inView: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, projExpanded: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != "", comments: map[string][]linear.Comment{}, commentsErr: map[string]error{}, commentsBusy: map[string]bool{}}
 	// Resolved once, not per frame: All() globs the filesystem, and View runs on
 	// every keystroke.
 	m.acct = account.Current()
@@ -571,6 +572,41 @@ func tick() tea.Cmd {
 	return tea.Tick(refreshEvery+jitter, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
+// linearRefresh returns the two Linear-backed fetches, or nil when this deck
+// should sit this round out.
+//
+// Only the deck you are looking at spends Linear's budget. Every deck on the
+// machine shares one LINEAR_API_KEY, and so one hourly pool of 3,000,000
+// complexity points; the assigned-issues query is by far the most expensive
+// thing the deck asks for, and three decks polling it in the background kept
+// that pool empty (measured 2026-09-14). The local polls — badges, other
+// sessions, quota — stay on either way: they never touch Linear, and keeping
+// them live is why a deck you switch to is already right about what is
+// running.
+func (m Model) linearRefresh() []tea.Cmd {
+	if !m.inView {
+		return nil
+	}
+	return []tea.Cmd{m.refresh(), m.refreshProjects()}
+}
+
+// linearStale reports whether the ticket list has gone past the point where the
+// timer would have refreshed it anyway — the test for whether coming back into
+// view is worth a fetch.
+func (m Model) linearStale(now time.Time) bool {
+	if m.lastSync.IsZero() {
+		// Never synced, which is two different situations. The first fetch is
+		// still in flight from Init — herdr focuses the pane moments after it
+		// starts, so catching up here would fetch the list twice on every deck
+		// launch. Or it came back an error, and the deck is sitting on the
+		// empty screen with nothing to fall back on: that one is worth the
+		// fetch, which a peer's cached list usually answers without touching
+		// Linear at all. m.err tells them apart.
+		return m.err != nil
+	}
+	return now.Sub(m.lastSync) >= refreshEvery
+}
+
 // statusTick schedules the next fast status-only poll. No jitter: it only hits
 // the local backend, not the shared Linear API, so there's no herd to spread.
 func statusTick() tea.Cmd {
@@ -590,7 +626,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// also how a deck that skipped a round — another deck held the poll lock —
 		// picks up the answer. A per-deck timer here would only put the decks back
 		// in lockstep — the state that earns the 429s.
-		return m, tea.Batch(m.refresh(), m.refreshProjects(), m.refreshStatuses(), m.refreshSessions(), tick(), m.fetchQuota())
+		cmds := []tea.Cmd{m.refreshStatuses(), m.refreshSessions(), tick(), m.fetchQuota()}
+		cmds = append(cmds, m.linearRefresh()...)
+		return m, tea.Batch(cmds...)
 
 	case statusTickMsg:
 		// Deliberately no Linear fetch or quota call — those stay on the slow tick.
@@ -600,9 +638,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// The deck pane regained focus (e.g. returning from a ticket's tab under
 		// herdr) — refresh badges immediately so they're live on arrival rather
 		// than up to statusRefreshEvery stale.
+		m.inView = true
 		if m.demoStatuses == nil {
-			return m, tea.Batch(m.refreshStatuses(), m.refreshSessions())
+			cmds := []tea.Cmd{m.refreshStatuses(), m.refreshSessions()}
+			// Catch up on the Linear rounds skipped while this deck was out of
+			// view, but only past the point where the list would have refreshed
+			// anyway. Bouncing between the deck and a ticket tab is the common
+			// motion, and fetching on every return would turn the gate into an
+			// amplifier — more Linear traffic than the plain timer, not less.
+			if m.linearStale(time.Now()) {
+				cmds = append(cmds, m.linearRefresh()...)
+			}
+			return m, tea.Batch(cmds...)
 		}
+
+	case tea.BlurMsg:
+		// Out of view: hold the Linear polling until it comes back (see tickMsg).
+		m.inView = false
 
 	case updateAvailableMsg:
 		m.updateLatest = msg.latest

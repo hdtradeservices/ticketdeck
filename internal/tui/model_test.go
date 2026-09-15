@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1971,5 +1972,111 @@ func TestOtherAccountsLineAlignsWithTitleBar(t *testing.T) {
 	if a, b := col(line1, "matt"), col(line2, "support"); a != b {
 		t.Errorf("account names start in different columns: title bar %d, other-accounts line %d\n%s\n%s",
 			a, b, line1, line2)
+	}
+}
+
+// ── refresh only while in view ───────────────────────────────────────────────
+// Every deck on the machine shares one LINEAR_API_KEY and one hourly complexity
+// pool, so a deck nobody is looking at must not spend it.
+
+func TestBlurHoldsTheLinearPoll(t *testing.T) {
+	m := loaded(t)
+	next, _ := m.Update(tea.BlurMsg{})
+	m = next.(Model)
+	if m.inView {
+		t.Fatal("a blurred deck should not consider itself in view")
+	}
+	if cmds := m.linearRefresh(); cmds != nil {
+		t.Errorf("a blurred deck should skip the Linear fetches, got %d", len(cmds))
+	}
+}
+
+func TestFocusResumesTheLinearPoll(t *testing.T) {
+	m := loaded(t)
+	next, _ := m.Update(tea.BlurMsg{})
+	next, _ = next.(Model).Update(tea.FocusMsg{})
+	m = next.(Model)
+	if !m.inView {
+		t.Fatal("a focused deck should consider itself in view")
+	}
+	if m.linearRefresh() == nil {
+		t.Error("a focused deck should fetch on its tick")
+	}
+}
+
+// Bouncing between the deck and a ticket tab is the common motion. Fetching on
+// every return would make the gate an amplifier rather than a brake.
+func TestFocusOnlyCatchesUpWhenStale(t *testing.T) {
+	m := loaded(t)
+	m.lastSync = time.Now()
+	if m.linearStale(time.Now()) {
+		t.Error("a list synced a moment ago should not refetch on focus")
+	}
+	m.lastSync = time.Now().Add(-2 * refreshEvery)
+	if !m.linearStale(time.Now()) {
+		t.Error("a list older than the refresh interval should catch up on focus")
+	}
+}
+
+// herdr focuses the deck pane moments after launch, while Init's first fetch is
+// still in flight. Treating "never synced" as stale would double every start.
+func TestFirstFocusDoesNotDoubleTheStartupFetch(t *testing.T) {
+	m := loaded(t)
+	m.lastSync, m.err = time.Time{}, nil
+	if m.linearStale(time.Now()) {
+		t.Error("a deck that has never synced should wait for Init's fetch, not add one")
+	}
+}
+
+// The other reason lastSync is zero: the first fetch came back an error. That
+// deck has an empty screen and nothing to fall back on, so coming into view has
+// to fetch — and a peer's cached list usually answers it without calling
+// Linear. Without this it waited for the next tick, over a minute later.
+func TestFocusCatchesUpAfterAFailedFirstSync(t *testing.T) {
+	m := loaded(t)
+	m.lastSync, m.err = time.Time{}, errors.New("rate limited (retry after 3600)")
+	if !m.linearStale(time.Now()) {
+		t.Error("a deck whose first sync failed should fetch when it comes into view")
+	}
+}
+
+// The same thing through Update, so the wiring is pinned and not just the
+// predicate. Focus always issues the two local badge refreshes; the catch-up
+// adds the Linear pair on top, so the batch is what distinguishes them.
+func TestFocusAfterAFailedSyncBatchesTheLinearFetch(t *testing.T) {
+	m := loaded(t)
+	m.inView = false
+
+	m.lastSync, m.err = time.Time{}, nil
+	next, cmd := m.Update(tea.FocusMsg{})
+	if !next.(Model).inView {
+		t.Error("focus should put the deck back in view")
+	}
+	quiet := batchLen(cmd)
+
+	m.lastSync, m.err = time.Time{}, errors.New("rate limited (retry after 3600)")
+	_, cmd = m.Update(tea.FocusMsg{})
+	if got := batchLen(cmd); got <= quiet {
+		t.Errorf("a failed first sync should add the Linear fetches on focus: %d vs %d", got, quiet)
+	}
+}
+
+// batchLen counts the commands a tea.Batch carries, so a test can tell "focus
+// refreshed the badges" from "focus also went to Linear".
+func batchLen(cmd tea.Cmd) int {
+	if cmd == nil {
+		return 0
+	}
+	if batch, ok := cmd().(tea.BatchMsg); ok {
+		return len(batch)
+	}
+	return 1
+}
+
+// A terminal that never reports focus (a plain tty, no herdr) must still
+// refresh — the gate fails open or the list would freeze on launch.
+func TestDeckStartsInView(t *testing.T) {
+	if !New(fakeFetcher{}, "", true, fakeBackend{}).inView {
+		t.Error("a new deck should start in view")
 	}
 }

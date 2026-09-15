@@ -16,6 +16,7 @@ import (
 	"github.com/mattn/go-runewidth"
 
 	"github.com/hdtradeservices/ticketdeck/internal/account"
+	"github.com/hdtradeservices/ticketdeck/internal/cache"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/quota"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
@@ -2078,5 +2079,62 @@ func batchLen(cmd tea.Cmd) int {
 func TestDeckStartsInView(t *testing.T) {
 	if !New(fakeFetcher{}, "", true, fakeBackend{}).inView {
 		t.Error("a new deck should start in view")
+	}
+}
+
+// New type-asserts its Fetcher for five optional capabilities. A pooled client
+// that failed to promote them would compile, run, and silently drop status
+// writes, assignee changes, comments and the whole projects section — so assert
+// the wrapper the live deck actually gets keeps every one of them.
+func TestPooledClientKeepsEveryOptionalCapability(t *testing.T) {
+	m := New(cache.Wrap(linear.NewClient("test-key")), "", true, fakeBackend{})
+	for _, c := range []struct {
+		name string
+		got  any
+	}{
+		{"statusWriter", m.writer},
+		{"assigner", m.assigner},
+		{"commenter", m.commenter},
+		{"projectFetcher", m.projFetch},
+		{"projectWriter", m.projWriter},
+	} {
+		if c.got == nil {
+			t.Errorf("the pooled client should still satisfy %s", c.name)
+		}
+	}
+	if _, ok := m.fetch.(interface{ Refresh() }); !ok {
+		t.Error("the pooled client should still satisfy the refresh-key capability")
+	}
+}
+
+// refreshableFetcher records whether the deck asked the pool to go live.
+type refreshableFetcher struct {
+	fakeFetcher
+	forced int
+}
+
+func (f *refreshableFetcher) Refresh() { f.forced++ }
+
+// Pressing r means "show me now". The pooled Fetcher answers from the shared
+// list until the interval lapses, so the key has to put the pool back on the
+// due side or it does nothing at all for a minute.
+func TestRefreshKeyForcesThePool(t *testing.T) {
+	f := &refreshableFetcher{}
+	m := New(f, "", true, fakeBackend{})
+
+	if _, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}}); cmd == nil {
+		t.Fatal("r should issue a refresh command")
+	}
+	if f.forced != 1 {
+		t.Errorf("r should force the pool live once, got %d", f.forced)
+	}
+}
+
+// A Fetcher without the capability — the demo fetcher, any test stub — must
+// still take the key rather than panicking on a failed type assertion.
+func TestRefreshKeyWorksWithoutAPool(t *testing.T) {
+	m := New(fakeFetcher{}, "", true, fakeBackend{})
+	if _, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}}); cmd == nil {
+		t.Error("r should still refresh when the Fetcher cannot be forced")
 	}
 }

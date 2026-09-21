@@ -2522,6 +2522,45 @@ func (m *Model) rescanAccounts() {
 	m.ownerCol = ownerColWidth(m.accounts, m.owners)
 }
 
+// byHeadroom orders hand-off candidates most-free first, so the default
+// selection is the subscription with the most room left.
+//
+// An account is ranked by whichever of its two windows is closer to its cap,
+// not by their average: being at 5% of the 5-hour window buys nothing on a
+// subscription sitting at 98% of its 7-day one. An account with no reading
+// sorts last — unknown headroom is not evidence of headroom — and ties break on
+// name so the list doesn't reshuffle between frames.
+func (m Model) byHeadroom(cands []account.Account) []account.Account {
+	out := slices.Clone(cands)
+	slices.SortStableFunc(out, func(a, b account.Account) int {
+		ha, oka := m.headroom(a.Name)
+		hb, okb := m.headroom(b.Name)
+		if oka != okb {
+			if oka {
+				return -1
+			}
+			return 1
+		}
+		if oka {
+			if c := cmp.Compare(hb, ha); c != 0 {
+				return c
+			}
+		}
+		return strings.Compare(a.Name, b.Name)
+	})
+	return out
+}
+
+// headroom is the percentage of an account's tighter rate window still free,
+// and whether there was a reading to compute it from.
+func (m Model) headroom(name string) (float64, bool) {
+	u := m.quotas[name].Usage
+	if u == nil {
+		return 0, false
+	}
+	return 100 - max(u.FiveHourPct, u.SevenDayPct), true
+}
+
 // openHandoff opens the confirm overlay for moving a ticket's session to
 // another subscription. Refuses early when there is nothing to move or nowhere
 // to move it, so the overlay never appears without a usable action.
@@ -2539,7 +2578,7 @@ func (m Model) openHandoffFor(key, label string) (tea.Model, tea.Cmd) {
 		m.notice = "hand-off needs a live backend"
 		return m, nil
 	}
-	cands := m.otherAccounts()
+	cands := m.byHeadroom(m.otherAccounts())
 	if len(cands) == 0 {
 		m.notice = "only one Claude subscription found — see `deck --account` in SETUP.md"
 		return m, nil

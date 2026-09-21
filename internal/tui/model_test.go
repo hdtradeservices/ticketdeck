@@ -2002,6 +2002,33 @@ func TestNewAccountAppearsWithoutRestartingTheDeck(t *testing.T) {
 	}
 }
 
+// The window closer to its cap is the one that binds, so it alone decides the
+// order: plenty of 5-hour room is worthless on a subscription out of 7-day.
+func TestHandoffCandidatesOrderedByTighterWindow(t *testing.T) {
+	m := twoAccounts(t)
+	m.accounts = []account.Account{
+		{Name: "matt", ConfigDir: m.acct.ConfigDir},
+		{Name: "loaded", ConfigDir: "/x/.claude-loaded"},
+		{Name: "free", ConfigDir: "/x/.claude-free"},
+		{Name: "unread", ConfigDir: "/x/.claude-unread"},
+	}
+	m.quotas = map[string]quota.Entry{
+		"loaded": {Usage: &quota.Usage{FiveHourPct: 5, SevenDayPct: 98}},
+		"free":   {Usage: &quota.Usage{FiveHourPct: 40, SevenDayPct: 20}},
+	}
+	m.sessions = map[string]session.Status{"ZEN-9": session.NeedsInput}
+	next, _ := m.Update(runes("H"))
+	m = next.(Model)
+	var got []string
+	for _, a := range m.handoffCands {
+		got = append(got, a.Name)
+	}
+	want := []string{"free", "loaded", "unread"}
+	if !slices.Equal(got, want) {
+		t.Errorf("candidates should be most-free first with unread last: got %v, want %v", got, want)
+	}
+}
+
 // ── refresh only while in view ───────────────────────────────────────────────
 // Every deck on the machine shares one LINEAR_API_KEY and one hourly complexity
 // pool, so a deck nobody is looking at must not spend it.

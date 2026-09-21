@@ -83,14 +83,18 @@ else
   fi
 fi
 
-# ── deck launcher ────────────────────────────────────────────────────────────
-if [ -f "./scripts/deck" ]; then
-  install -m 0755 ./scripts/deck "$BIN_DIR/deck"
-else
-  curl -fsSL "$RAW/scripts/deck" -o "$BIN_DIR/deck" && chmod +x "$BIN_DIR/deck"
-fi
+# ── deck launchers ───────────────────────────────────────────────────────────
+# rdeck rides along with deck: it is the same launcher pointed at another box, and
+# a laptop that will attach to a remote deck is not distinguishable at install time.
+for s in deck rdeck; do
+  if [ -f "./scripts/$s" ]; then
+    install -m 0755 "./scripts/$s" "$BIN_DIR/$s"
+  else
+    curl -fsSL "$RAW/scripts/$s" -o "$BIN_DIR/$s" && chmod +x "$BIN_DIR/$s"
+  fi
+done
 
-say "installed: ticketdeck, deck$([ "${NO_HERDR:-0}" != 1 ] && echo ", herdr") → $BIN_DIR"
+say "installed: ticketdeck, deck, rdeck$([ "${NO_HERDR:-0}" != 1 ] && echo ", herdr") → $BIN_DIR"
 case ":$PATH:" in
   *":$BIN_DIR:"*) : ;;
   *) printf '\033[33m! %s is not on your PATH — add:  export PATH="%s:$PATH"\033[0m\n' "$BIN_DIR" "$BIN_DIR" ;;

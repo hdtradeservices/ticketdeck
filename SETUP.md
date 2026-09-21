@@ -331,6 +331,36 @@ Three things to know:
   support` works. (`ticketdeck --account support` does the same for the
   standalone, non-herdr path.)
 
+## 5. A deck on another box: `rdeck`
+
+`rdeck` attaches to a TicketDeck running somewhere else — a cloud workstation,
+say — and leaves it running when you detach. It brings up the remote herdr
+server with the right Claude account, starts TicketDeck in it if it isn't
+already there, then attaches from here.
+
+```sh
+rdeck                    # primary account (first line of ~/.claude-accounts)
+rdeck support            # the 'support' subscription on the box
+rdeck m0 --status        # report remote state, attach nothing
+rdeck support --restart  # rebuild the session server first (closes its panes)
+```
+
+Detaching (`Ctrl+b q`) leaves the server and every ticket session running on the
+box. Set `RDECK_HOST` to the ssh target (default `zentail-workbench`).
+
+**Accounts work differently here.** On the box they map to herdr *sessions*, not
+to the `XDG_CONFIG_HOME` overlay `deck --account` uses. `herdr --remote` picks a
+remote server by session name and has no way to name a socket, so an overlay
+server on the far end is unreachable from here. The primary account is the
+remote *default* session — the one a plain `deck` on the box already runs — and
+every other account gets a named session of the same name.
+
+**A server the bridge started is not usable.** If you run `herdr --remote` by
+hand and let it start a server for you, that server has a bare environment: no
+`CLAUDE_CONFIG_DIR`, no `LINEAR_API_KEY`, no `~/.local/bin` on `PATH`. The deck
+either can't start at all or starts against the wrong subscription. `rdeck`
+checks for this and tells you to rerun with `--restart`.
+
 ## Modes / flags
 
 ```sh

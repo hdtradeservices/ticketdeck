@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# rdeck — attach to a TicketDeck running on a remote box, one account per session.
+#
+# Ensures the remote herdr session server is up with the right Claude account,
+# ensures TicketDeck is running in it, then attaches from here. Detaching
+# (Ctrl+b q) leaves the server and every ticket session running on the box.
+#
+# Usage:
+#   rdeck                    # primary account (first line of ~/.claude-accounts)
+#   rdeck support            # run as the ~/.claude-support subscription
+#   rdeck m0 --status        # report remote state, attach nothing
+#   rdeck support --restart  # rebuild the session server first (closes its panes)
+#
+# Env:
+#   RDECK_HOST      ssh target (default: zentail-workbench)
+#   RDECK_ACCOUNT   default account when none is given on the command line
+#
+# Accounts map to herdr SESSIONS, not to the XDG overlay `deck --account` uses:
+# `herdr --remote` selects a remote server by session name and has no way to name
+# a socket, and the box's sshd accepts only LANG/LC_*, so an overlay server on the
+# far end is unreachable from here. The primary account is the remote DEFAULT
+# session — the one a plain `deck` on the box already runs — and every other
+# account gets a named session of the same name.
+set -euo pipefail
+
+HOST="${RDECK_HOST:-zentail-workbench}"
+ACCOUNT="${RDECK_ACCOUNT:-}"
+MODE=attach
+RESTART=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host) HOST="${2:-}"; shift 2 ;;
+    --host=*) HOST="${1#*=}"; shift ;;
+    --status) MODE=status; shift ;;
+    --restart) RESTART=1; shift ;;
+    --no-attach) MODE=ensure; shift ;;
+    -h|--help)
+      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "rdeck: unknown option: $1" >&2; exit 2 ;;
+    *) [ -z "$ACCOUNT" ] || { echo "rdeck: one account at a time (got '$ACCOUNT' and '$1')" >&2; exit 2; }
+       ACCOUNT="$1"; shift ;;
+  esac
+done
+
+# The primary account is whichever name leads ~/.claude-accounts; it owns ~/.claude
+# and, remotely, the default session. Fall back to the file on the box if this
+# machine has no copy.
+primary_account() {
+  local f="$HOME/.claude-accounts"
+  [ -f "$f" ] && grep -vE '^\s*(#|$)' "$f" | head -1 && return
+  ssh "$HOST" 'grep -vE "^\s*(#|$)" ~/.claude-accounts 2>/dev/null | head -1' 2>/dev/null
+}
+
+PRIMARY="$(primary_account || true)"
+[ -n "$ACCOUNT" ] || ACCOUNT="$PRIMARY"
+[ -n "$ACCOUNT" ] || { echo "rdeck: no account given and no ~/.claude-accounts to read one from" >&2; exit 1; }
+
+if [ "$ACCOUNT" = "$PRIMARY" ]; then
+  SESSION=""                      # the remote default session
+  CONFIG_DIR='$HOME/.claude'      # expanded on the box, whose $HOME differs
+else
+  SESSION="$ACCOUNT"
+  CONFIG_DIR="\$HOME/.claude-$ACCOUNT"
+fi
+SOCK_DIR='$HOME/.config/herdr'
+[ -z "$SESSION" ] || SOCK_DIR="\$HOME/.config/herdr/sessions/$SESSION"
+
+command -v herdr >/dev/null 2>&1 || { echo "rdeck: herdr not on PATH (see https://herdr.dev)" >&2; exit 1; }
+
+# `herdr --remote` from inside a herdr pane aborts on the nesting guard, and the
+# message doesn't name the setting that lifts it.
+if [ "$MODE" = attach ] && [ -n "${HERDR_ENV:-}" ] \
+   && ! grep -qE '^\s*allow_nested\s*=\s*true' "${XDG_CONFIG_HOME:-$HOME/.config}/herdr/config.toml" 2>/dev/null; then
+  cat >&2 <<EOF
+rdeck: you are inside a herdr pane, and nested herdr is disabled.
+       Run this from a plain terminal, or set in ${XDG_CONFIG_HOME:-$HOME/.config}/herdr/config.toml:
+
+           [experimental]
+           allow_nested = true
+EOF
+  exit 1
+fi
+
+# Everything below runs on the box. bash -lic is load-bearing twice over: login
+# puts ~/.local/bin (ticketdeck) on PATH, interactive sources the rc that exports
+# LINEAR_API_KEY, and deck refuses to start without either.
+# The stderr filter drops two streams of noise that would otherwise bury a real
+# error: gcloud's IAP-tunnel NumPy advice, and bash's job-control complaints from
+# running interactively without a terminal.
+remote() {
+  local rc
+  # Both streams go through one filter, and the filter runs in the pipeline rather
+  # than a process substitution: a backgrounded filter loses whatever the remote
+  # wrote just before a failing exit, which is exactly the text worth reading.
+  set +e
+  ssh "$HOST" "bash -lic $(printf '%q' "$1")" </dev/null 2>&1 \
+    | grep -vE 'NumPy|increasing_the_tcp_upload_bandwidth|^WARNING: *$|cannot set terminal process group|no job control in this shell|^logout$|^\[[0-9]+\]( \+)? [0-9]+$|^ *$'
+  rc=${PIPESTATUS[0]}
+  set -e
+  return "$rc"
+}
+
+REMOTE_SCRIPT=$(cat <<EOF
+set -u
+export HERDR_SOCKET_PATH="$SOCK_DIR/herdr.sock"
+export HERDR_CLIENT_SOCKET_PATH="$SOCK_DIR/herdr-client.sock"
+export CLAUDE_CONFIG_DIR="$CONFIG_DIR"
+export TICKETDECK_ACCOUNT="$ACCOUNT"
+MODE="$MODE"
+RESTART="$RESTART"
+SESSION="$SESSION"
+SESSION_JSON="$SOCK_DIR/session.json"
+
+server_running() { herdr status 2>/dev/null | grep -q 'status: running'; }
+# Identify the server by the socket it listens on, never by process name: every
+# overlay deck on the box is also a bare \`herdr server\`, so a name match returns
+# whichever one started first and would report a different account than this one.
+server_pid() { ss -xlnp 2>/dev/null | grep -F " \$HERDR_SOCKET_PATH " | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2; }
+server_env() {
+  local p; p="\$(server_pid)"
+  [ -n "\$p" ] || return 0
+  tr '\0' '\n' < "/proc/\$p/environ" 2>/dev/null
+}
+# An unset CLAUDE_CONFIG_DIR is not "no account": it means ~/.claude, the primary one.
+server_account() {
+  local a; a="\$(server_env | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | head -1)"
+  printf '%s\n' "\${a:-\$HOME/.claude}"
+}
+# Names what is wrong with a running server, or prints nothing when it is usable.
+# A server herdr's remote bridge started, rather than this script or deck, has a bare
+# environment: no account, no LINEAR_API_KEY and no ~/.local/bin, so TicketDeck either
+# cannot start at all or starts against the wrong subscription.
+server_problem() {
+  local env acct path
+  env="\$(server_env)"
+  [ -n "\$env" ] || { echo "has no process listening on its socket"; return; }
+  acct="\$(server_account)"
+  [ "\$acct" = "\$CLAUDE_CONFIG_DIR" ] || { echo "runs the account at \$acct, not \$CLAUDE_CONFIG_DIR"; return; }
+  printf '%s\n' "\$env" | grep -q '^LINEAR_API_KEY=' || { echo "has no LINEAR_API_KEY, which TicketDeck needs"; return; }
+  path="\$(printf '%s\n' "\$env" | sed -n 's/^PATH=//p' | head -1)"
+  case ":\$path:" in
+    *":\$HOME/.local/bin:"*) ;;
+    *) echo "has no ~/.local/bin on PATH, so it cannot find ticketdeck"; return ;;
+  esac
+}
+deck_pane() {
+  herdr pane list 2>/dev/null | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: raise SystemExit
+for p in d.get("result", {}).get("panes", []):
+    if p.get("label") == "deck":
+        print(p.get("pane_id", "")); break' 2>/dev/null
+}
+
+if [ "\$RESTART" = 1 ] && server_running; then
+  if [ -n "\$SESSION" ]; then
+    herdr session stop "\$SESSION" >/dev/null 2>&1 || true
+  else
+    herdr server stop >/dev/null 2>&1 || true
+  fi
+  sleep 1
+fi
+
+if ! server_running && [ "\$MODE" != status ]; then
+  # Same cold-start reset deck does, against THIS session's file. herdr restores
+  # panes as bare shells and never re-runs their launch command, so without it the
+  # deck comes back as an empty prompt somewhere past tab #1. deck cannot do this
+  # for us: it derives the path from XDG_CONFIG_HOME, which for a named session
+  # points at the DEFAULT session's file. Ticket sessions are untouched — they live
+  # on disk and come back as resumable in the deck.
+  [ ! -f "\$SESSION_JSON" ] || python3 - "\$SESSION_JSON" <<'PYEOF' || true
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception:
+    raise SystemExit
+for w in d.get("workspaces") or []:
+    w["public_tab_numbers"] = []
+    w["next_public_tab_number"] = 1
+    w["public_pane_numbers"] = {}
+    w["next_public_pane_number"] = 1
+    w["tabs"] = []
+    w["active_tab"] = 0
+with open(sys.argv[1], "w") as f:
+    json.dump(d, f)
+PYEOF
+  mkdir -p "\$(dirname "\$HERDR_SOCKET_PATH")"
+  # The server must exist before deck runs, so that deck skips its own cold-start
+  # reset — which would clear the default session's tabs, not this one's.
+  # setsid, not nohup: a nohup'd server stays inside the SSH login session, and
+  # herdr flags a server it did not start detached as one that "may not survive SSH
+  # connection loss" on every attach. Declining that prompt shuts the server down
+  # and takes its panes with it (lost 7 Claude panes to it, 2026-09-21).
+  setsid herdr \${SESSION:+--session "\$SESSION"} server >>"\$HOME/.herdr-\${SESSION:-default}.log" 2>&1 </dev/null &
+  for _ in \$(seq 1 60); do server_running && break; sleep 0.2; done
+  server_running || { echo "rdeck: remote herdr server did not start; see ~/.herdr-\${SESSION:-default}.log" >&2; exit 1; }
+fi
+
+if server_running && [ "\$RESTART" != 1 ]; then
+  problem="\$(server_problem)"
+  if [ -n "\$problem" ]; then
+    echo "rdeck: the server for session '\${SESSION:-default}' \$problem." >&2
+    echo "       That is what a server herdr's remote bridge started looks like." >&2
+    echo "       Rerun with --restart to rebuild it (closes its panes, keeps ticket sessions)." >&2
+    exit 3
+  fi
+fi
+
+# deck builds or reuses the TicketDeck pane, labels it, and wraps it in the respawn
+# loop. Its last act is to exec the herdr client and attach, which is this script's
+# local half instead; that exec fails without a terminal and takes deck's exit status
+# with it, so the pane check below is what decides whether this worked.
+if [ "\$MODE" != status ] && [ -z "\$(deck_pane)" ]; then
+  deck >/tmp/rdeck-deck.log 2>&1 </dev/null || true
+  if [ -z "\$(deck_pane)" ]; then
+    echo "rdeck: TicketDeck did not come up on '\${SESSION:-default}'. deck said:" >&2
+    tail -20 /tmp/rdeck-deck.log >&2
+    exit 1
+  fi
+fi
+
+echo "session:  \${SESSION:-default}"
+# A stopped server has no environment to read, so server_account's "unset means
+# ~/.claude" fallback would name the primary account for every session. Report the
+# dir this script would launch with instead.
+if server_running; then
+  echo "server:   running"
+  echo "account:  \${TICKETDECK_ACCOUNT} (\$(server_account))"
+else
+  echo "server:   stopped"
+  echo "account:  \${TICKETDECK_ACCOUNT} (\$CLAUDE_CONFIG_DIR on start)"
+fi
+echo "deck:     \$(deck_pane || true)"
+herdr agent list 2>/dev/null | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: raise SystemExit
+a = d.get("result", {}).get("agents", [])
+print("sessions: %d live (%s)" % (len(a), ", ".join(x.get("name") or x.get("agent","?") for x in a) or "none"))' 2>/dev/null || true
+EOF
+)
+
+echo "rdeck: $ACCOUNT on $HOST" >&2
+remote "$REMOTE_SCRIPT" || exit $?
+
+[ "$MODE" = attach ] || exit 0
+exec herdr --remote "$HOST" ${SESSION:+--session "$SESSION"}

@@ -1976,6 +1976,32 @@ func TestOtherAccountsLineAlignsWithTitleBar(t *testing.T) {
 	}
 }
 
+// A deck that started before an account logged in must still offer it. Logging
+// in happens in another terminal, usually hours after the decks were started,
+// so the once-at-startup scan left the new subscription invisible until every
+// deck was restarted.
+func TestNewAccountAppearsWithoutRestartingTheDeck(t *testing.T) {
+	m := twoAccounts(t)
+	if len(m.otherAccounts()) != 1 {
+		t.Fatalf("expected one other account at startup, got %d", len(m.otherAccounts()))
+	}
+	dir := filepath.Join(os.Getenv("HOME"), ".claude-m1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next, _ := m.Update(tickMsg{})
+	m = next.(Model)
+	if !slices.ContainsFunc(m.otherAccounts(), func(a account.Account) bool { return a.Name == "m1" }) {
+		t.Errorf("account that logged in after startup should appear as a hand-off target, got %v", m.otherAccounts())
+	}
+	if _, ok := m.acctColors["m1"]; !ok {
+		t.Error("a newly discovered account should get an accent color")
+	}
+}
+
 // ── refresh only while in view ───────────────────────────────────────────────
 // Every deck on the machine shares one LINEAR_API_KEY and one hourly complexity
 // pool, so a deck nobody is looking at must not spend it.

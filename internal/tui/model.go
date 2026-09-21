@@ -620,6 +620,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ensureVisible()
 
 	case tickMsg:
+		// Rescan before the quota poll so an account that just logged in is read
+		// this round rather than the next one.
+		m.rescanAccounts()
 		// Quota rides this tick with no schedule of its own: quota.Poll answers
 		// from the cache shared by every deck on the machine and decides for
 		// itself when an account is old enough to re-read. Asking every tick is
@@ -2499,6 +2502,24 @@ func (m Model) otherAccounts() []account.Account {
 		}
 	}
 	return out
+}
+
+// rescanAccounts re-globs the subscriptions on disk. New() resolves the list
+// once, which made a deck blind to any account that logged in after it started
+// — the normal order, since `claude auth login` happens in another terminal
+// hours later. The account was simply absent as a hand-off target until every
+// deck on the box was restarted, with nothing on screen saying why.
+func (m *Model) rescanAccounts() {
+	if m.demoStatuses != nil {
+		return // --demo fabricates accounts and their colors; a rescan drops them
+	}
+	accts := account.All()
+	if slices.Equal(accts, m.accounts) {
+		return
+	}
+	m.accounts = accts
+	m.acctColors = account.Colors(accts)
+	m.ownerCol = ownerColWidth(m.accounts, m.owners)
 }
 
 // openHandoff opens the confirm overlay for moving a ticket's session to

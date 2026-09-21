@@ -3,11 +3,21 @@
 // managing Claude sessions directly. TicketDeck stays the Linear-aware layer;
 // herdr owns multiplexing, detach/re-attach persistence, and agent-state.
 //
-// Commands used (verified against herdr 0.7.4):
+// Commands used (verified against herdr 0.9.1):
 //
-//	herdr agent list                              — enumerate agents (JSON over socket)
-//	herdr agent start <name> --cwd <dir> -- <cmd> — launch a named agent
-//	herdr agent attach <name>                     — re-attach a running agent
+//	herdr agent list                      — enumerate agents (JSON over socket)
+//	herdr agent get <name>                — one agent, incl. interactive_ready
+//	herdr tab create --cwd <dir>          — open the pane a session runs in
+//	herdr agent start <name> --kind <k> --pane <p> -- <cmd>
+//	                                      — run the agent and register its name
+//	herdr agent prompt <name> <text>      — type a message and submit it
+//	herdr agent focus <name>              — switch the workspace to a session
+//
+// herdr renames these between minor releases and the deck only finds out at the
+// point of use, in front of whoever pressed the key, so keep every one of them
+// pinned by a test: the unit tests stub `herdr` and assert the argv, and
+// TestLiveSubmit drives the submit path against a real server under
+// TICKETDECK_HERDR_LIVE=1.
 //
 // `herdr agent list` prints {"result":{"agents":[…]}} when a server is running;
 // with no server it prints usage text, so List fails soft (badges stay empty).
@@ -87,6 +97,29 @@ func ListAt(socket string) ([]Agent, error) {
 	return parseAgents(out)
 }
 
+// agentRef renders a session name the way herdr 0.9 requires it. Agent names are
+// lowercase there ([a-z0-9_-], 1-32 chars), so a ticket session registers as
+// "zen-5138" while the deck shows ZEN-5138 everywhere else. Every herdr call that
+// takes a name goes through this; parseAgents folds them back on the way in.
+func agentRef(name string) string { return strings.ToLower(name) }
+
+// lowerTicketKeyRE is ticketKeyRE's lowercase twin, matching the names herdr 0.9
+// stores for ticket sessions.
+var lowerTicketKeyRE = regexp.MustCompile(`^[a-z][a-z0-9]*-[0-9]+$`)
+
+// foldAgentName restores a ticket key's canonical uppercase. Scratch names are
+// left alone on purpose: uppercasing "scratch-1" would make ticketKeyRE classify
+// an ad-hoc session as a ticket.
+func foldAgentName(n string) string {
+	if _, isScratch := scratchNum(n); isScratch {
+		return n
+	}
+	if lowerTicketKeyRE.MatchString(n) {
+		return strings.ToUpper(n)
+	}
+	return n
+}
+
 func parseAgents(b []byte) ([]Agent, error) {
 	var resp agentListResp
 	if err := json.Unmarshal(b, &resp); err != nil {
@@ -96,6 +129,7 @@ func parseAgents(b []byte) ([]Agent, error) {
 		if resp.Result.Agents[i].Name == "" {
 			resp.Result.Agents[i].Name = resp.Result.Agents[i].Label
 		}
+		resp.Result.Agents[i].Name = foldAgentName(resp.Result.Agents[i].Name)
 	}
 	return resp.Result.Agents, nil
 }
@@ -145,7 +179,7 @@ func Plan(t session.Ticket, agents []Agent, defaultCwd string) (session.LaunchSp
 			// return; herdr owns the pane. Carry the label so Run can freshen the
 			// tab title (panes opened before the title feature show a bare key).
 			return session.LaunchSpec{
-				Args:   []string{"agent", "focus", t.Key},
+				Args:   []string{"agent", "focus", agentRef(t.Key)},
 				Cwd:    firstNonEmpty(a.Cwd, defaultCwd),
 				Name:   t.Key,
 				Label:  session.TabLabel(t),
@@ -198,7 +232,7 @@ func scratchNum(name string) (int, bool) {
 
 // FocusSpec switches the workspace to an existing session's pane.
 func FocusSpec(ref session.SessionRef) session.LaunchSpec {
-	return session.LaunchSpec{Args: []string{"agent", "focus", ref.Name}, Name: ref.Name, Action: "focus"}
+	return session.LaunchSpec{Args: []string{"agent", "focus", agentRef(ref.Name)}, Name: ref.Name, Action: "focus"}
 }
 
 // Sessions lists every live herd agent except the deck, as SessionRefs, so the
@@ -324,100 +358,49 @@ func currentPaneID() string {
 }
 
 // Send types text into the named session and submits it, without switching to
-// the pane. It writes the literal text with `agent send` (robust, addressed by
-// name), then presses Enter with `pane send-keys` — this pair works on Claude's
-// TUI panes, where `pane run` can fail opaquely. Used to fire a message (e.g.
-// "/triage") at a ticket's running Claude session from the deck.
+// the pane. Used to fire a message (e.g. "/triage") at a ticket's running Claude
+// session from the deck.
 func Send(agents []Agent, name, text string) (string, error) {
 	for _, a := range agents {
 		if strings.EqualFold(a.Name, name) {
-			return sendAndEnter(a.Name, a.PaneID, text)
+			return submit(a.Name, text)
 		}
 	}
 	return "", fmt.Errorf("no running session for %s", name)
 }
 
-// Submit timing. Claude's TUI drops an Enter that arrives while it is still
-// painting, and treats one coalesced into the same read as the pasted text as a
-// literal newline — either way the command lands in the prompt and never runs.
-// So sendAndEnter watches the pane instead of firing blind: wait for the typed
-// text to show up in the input box, then press Enter until the box clears.
-// Shortened by the tests.
+// Submitting. `agent prompt` is the trust-dialog guard as well as the typist:
+// herdr rejects a prompt at a blocked agent with agent_blocked before sending
+// anything, so a stray "/triage" cannot answer a dialog by pressing Enter at it.
+// Anything that submits by hand instead has to re-earn that.
 var (
-	typedTimeout   = 5 * time.Second        // wait for typed text to appear in the input box
-	submitTimeout  = 3 * time.Second        // wait for the box to clear after each Enter
-	promptTimeout  = 30 * time.Second       // wait for a fresh session to paint its input box
-	submitAttempts = 4                      // Enter presses before giving up
-	pollEvery      = 200 * time.Millisecond // pane re-read interval
+	readyTimeout = 60 * time.Second       // budget for a fresh session to paint its input box
+	pollEvery    = 200 * time.Millisecond // agent re-read interval
 )
 
-// waitForPrompt waits for an empty Claude input box to appear. herdr calls a
-// just-spawned agent "idle" within a second — long before Claude paints — so a
-// fresh session needs this on top of `agent wait` or the typed text lands in a
-// TUI that isn't reading stdin yet.
+// submit types text into the named agent and submits it, without switching to
+// its pane.
 //
-// It reports whether the pane is safe to type into. False means the box was
-// readable and stayed occupied for the whole budget — the trust prompt draws its
-// own "❯ 1. Yes…" line, and typing a command into that answers a dialog instead.
-// A pane we could never read returns true: there is nothing to judge, and one
-// blind Enter beats a `t` that silently stops working wherever herdr can't read.
-func waitForPrompt(name string) bool {
-	sawBox := false
-	empty := waitFor(promptTimeout, func() bool {
-		in, ok := promptInput(paneText(name))
-		sawBox = sawBox || ok
-		return ok && in == ""
-	})
-	return empty || !sawBox
+// --wait is deliberately omitted. It requires an observed working or blocked
+// state within 5s, and a slash command can finish inside that window: /cost at
+// an idle session returned agent_prompt_stalled for a prompt that had in fact
+// landed and run (2026-09-21).
+func submit(name, text string) (string, error) {
+	out, err := exec.Command(herdrBin, "agent", "prompt", agentRef(name), text).CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("agent prompt %s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	return "sent", nil
 }
 
-// sendAndEnter writes literal text to a named agent then submits it with Enter,
-// confirming against the pane that the text actually left the input box.
-func sendAndEnter(name, paneID, text string) (string, error) {
-	if out, err := exec.Command(herdrBin, "agent", "send", name, text).CombinedOutput(); err != nil {
-		return string(out), fmt.Errorf("agent send: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	if paneID == "" {
-		return "", fmt.Errorf("no pane id to submit %s", name)
-	}
-	// Don't press Enter until the text is on screen — an Enter that beats the
-	// text is the race this whole dance exists to avoid. If the pane is
-	// unreadable (no herdr read, a modal covering the box) this falls through and
-	// the single blind Enter below is the old behaviour.
-	typed := waitFor(typedTimeout, func() bool { return pending(paneText(name), text) })
-	for range submitAttempts {
-		out, err := exec.Command(herdrBin, "pane", "send-keys", paneID, "Enter").CombinedOutput()
-		if err != nil {
-			return string(out), fmt.Errorf("submit Enter: %w: %s", err, strings.TrimSpace(string(out)))
-		}
-		if !typed {
-			return "sent + Enter (unverified)", nil
-		}
-		// Success needs the box readable AND empty of our text. "No box in this
-		// frame" is not success: a swallowed Enter happens mid-paint, which is
-		// exactly when a read comes back without the input box, so accepting that
-		// as gone would report the failure this exists to catch as a submit.
-		last := boxUnknown
-		if waitFor(submitTimeout, func() bool {
-			last = readBox(paneText(name), text)
-			return last == boxSubmitted
-		}) {
-			return "sent + Enter", nil
-		}
-		if last == boxUnknown {
-			// The pane stopped being readable, so there is nothing left to judge
-			// against — say so rather than pressing Enter at a session we can no
-			// longer see.
-			return "sent + Enter (unverified)", nil
-		}
-	}
-	return "", fmt.Errorf("%s still sitting unsent in %s's prompt after %d Enters", text, name, submitAttempts)
-}
-
-// waitFor polls cond every pollEvery until it holds or the budget runs out.
-func waitFor(budget time.Duration, cond func() bool) bool {
-	for deadline := time.Now().Add(budget); ; time.Sleep(pollEvery) {
-		if cond() {
+// waitInteractive waits for a freshly started agent to be ready for input, and
+// reports whether it got there. herdr calls a just-spawned agent "idle" within a
+// second — long before Claude paints — so `agent wait` alone lands text in a TUI
+// that is not reading stdin yet. interactive_ready is the flag that tracks the
+// input box itself.
+func waitInteractive(name string) bool {
+	for deadline := time.Now().Add(readyTimeout); ; time.Sleep(pollEvery) {
+		if interactiveReady(name) {
 			return true
 		}
 		if time.Now().After(deadline) {
@@ -426,70 +409,23 @@ func waitFor(budget time.Duration, cond func() bool) bool {
 	}
 }
 
-// paneText returns the visible text of an agent's pane, "" if unreadable.
-func paneText(name string) string {
-	out, err := exec.Command(herdrBin, "agent", "read", name, "--source", "visible", "--format", "text").Output()
+// interactiveReady reads one agent's interactive_ready flag. An unreadable agent
+// is reported as not ready: waitInteractive's caller retries, and its timeout is
+// the backstop.
+func interactiveReady(name string) bool {
+	out, err := exec.Command(herdrBin, "agent", "get", agentRef(name)).Output()
 	if err != nil {
-		return ""
+		return false
 	}
 	var r struct {
 		Result struct {
-			Read struct {
-				Text string `json:"text"`
-			} `json:"read"`
+			Agent struct {
+				Ready bool `json:"interactive_ready"`
+			} `json:"agent"`
 		} `json:"result"`
 	}
-	if json.Unmarshal(out, &r) != nil {
-		return ""
-	}
-	return r.Result.Read.Text
+	return json.Unmarshal(out, &r) == nil && r.Result.Agent.Ready
 }
-
-// promptMarkerRE matches a Claude prompt line ("❯ /triage", "> hello", "❯").
-var promptMarkerRE = regexp.MustCompile(`^\s*[❯>]\s?(.*)$`)
-
-// promptInput returns what is sitting in Claude's input box, and whether a box
-// was found. The box is the LAST prompt line on screen — the ones above it are
-// the transcript's echoes of already-submitted messages.
-func promptInput(screen string) (string, bool) {
-	lines := strings.Split(screen, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		if m := promptMarkerRE.FindStringSubmatch(lines[i]); m != nil {
-			return strings.TrimSpace(m[1]), true
-		}
-	}
-	return "", false
-}
-
-// boxState is what one frame of the pane says about text we typed. The third
-// state is the point: "we couldn't see a box" has to be distinguishable from
-// "the box no longer holds it", or an unreadable frame reads as a submit.
-type boxState int
-
-const (
-	boxUnknown   boxState = iota // no input box in this frame — mid-paint, or a modal over it
-	boxPending                   // the text is still sitting in the box
-	boxSubmitted                 // the box is readable and the text has left it
-)
-
-// readBox classifies one frame. A half-painted box (input is a prefix of text)
-// and a box the user had already typed a draft into (text is somewhere inside
-// input) both still count as holding the text.
-func readBox(screen, text string) boxState {
-	input, ok := promptInput(screen)
-	switch {
-	case !ok:
-		return boxUnknown
-	case input == "":
-		return boxSubmitted
-	case strings.Contains(input, text) || strings.HasPrefix(text, input):
-		return boxPending
-	}
-	return boxSubmitted // the box holds something else, so ours went through
-}
-
-// pending reports whether text is still sitting unsent in the input box.
-func pending(screen, text string) bool { return readBox(screen, text) == boxPending }
 
 // Triage runs "/triage" against a ticket's session in the background, without
 // leaving the deck. If the session is already running it just submits /triage;
@@ -499,31 +435,22 @@ func pending(screen, text string) bool { return readBox(screen, text) == boxPend
 func Triage(agents []Agent, t session.Ticket, cwd string) (string, error) {
 	for _, a := range agents {
 		if strings.EqualFold(a.Name, t.Key) {
-			return sendAndEnter(a.Name, a.PaneID, "/triage")
+			return submit(a.Name, "/triage")
 		}
 	}
 	// Not running → start it in the background.
 	inner := claudeInner(t, cwd)
-	startArgs := append([]string{"agent", "start", t.Key, "--cwd", cwd, "--no-focus", "--"}, inner...)
-	startOut, err := exec.Command(herdrBin, startArgs...).CombinedOutput()
+	// Own tab from the start, and never steal focus from the deck.
+	_, startOut, err := startAgentPane(t.Key, cwd, session.TabLabel(t), inner, false)
 	if err != nil {
-		return string(startOut), fmt.Errorf("agent start: %w: %s", err, strings.TrimSpace(string(startOut)))
-	}
-	paneID := parsePaneID(startOut)
-	if paneID == "" {
-		return string(startOut), fmt.Errorf("could not parse pane id from agent start")
-	}
-	// Own tab, but do not steal focus from the deck.
-	if out, err := exec.Command(herdrBin, "pane", "move", paneID, "--new-tab", "--label", session.TabLabel(t)).CombinedOutput(); err != nil {
-		return string(out), fmt.Errorf("pane move: %w: %s", err, strings.TrimSpace(string(out)))
+		return startOut, err
 	}
 	// Wait until Claude is up and its prompt is painted, then submit /triage.
-	_ = exec.Command(herdrBin, "agent", "wait", t.Key, "--status", "idle", "--timeout", "60000").Run()
-	if !waitForPrompt(t.Key) {
+	if !waitInteractive(t.Key) {
 		focusDeck(agents)
-		return "", fmt.Errorf("%s has a prompt of its own open (trust dialog?) — clear it in its tab, then triage again", t.Key)
+		return "", fmt.Errorf("%s did not finish starting within %s — open its tab to see what it is waiting on, then triage again", t.Key, readyTimeout)
 	}
-	out, err := sendAndEnter(t.Key, paneID, "/triage")
+	out, err := submit(t.Key, "/triage")
 	// Make sure focus is back on the deck regardless of what the new tab did.
 	focusDeck(agents)
 	if err != nil {
@@ -574,17 +501,11 @@ func Run(spec session.LaunchSpec) (string, error) {
 	if len(inner) == 0 {
 		return "", fmt.Errorf("no inner command in launch spec for %s", spec.Name)
 	}
-	startArgs := append([]string{"agent", "start", spec.Name, "--cwd", spec.Cwd, "--no-focus", "--"}, inner...)
-	startOut, err := exec.Command(herdrBin, startArgs...).CombinedOutput()
+	paneID, runOut, err := startAgentPane(spec.Name, spec.Cwd, spec.Label, inner, true)
 	if err != nil {
-		return string(startOut), fmt.Errorf("agent start: %w", err)
+		return runOut, err
 	}
-	paneID := parsePaneID(startOut)
-	if paneID == "" {
-		return string(startOut), fmt.Errorf("could not parse pane id from agent start output")
-	}
-	moveOut, err := exec.Command(herdrBin, "pane", "move", paneID, "--new-tab", "--focus", "--label", spec.Label).CombinedOutput()
-	return "start " + paneID + " → new tab: " + string(moveOut), err
+	return "start " + paneID + " → new tab: " + runOut, nil
 }
 
 // innerArgv returns the command after the first "--" in a herd spec's args.
@@ -595,6 +516,58 @@ func innerArgv(args []string) []string {
 		}
 	}
 	return nil
+}
+
+// parseRootPaneID reads the pane id out of `tab create`/`workspace create` output.
+func parseRootPaneID(b []byte) string {
+	var r struct {
+		Result struct {
+			RootPane struct {
+				PaneID string `json:"pane_id"`
+			} `json:"root_pane"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(b, &r) == nil {
+		return r.Result.RootPane.PaneID
+	}
+	return ""
+}
+
+// startAgentPane opens a new tab at cwd and runs inner in it, returning the pane id.
+//
+// Two calls, because `agent start` attaches an agent KIND to a pane that already
+// exists — it cannot make one, and it has no --cwd. The second call is not
+// plumbing: it is what registers the name, and the name is how the deck matches a
+// live pane back to its ticket. Run the same argv through `pane run` instead and
+// the pane is nameless, so the ticket reads as "resumable" while its session is
+// in fact running.
+func startAgentPane(name, cwd, label string, inner []string, focus bool) (string, string, error) {
+	args := []string{"tab", "create", "--cwd", cwd}
+	if label != "" {
+		args = append(args, "--label", label)
+	}
+	if focus {
+		args = append(args, "--focus")
+	} else {
+		args = append(args, "--no-focus")
+	}
+	out, err := exec.Command(herdrBin, args...).CombinedOutput()
+	if err != nil {
+		return "", string(out), fmt.Errorf("tab create: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	pane := parseRootPaneID(out)
+	if pane == "" {
+		return "", string(out), fmt.Errorf("could not parse pane id from tab create output")
+	}
+	startArgs := []string{"agent", "start", agentRef(name), "--kind", inner[0], "--pane", pane, "--timeout", "120000"}
+	if len(inner) > 1 {
+		startArgs = append(append(startArgs, "--"), inner[1:]...)
+	}
+	runOut, err := exec.Command(herdrBin, startArgs...).CombinedOutput()
+	if err != nil {
+		return pane, string(runOut), fmt.Errorf("agent start: %w: %s", err, strings.TrimSpace(string(runOut)))
+	}
+	return pane, string(runOut), nil
 }
 
 func parsePaneID(b []byte) string {

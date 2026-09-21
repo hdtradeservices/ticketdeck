@@ -3,7 +3,6 @@ package herd
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -162,7 +161,8 @@ func TestPlanFocusesExistingAgent(t *testing.T) {
 	}
 	cmd := Bin() + " " + strings.Join(spec.Args, " ")
 	t.Logf("herdr focus command: %s", cmd)
-	if cmd != "herdr agent focus ZEN-3175" {
+	// herdr 0.9 only accepts lowercase agent names; the deck still shows ZEN-3175.
+	if cmd != "herdr agent focus zen-3175" {
 		t.Errorf("unexpected focus command: %s", cmd)
 	}
 	if spec.Cwd != "/home/matthew/Repos/walmart" {
@@ -170,90 +170,14 @@ func TestPlanFocusesExistingAgent(t *testing.T) {
 	}
 }
 
-// stuckScreen is a real capture of the bug: `t` typed /triage into the session,
-// the slash-command menu opened, and the Enter never submitted it. Note the
-// earlier "❯ hello there" — the transcript echo of a message that DID submit.
-const stuckScreen = `❯ hello there
-
-● Hey Matt — what are we working on?
-
-  /triage        Routes a Linear issue to /investigate, /plan, /zeus…
-  /babysit       Drives a PR to merge-ready: resolves conflicts, triages…
-────────────────────────────────────────────
-❯ /triage
-────────────────────────────────────────────
-  Opus 5 1M | Repos | 0/1m (0%) | effort: high
-  -- INSERT -- ⏵⏵ bypass permissions on`
-
-// submittedScreen is the same pane one Enter later: the box is empty again and
-// /triage has moved into the transcript.
-const submittedScreen = `❯ hello there
-
-● Hey Matt — what are we working on?
-
-❯ /triage
-
-● I'll triage ZEN-3751.
-────────────────────────────────────────────
-❯
-────────────────────────────────────────────
-  Opus 5 1M | Repos | 0/1m (0%) | effort: high`
-
-func TestPendingDetectsUnsentPrompt(t *testing.T) {
-	if !pending(stuckScreen, "/triage") {
-		t.Error("stuck screen: /triage is still in the input box, want pending")
-	}
-	if pending(submittedScreen, "/triage") {
-		t.Error("submitted screen: input box is empty, want not pending")
-	}
-	// Half-painted box: only the first characters have landed.
-	if !pending("────\n❯ /tri\n────\n  Opus 5", "/triage") {
-		t.Error("half-painted box should count as pending")
-	}
-	// A modal covering the input box leaves nothing to press Enter at.
-	if pending("   Help  General  Commands\n\n   Esc to cancel", "/triage") {
-		t.Error("no input box on screen, want not pending")
-	}
-}
-
-func TestPromptInputTakesTheLastPromptLine(t *testing.T) {
-	in, ok := promptInput(stuckScreen)
-	if !ok || in != "/triage" {
-		t.Errorf("promptInput = (%q, %v), want (\"/triage\", true)", in, ok)
-	}
-	if in, ok := promptInput(submittedScreen); !ok || in != "" {
-		t.Errorf("promptInput = (%q, %v), want (\"\", true)", in, ok)
-	}
-	if _, ok := promptInput("no prompt here"); ok {
-		t.Error("promptInput found a box where there is none")
-	}
-}
-
-// fakeHerdr installs a stub `herdr` on herdrBin that answers the three calls
-// sendAndEnter makes. `agent read` reports the typed text still sitting in the
-// prompt until clearAfter Enters have arrived — clearAfter=1 is a TUI that
-// submits on the first Enter, 2 is the bug. Returns the path counting Enters.
-func fakeHerdr(t *testing.T, text string, clearAfter int) (enters func() int) {
-	t.Helper()
-	return fakeHerdrScript(t, fmt.Sprintf(`
-n=$(cat %%[1]s 2>/dev/null || echo 0)
-case "$1 $2" in
-  "agent send") exit 0 ;;
-  "pane send-keys") echo $((n+1)) > %%[1]s; exit 0 ;;
-  "agent read")
-    if [ "$n" -ge %d ]; then box=""; else box=" %s"; fi
-    printf '{"result":{"read":{"text":"----\\n❯%%%%s\\n----\\n  Opus 5 1M"}}}' "$box" ;;
-esac
-`, clearAfter, text))
-}
-
-// fakeHerdrScript installs an arbitrary stub `herdr` on herdrBin. The script is
-// a fmt template whose %[1]s is a scratch file the stub counts Enters in.
-func fakeHerdrScript(t *testing.T, script string) (enters func() int) {
+// fakeHerdrScript installs a stub `herdr` on herdrBin. The script is a fmt
+// template whose %[1]s is a scratch file; the returned closure reads it back, so
+// a stub can log the argv it was called with or count its own invocations.
+func fakeHerdrScript(t *testing.T, script string) (scratch func() string) {
 	t.Helper()
 	dir := t.TempDir()
-	counter := dir + "/enters"
-	script = "#!/bin/sh" + fmt.Sprintf(script, counter)
+	file := dir + "/scratch"
+	script = "#!/bin/sh" + fmt.Sprintf(script, file)
 
 	path := dir + "/herdr"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
@@ -262,152 +186,100 @@ func fakeHerdrScript(t *testing.T, script string) (enters func() int) {
 	old := herdrBin
 	herdrBin = path
 	t.Cleanup(func() { herdrBin = old })
-	return func() int {
-		b, err := os.ReadFile(counter)
+	return func() string {
+		b, err := os.ReadFile(file)
 		if err != nil {
-			return 0
+			return ""
 		}
-		n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
-		return n
+		return strings.TrimSpace(string(b))
 	}
 }
 
-// fastPolls shrinks the pane-watching timeouts so the retry tests don't sleep.
+// fastPolls shrinks the readiness budget so the waiting tests don't sleep.
 func fastPolls(t *testing.T) {
 	t.Helper()
-	old := []time.Duration{typedTimeout, submitTimeout, promptTimeout, pollEvery}
-	typedTimeout, submitTimeout, promptTimeout, pollEvery = 300*time.Millisecond, 200*time.Millisecond, 300*time.Millisecond, 10*time.Millisecond
-	t.Cleanup(func() {
-		typedTimeout, submitTimeout, promptTimeout, pollEvery = old[0], old[1], old[2], old[3]
-	})
+	oldReady, oldPoll := readyTimeout, pollEvery
+	readyTimeout, pollEvery = 300*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { readyTimeout, pollEvery = oldReady, oldPoll })
 }
 
-func TestSendAndEnterRetriesSwallowedEnter(t *testing.T) {
-	fastPolls(t)
-	enters := fakeHerdr(t, "/triage", 2) // first Enter is swallowed
-	res, err := sendAndEnter("ZEN-3751", "w1:pE", "/triage")
-	if err != nil {
-		t.Fatalf("sendAndEnter: %v", err)
-	}
-	if res != "sent + Enter" {
-		t.Errorf("result = %q, want %q", res, "sent + Enter")
-	}
-	if got := enters(); got != 2 {
-		t.Errorf("pressed Enter %d times, want 2 (one swallowed, one that landed)", got)
-	}
-}
-
-func TestSendAndEnterStopsAtOneEnterWhenItLands(t *testing.T) {
-	fastPolls(t)
-	enters := fakeHerdr(t, "/triage", 1)
-	if _, err := sendAndEnter("ZEN-3751", "w1:pE", "/triage"); err != nil {
-		t.Fatalf("sendAndEnter: %v", err)
-	}
-	if got := enters(); got != 1 {
-		t.Errorf("pressed Enter %d times, want 1", got)
-	}
-}
-
-func TestSendAndEnterGivesUpLoudly(t *testing.T) {
-	fastPolls(t)
-	enters := fakeHerdr(t, "/triage", 99) // a prompt that never clears
-	_, err := sendAndEnter("ZEN-3751", "w1:pE", "/triage")
-	if err == nil {
-		t.Fatal("want an error when /triage never leaves the prompt")
-	}
-	if !strings.Contains(err.Error(), "unsent") {
-		t.Errorf("error should say the text is unsent, got: %v", err)
-	}
-	if got := enters(); got != submitAttempts {
-		t.Errorf("pressed Enter %d times, want %d", got, submitAttempts)
-	}
-}
-
-// A read that comes back without an input box says nothing about whether the
-// Enter landed, and mid-paint — exactly when an Enter gets swallowed — is when
-// that is most likely. Treating it as "the text is gone" would report the stuck
-// case as a submit, so it reports unverified and stops pressing keys at a pane it
-// can no longer see.
-func TestSendAndEnterDoesNotCallAnUnreadablePaneASubmit(t *testing.T) {
-	fastPolls(t)
-	enters := fakeHerdrScript(t, `
-n=$(cat %[1]s 2>/dev/null || echo 0)
-case "$1 $2" in
-  "agent send") exit 0 ;;
-  "pane send-keys") echo $((n+1)) > %[1]s; exit 0 ;;
-  "agent read")
-    if [ "$n" -ge 1 ]; then exit 1; fi
-    printf '{"result":{"read":{"text":"----\\n❯ /triage\\n----\\n  Opus 5 1M"}}}' ;;
-esac
+// herdr 0.9 only accepts lowercase agent names, and `agent prompt` is one call:
+// the deck no longer types the text and presses Enter itself.
+func TestSubmitPromptsByLowercaseName(t *testing.T) {
+	log := fakeHerdrScript(t, `
+echo "$@" >> %[1]s
 `)
-	res, err := sendAndEnter("ZEN-3751", "w1:pE", "/triage")
-	if err != nil {
-		t.Fatalf("sendAndEnter: %v", err)
+	if _, err := submit("ZEN-3751", "/triage"); err != nil {
+		t.Fatalf("submit: %v", err)
 	}
-	if !strings.Contains(res, "unverified") {
-		t.Errorf("result = %q, want it flagged unverified", res)
-	}
-	if got := enters(); got != 1 {
-		t.Errorf("pressed Enter %d times, want 1 — no point keying a pane we can't read", got)
+	if got := log(); got != "agent prompt zen-3751 /triage" {
+		t.Errorf("submit ran %q, want \"agent prompt zen-3751 /triage\"", got)
 	}
 }
 
-func TestReadBoxSeparatesUnknownFromSubmitted(t *testing.T) {
-	if got := readBox("   Help  General\n\n   Esc to cancel", "/triage"); got != boxUnknown {
-		t.Errorf("no box on screen = %v, want boxUnknown", got)
+// herdr refuses to prompt a blocked agent, which is what stops a /triage
+// answering a trust dialog. That refusal has to reach the deck's error line
+// rather than being reported as a send.
+func TestSubmitSurfacesHerdrRefusal(t *testing.T) {
+	fakeHerdrScript(t, `
+: %[1]s
+printf '{"error":{"code":"agent_blocked","message":"agent is blocked"}}'
+exit 1
+`)
+	_, err := submit("ZEN-3751", "/triage")
+	if err == nil {
+		t.Fatal("submit reported success for a refused prompt")
 	}
-	if got := readBox(submittedScreen, "/triage"); got != boxSubmitted {
-		t.Errorf("empty box = %v, want boxSubmitted", got)
-	}
-	if got := readBox(stuckScreen, "/triage"); got != boxPending {
-		t.Errorf("text still in the box = %v, want boxPending", got)
-	}
-	if got := readBox("----\n❯ something the user typed\n----", "/triage"); got != boxSubmitted {
-		t.Errorf("box holding other text = %v, want boxSubmitted", got)
+	if !strings.Contains(err.Error(), "agent_blocked") {
+		t.Errorf("error %q drops herdr's reason", err)
 	}
 }
 
-// fakeScreen serves one fixed pane body for every `agent read`, so a caller can
-// be pointed at a specific TUI state (a trust dialog, an unreadable pane).
-func fakeScreen(t *testing.T, body string) {
-	t.Helper()
-	dir := t.TempDir()
-	script := "#!/bin/sh\ncase \"$1 $2\" in\n  \"agent read\") " + body + " ;;\nesac\n"
-	path := dir + "/herdr"
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	old := herdrBin
-	herdrBin = path
-	t.Cleanup(func() { herdrBin = old })
-}
-
-// A cold session sitting on Claude's trust prompt has an input box, and it is
-// not ours to type into: "/triage" there answers the dialog. The wait has to
-// report that rather than proceeding once its budget runs out.
-func TestWaitForPromptRefusesAnOccupiedBox(t *testing.T) {
+// herdr calls a just-spawned agent "idle" long before Claude paints its input
+// box, so the wait watches interactive_ready instead.
+func TestWaitInteractiveWaitsForTheInputBox(t *testing.T) {
 	fastPolls(t)
-	fakeScreen(t, `printf '{"result":{"read":{"text":"Do you trust this folder?\\n❯ 1. Yes, proceed\\n  2. No"}}}'`)
-	if waitForPrompt("ZEN-3751") {
-		t.Error("a box occupied for the whole budget is not safe to type into")
+	calls := fakeHerdrScript(t, `
+n=$(cat %[1]s 2>/dev/null || echo 0)
+n=$((n + 1))
+echo $n > %[1]s
+if [ $n -lt 3 ]; then
+  printf '{"result":{"agent":{"interactive_ready":false}}}'
+else
+  printf '{"result":{"agent":{"interactive_ready":true}}}'
+fi
+`)
+	if !waitInteractive("ZEN-3751") {
+		t.Fatal("waitInteractive gave up on an agent that became ready")
+	}
+	if calls() != "3" {
+		t.Errorf("polled %s times, want 3", calls())
 	}
 }
 
-// A pane herdr can't read tells us nothing, and refusing there would mean `t`
-// silently stops working. Fall through to the blind path instead.
-func TestWaitForPromptAllowsAnUnreadablePane(t *testing.T) {
+// A session stuck on a trust dialog never reports ready. The wait has to run out
+// and say so, rather than typing /triage at the dialog.
+func TestWaitInteractiveGivesUpOnASessionThatNeverPaints(t *testing.T) {
 	fastPolls(t)
-	fakeScreen(t, "exit 1")
-	if !waitForPrompt("ZEN-3751") {
-		t.Error("an unreadable pane should not block the submit")
+	fakeHerdrScript(t, `
+: %[1]s
+printf '{"result":{"agent":{"interactive_ready":false}}}'
+`)
+	if waitInteractive("ZEN-3751") {
+		t.Error("waitInteractive called a session that never painted ready")
 	}
 }
 
-func TestWaitForPromptAcceptsAnEmptyBox(t *testing.T) {
+// An agent herdr can't read is not ready either — a stub that errors must not
+// read as a green light.
+func TestWaitInteractiveTreatsAnUnreadableAgentAsNotReady(t *testing.T) {
 	fastPolls(t)
-	fakeScreen(t, `printf '{"result":{"read":{"text":"----\\n❯\\n----"}}}'`)
-	if !waitForPrompt("ZEN-3751") {
-		t.Error("an empty prompt box is exactly what this waits for")
+	fakeHerdrScript(t, `
+: %[1]s
+exit 1
+`)
+	if waitInteractive("ZEN-3751") {
+		t.Error("waitInteractive treated an unreadable agent as ready")
 	}
 }
 

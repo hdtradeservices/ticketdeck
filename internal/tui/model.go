@@ -112,6 +112,11 @@ const refreshEvery = 60 * time.Second
 // the rate-limited Linear API.
 const statusRefreshEvery = 3 * time.Second
 
+// finishedIdleGrace is how long a session must sit idle, after its ticket went
+// Done outside the deck, before the deck closes it. Idle also means "between
+// turns", so a short grace would close a session someone is still talking to.
+const finishedIdleGrace = 10 * time.Minute
+
 // triageCmd is the message the `t` hotkey sends to the highlighted session.
 const triageCmd = "/triage"
 
@@ -279,6 +284,7 @@ type Model struct {
 	backend       Backend
 	sessions      map[string]session.Status   // ticket key → session status
 	statusSince   map[string]time.Time        // ticket key → when its current status was first seen
+	closeOnIdle   map[string]bool             // tickets that went Done off-deck, their session to close once idle
 	owners        map[string]account.Owner    // ticket key → which subscription runs its session
 	ownerCol      int                         // width of the account column (0 = one account, nothing to label)
 	otherSessions []session.SessionRef        // live sessions not tied to a visible ticket
@@ -350,7 +356,7 @@ type demoOwner interface {
 }
 
 func New(f Fetcher, root string, dry bool, backend Backend) Model {
-	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, inView: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, projExpanded: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != "", comments: map[string][]linear.Comment{}, commentsErr: map[string]error{}, commentsBusy: map[string]bool{}}
+	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, inView: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, closeOnIdle: map[string]bool{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, projExpanded: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != "", comments: map[string][]linear.Comment{}, commentsErr: map[string]error{}, commentsBusy: map[string]bool{}}
 	// Resolved once, not per frame: All() globs the filesystem, and View runs on
 	// every keystroke.
 	m.acct = account.Current()
@@ -698,7 +704,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = nil
 		m.lastSync = time.Now()
+		prev := m.allIssues
 		m.rebuild(msg.issues)
+		m.queueFinishedCloses(prev, msg.issues)
 		return m, tea.Batch(m.refreshStatuses(), m.refreshSessions())
 
 	case projectsMsg:
@@ -767,6 +775,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.sessions = msg.statuses
+			return m, m.closeIdleFinished(now)
 		}
 
 	case sessionsMsg:
@@ -1562,6 +1571,59 @@ func isTerminalTarget(target string) bool {
 // opposed to a resumable-on-disk, completed, or absent one).
 func isRunning(st session.Status) bool {
 	return st == session.Working || st == session.Idle || st == session.NeedsInput
+}
+
+// finishedTicket reports whether a ticket's work is over: Done, but not the
+// Validate gate, which is completed-type yet still active.
+func finishedTicket(is linear.Issue) bool { return is.IsDone() && !is.IsValidate() }
+
+// queueFinishedCloses marks the tickets that went Done between two Linear
+// refreshes — moved by a skill or in Linear rather than from the deck, which
+// closes its own moves at once — so their sessions close once idle. Only a
+// transition counts: a ticket already Done at the first refresh may have been
+// reopened in chat on purpose.
+func (m *Model) queueFinishedCloses(prev, next []linear.Issue) {
+	wasFinished := make(map[string]bool, len(prev))
+	for _, is := range prev {
+		wasFinished[is.Identifier] = finishedTicket(is)
+	}
+	nowFinished := make(map[string]bool, len(next))
+	for _, is := range next {
+		nowFinished[is.Identifier] = finishedTicket(is)
+		if done, seen := wasFinished[is.Identifier]; seen && !done && finishedTicket(is) {
+			m.closeOnIdle[is.Identifier] = true
+		}
+	}
+	for k := range m.closeOnIdle {
+		if !nowFinished[k] { // reopened before its session idled
+			delete(m.closeOnIdle, k)
+		}
+	}
+}
+
+// closeIdleFinished closes the queued sessions that have been idle for
+// finishedIdleGrace. A working or blocked session is still finishing its last
+// turn or waiting on an answer, so it stays queued; one no longer running
+// leaves the queue.
+func (m Model) closeIdleFinished(now time.Time) tea.Cmd {
+	var cmds []tea.Cmd
+	for key := range m.closeOnIdle {
+		switch st := m.sessions[key]; {
+		case st == session.Idle:
+			if now.Sub(m.statusSince[key]) < finishedIdleGrace {
+				continue
+			}
+			delete(m.closeOnIdle, key)
+			key, backend := key, m.backend
+			cmds = append(cmds, func() tea.Msg {
+				out, err := backend.CloseByName(key)
+				return detachedDoneMsg{action: "closed " + key + " (done)", err: err, output: strings.TrimSpace(out)}
+			})
+		case !isRunning(st):
+			delete(m.closeOnIdle, key)
+		}
+	}
+	return tea.Batch(cmds...)
 }
 
 // fetchUsers loads workspace users for the assignee picker (once, then cached).

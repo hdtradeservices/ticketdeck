@@ -508,6 +508,101 @@ func TestTerminalMoveClosesRunningSession(t *testing.T) {
 	}
 }
 
+// withState returns fixture() with ticket key moved to the given state.
+func withState(key, name, typ string) []linear.Issue {
+	issues := fixture()
+	for i := range issues {
+		if issues[i].Identifier == key {
+			issues[i].StateName, issues[i].StateType = name, typ
+			issues[i].CompletedAt = time.Now()
+		}
+	}
+	return issues
+}
+
+// statusAt feeds a statusesMsg reporting key as st, then backdates the idle
+// timer by ago and polls again, returning the commands both polls produced.
+func statusAt(t *testing.T, m Model, key string, st session.Status, ago time.Duration) (Model, tea.Cmd) {
+	t.Helper()
+	next, first := m.Update(statusesMsg{statuses: map[string]session.Status{key: st}})
+	m = next.(Model)
+	m.statusSince[key] = time.Now().Add(-ago)
+	next, second := m.Update(statusesMsg{statuses: map[string]session.Status{key: st}})
+	return next.(Model), tea.Batch(first, second)
+}
+
+func TestOffDeckDoneClosesSessionOnceIdle(t *testing.T) {
+	// ZEN-9 goes Validate → Done in Linear (a skill moved it, not the deck).
+	rec := &recBackend{}
+	m := New(fakeFetcher{fixture()}, "", true, rec)
+	next, _ := m.Update(refreshedMsg{issues: withState("ZEN-9", "Validate", "completed")})
+	next, _ = next.(Model).Update(refreshedMsg{issues: withState("ZEN-9", "Done", "completed")})
+	m = next.(Model)
+	if !m.closeOnIdle["ZEN-9"] {
+		t.Fatal("a Validate → Done transition should queue ZEN-9's session")
+	}
+
+	// Still working its last turn: left alone.
+	m, cmd := statusAt(t, m, "ZEN-9", session.Working, time.Hour)
+	runCmd(cmd)
+	if rec.closedByName != "" {
+		t.Fatalf("a working session must not close, got %q", rec.closedByName)
+	}
+
+	// Idle, but inside the grace: someone may be mid-conversation.
+	m, cmd = statusAt(t, m, "ZEN-9", session.Idle, time.Minute)
+	runCmd(cmd)
+	if rec.closedByName != "" {
+		t.Fatalf("an idle session inside the grace must not close, got %q", rec.closedByName)
+	}
+
+	// Idle past the grace, but the Linear list is stale (the deck was out of
+	// view): the ticket may have been reopened since, so wait for a refresh.
+	m.lastSync = time.Now().Add(-refreshEvery - time.Minute)
+	m, cmd = statusAt(t, m, "ZEN-9", session.Idle, finishedIdleGrace+time.Minute)
+	runCmd(cmd)
+	if rec.closedByName != "" {
+		t.Fatalf("a stale Linear list must not close a session, got %q", rec.closedByName)
+	}
+	m.lastSync = time.Now()
+
+	// Idle past the grace: closed, and dequeued.
+	m, cmd = statusAt(t, m, "ZEN-9", session.Idle, finishedIdleGrace+time.Minute)
+	runCmd(cmd)
+	if rec.closedByName != "ZEN-9" {
+		t.Fatalf("an idle session past the grace should close, got %q", rec.closedByName)
+	}
+	if m.closeOnIdle["ZEN-9"] {
+		t.Error("a closed session should leave the queue")
+	}
+}
+
+func TestOffDeckDoneSkipsWhatIsNotATransition(t *testing.T) {
+	m := New(fakeFetcher{fixture()}, "", true, &recBackend{})
+
+	// Already Done at the first refresh: it may have been reopened on purpose.
+	next, _ := m.Update(refreshedMsg{issues: withState("ZEN-9", "Done", "completed")})
+	m = next.(Model)
+	if len(m.closeOnIdle) != 0 {
+		t.Fatalf("no transition was seen, queue = %v", m.closeOnIdle)
+	}
+
+	// Into Validate is not finished.
+	next, _ = m.Update(refreshedMsg{issues: fixture()})
+	next, _ = next.(Model).Update(refreshedMsg{issues: withState("ZEN-9", "Validate", "completed")})
+	m = next.(Model)
+	if m.closeOnIdle["ZEN-9"] {
+		t.Fatal("Validate must not queue a close")
+	}
+
+	// Done, then reopened before the session idled: dequeued.
+	next, _ = m.Update(refreshedMsg{issues: withState("ZEN-9", "Done", "completed")})
+	next, _ = next.(Model).Update(refreshedMsg{issues: fixture()})
+	if next.(Model).closeOnIdle["ZEN-9"] {
+		t.Error("a reopened ticket should leave the queue")
+	}
+}
+
 // runCmd executes a tea.Cmd, fanning out tea.BatchMsg results so nested
 // commands (e.g. the close cmd batched with refreshes) actually run.
 func runCmd(cmd tea.Cmd) {

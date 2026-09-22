@@ -1606,6 +1606,12 @@ func (m *Model) queueFinishedCloses(prev, next []linear.Issue) {
 // turn or waiting on an answer, so it stays queued; one no longer running
 // leaves the queue.
 func (m Model) closeIdleFinished(now time.Time) tea.Cmd {
+	// The queue is only as current as the last Linear refresh, and those pause
+	// while the deck is out of view though this poll does not. Closing on a stale
+	// list would close a ticket someone reopened in the meantime.
+	if m.linearStale(now) {
+		return nil
+	}
 	var cmds []tea.Cmd
 	for key := range m.closeOnIdle {
 		switch st := m.sessions[key]; {

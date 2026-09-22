@@ -521,14 +521,14 @@ func withState(key, name, typ string) []linear.Issue {
 }
 
 // statusAt feeds a statusesMsg reporting key as st, then backdates the idle
-// timer by ago and polls again, returning the command that second poll produced.
+// timer by ago and polls again, returning the commands both polls produced.
 func statusAt(t *testing.T, m Model, key string, st session.Status, ago time.Duration) (Model, tea.Cmd) {
 	t.Helper()
-	next, _ := m.Update(statusesMsg{statuses: map[string]session.Status{key: st}})
+	next, first := m.Update(statusesMsg{statuses: map[string]session.Status{key: st}})
 	m = next.(Model)
 	m.statusSince[key] = time.Now().Add(-ago)
-	next, cmd := m.Update(statusesMsg{statuses: map[string]session.Status{key: st}})
-	return next.(Model), cmd
+	next, second := m.Update(statusesMsg{statuses: map[string]session.Status{key: st}})
+	return next.(Model), tea.Batch(first, second)
 }
 
 func TestOffDeckDoneClosesSessionOnceIdle(t *testing.T) {
@@ -555,6 +555,16 @@ func TestOffDeckDoneClosesSessionOnceIdle(t *testing.T) {
 	if rec.closedByName != "" {
 		t.Fatalf("an idle session inside the grace must not close, got %q", rec.closedByName)
 	}
+
+	// Idle past the grace, but the Linear list is stale (the deck was out of
+	// view): the ticket may have been reopened since, so wait for a refresh.
+	m.lastSync = time.Now().Add(-refreshEvery - time.Minute)
+	m, cmd = statusAt(t, m, "ZEN-9", session.Idle, finishedIdleGrace+time.Minute)
+	runCmd(cmd)
+	if rec.closedByName != "" {
+		t.Fatalf("a stale Linear list must not close a session, got %q", rec.closedByName)
+	}
+	m.lastSync = time.Now()
 
 	// Idle past the grace: closed, and dequeued.
 	m, cmd = statusAt(t, m, "ZEN-9", session.Idle, finishedIdleGrace+time.Minute)

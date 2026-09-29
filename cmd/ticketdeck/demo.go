@@ -87,6 +87,7 @@ func (demoFetcher) DemoSessions() map[string]session.Status {
 		"DEMO-102":      session.NeedsInput,
 		"DEMO-106":      session.Completed,
 		"DEMO-104":      session.Stopped,
+		"DEMO-105":      session.Background,
 		"proj-demo0001": session.Working,
 		"proj-demo0003": session.Stopped,
 		// DEMO-103 is deliberately absent: its session runs on another deck, which

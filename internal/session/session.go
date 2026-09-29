@@ -25,11 +25,12 @@ const (
 	Idle                     // running, attached-idle (nothing in flight)
 	Completed                // finished (state=done); resumable
 	Stopped                  // exists but not running and not done; resumable
+	Background               // running, lead idle, a shell command or monitor still going
 )
 
 // Running reports whether a session process is live (attach, don't fork).
 func (s Status) Running() bool {
-	return s == Working || s == NeedsInput || s == Idle
+	return s == Working || s == NeedsInput || s == Idle || s == Background
 }
 
 // resumable reports whether a stopped session can be reopened from disk.

@@ -1265,6 +1265,8 @@ func statusPhrase(s session.Status) string {
 		return "waiting on input"
 	case session.Idle:
 		return "idle"
+	case session.Background:
+		return "idle, with a background task running"
 	default:
 		_, label, _ := sessionStyle(s)
 		return label
@@ -1570,7 +1572,7 @@ func isTerminalTarget(target string) bool {
 // isRunning reports whether a session status corresponds to a live agent (as
 // opposed to a resumable-on-disk, completed, or absent one).
 func isRunning(st session.Status) bool {
-	return st == session.Working || st == session.Idle || st == session.NeedsInput
+	return st.Running()
 }
 
 // finishedTicket reports whether a ticket's work is over: Done, but not the
@@ -3171,6 +3173,8 @@ func sessionStyle(s session.Status) (glyph, label string, color lipgloss.Color) 
 		return "◆", "needs input", lipgloss.Color("214") // amber
 	case session.Idle:
 		return "○", "idle", lipgloss.Color("81") // cyan
+	case session.Background:
+		return "◐", "background", lipgloss.Color("141") // lavender
 	case session.Completed:
 		return "✓", "done", lipgloss.Color("71") // muted green
 	case session.Stopped:

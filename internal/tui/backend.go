@@ -60,6 +60,7 @@ func (ClaudeBackend) Statuses(keys []string, cwd string) (map[string]session.Sta
 	}
 	res := session.Statuses(keys, infos)
 	session.MarkResumable(res, cwd)
+	session.MarkBackground(res, cwd)
 	return res, nil
 }
 
@@ -132,6 +133,7 @@ func (HerdBackend) Statuses(keys []string, cwd string) (map[string]session.Statu
 	// herdr only lists running agents; a fresh server has none. Surface earlier
 	// sessions still on disk as resumable so the badges aren't all blank.
 	session.MarkResumable(res, cwd)
+	session.MarkBackground(res, cwd)
 	return res, nil
 }
 

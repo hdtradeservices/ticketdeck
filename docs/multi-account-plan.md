@@ -4,7 +4,57 @@ A plan to run all your Claude subscriptions from a single TicketDeck session:
 each ticket opens under whichever account has room, sessions move between
 accounts without leaving the deck, and you never launch a second deck to switch.
 
-Status: proposal, not built. Written 2026-09-09.
+Status: **built** (2026-10-22). Written 2026-09-09 as a proposal; the section
+below records where the build differs from it and why. The rest of the document
+is the plan as written.
+
+## What shipped, and where it differs
+
+All four phases shipped together, plus automatic moves. What changed on the
+way, mostly from running it against real accounts and a real herdr:
+
+- **The account rides on the tab, not on an `env` prefix.** herdr 0.9's
+  `tab create --env KEY=VALUE` gives a pane its own environment, and `agent
+  start` still registers the session's name. The `env -u … claude` prefix
+  would have needed `pane run`, which leaves the pane nameless.
+- **The deck's own account inherits; it is never named.** Claude Code reads
+  `~/.claude.json` while `CLAUDE_CONFIG_DIR` is unset, but
+  `$CLAUDE_CONFIG_DIR/.claude.json` once it is set — even to `~/.claude`. On
+  one machine (2026-10-21) the two files held 17 and 5 projects, and only the
+  first trusted `~/Repos`, so naming the primary account's dir sent a moved
+  session to a folder-trust prompt. A session on the deck's own account gets
+  the deck's environment unchanged.
+- **Ownership comes from each account's live-session registry**
+  (`<config dir>/sessions/<pid>.json`), which maps a running claude to its
+  session id and account; `/proc/<pid>/environ` then names its herdr pane. A
+  scratch session is a bare `claude` with no id on its command line, and herdr
+  only knows a session's id when that account has herdr's hook, so neither of
+  the plan's sources was enough on its own. One poll (`internal/fleet`) now
+  answers ownership, status and the Other sessions list together.
+- **The router ranks by the tighter window**, not by 5-hour then 7-day:
+  `support` at 9%/44% outranks `m0` at 1%/56% (the plan's worked example
+  picked `m0`). Within a ten-point band, fewer live sessions wins.
+- **An expired token is usable, not excluded.** It is what an account nobody
+  has used for hours looks like, and launching a session under it refreshes the
+  token. It ranks as moderate room. Cleared credentials — no access token and
+  no refresh token — read as `not signed in`, which is excluded.
+- **A reading from before the weekly reset is no reading.** The cache keeps
+  the last good numbers for an account that can't be read, and on that machine
+  they were a month old; the router treated their long-reset windows as empty.
+- **Rate limits are read from the transcript**, not inferred from usage
+  readings: Claude records a refused turn as an assistant entry with
+  `"error":"rate_limit"` and `quotaLimits.resetsAt`. That is what makes moving
+  safe to automate, and it marks the account out until the reset even when its
+  usage can't be read.
+- **Auto-move is on by default and carries on**, rather than opt-in: a
+  cut-off session moves to the roomiest account and is told to continue.
+  Claude shows a what-now menu at a limit, so a session sitting on it counts
+  as cut off; with nowhere to go it waits and continues in place after the
+  reset. `TICKETDECK_AUTO_MOVE=off` and the `A` overlay turn it off.
+- **Phase 4 is partly deferred.** `deck --account` still works and its
+  sessions are adopted with `M`; the peer-socket probe stays, now covering
+  every herdr server on the machine, including `rdeck`'s named sessions, which
+  the old probe never found.
 
 ## The end state
 

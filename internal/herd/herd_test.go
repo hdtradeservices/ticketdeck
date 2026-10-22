@@ -320,7 +320,7 @@ func TestScratchSpecPicksLowestFreeName(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := ScratchSpec(c.live, "/repos")
+			got := ScratchSpec(c.live, session.Ticket{}, "/repos")
 			if got.Name != c.want || got.Label != c.want {
 				t.Errorf("name/label = %q/%q, want %q", got.Name, got.Label, c.want)
 			}

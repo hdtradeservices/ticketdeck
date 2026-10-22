@@ -6,10 +6,10 @@
 # (Ctrl+b q) leaves the server and every ticket session running on the box.
 #
 # Usage:
-#   rdeck                    # primary account (first line of ~/.claude-accounts)
-#   rdeck support            # run as the ~/.claude-support subscription
-#   rdeck m0 --status        # report remote state, attach nothing
-#   rdeck support --restart  # rebuild the session server first (closes its panes)
+#   rdeck                    # the deck — it runs every account on the box
+#   rdeck --status           # report remote state and every account's sessions
+#   rdeck support            # the older per-account deck for ~/.claude-support
+#   rdeck support --restart  # rebuild that session server first (closes its panes)
 #
 # Env:
 #   RDECK_HOST      ssh target (default: zentail-workbench)
@@ -238,10 +238,18 @@ try: d = json.load(sys.stdin)
 except Exception: raise SystemExit
 a = d.get("result", {}).get("agents", [])
 print("sessions: %d live (%s)" % (len(a), ", ".join(x.get("name") or x.get("agent","?") for x in a) or "none"))' 2>/dev/null || true
+# Every account and every session on the box, from a TicketDeck new enough to
+# have the subcommand; an older one just skips it.
+if [ "\$MODE" = status ] && ticketdeck sessions >/tmp/rdeck-sessions.txt 2>/dev/null; then
+  echo; cat /tmp/rdeck-sessions.txt
+fi
 EOF
 )
 
 echo "rdeck: $ACCOUNT on $HOST" >&2
+if [ "$ACCOUNT" != "$PRIMARY" ] && [ "$MODE" = attach ]; then
+  echo "rdeck: the primary deck (plain \`rdeck\`) runs every account now; M in it brings this deck's sessions over" >&2
+fi
 remote "$REMOTE_SCRIPT" || exit $?
 
 [ "$MODE" = attach ] || exit 0

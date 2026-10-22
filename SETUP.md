@@ -77,7 +77,7 @@ tickets instead.
 | goal | key |
 |---|---|
 | move / page / top-bottom | `↑`/`↓` (`j`/`k`) · `PgUp`/`PgDn` · `g`/`G` |
-| open the ticket (launch/attach its session) | `Enter` — the first time, a reminder shows how to get back (`Ctrl+b 1`); `⏎` proceeds, `d` proceeds and never shows it again. If **another deck is already running that ticket**, it stops and shows that deck's live state instead of forking the session — see [One deck per ticket](#multiple-claude-subscriptions-accounts). |
+| open the ticket (launch/attach its session) | `Enter` — the first time, a reminder shows how to get back (`Ctrl+b 1`); `⏎` proceeds, `d` proceeds and never shows it again. It opens on the account the router picks — see [Where a session opens](#where-a-session-opens). If **the ticket's session runs somewhere this deck can't drive** (an older deck's workspace, a plain terminal), it stops and shows that session's live state instead of forking it. |
 | show the ticket's **description** (rendered markdown) | `d` (in the overlay: `Enter` opens the session, `o` browser, `p` PR, `↑`/`↓` scroll, `esc` closes) |
 | show the ticket's **investigation** or **implementation plan** | `i` / `P`, inside the description overlay. Those write-ups live in the ticket's Linear comments, not its description, so the deck fetches that ticket's comments the first time you press one of these keys and reuses them after. It shows the newest `## Investigation summary` (`/investigate`) or `## Implementation plan` (`/plan`) comment, with a line naming who wrote it and when. Pressing the same key again goes back to the description, as does `esc`; `d` closes the overlay outright. Says so plainly when the ticket has no such comment yet — and `r` re-reads the comments, for when the agent posts its write-up while you're looking. |
 | open the ticket in the **web browser** | `o` |
@@ -85,23 +85,30 @@ tickets instead.
 | **change status** → Done / Validate / Monitoring / Blocked / Cancel | `s`, then `d`/`v`/`m`/`b`/`c`, then `y` to confirm — **writes to Linear; needs a write-scoped `LINEAR_API_KEY`**. Moving to a terminal state (**Done / Cancel**) also **closes that ticket's Claude session** if one is running (transcript persists — resumable), then returns focus to the deck (not the neighbor tab). Moving to **Done** also runs the **unblock cascade**: every still-open ticket this one was *blocking* is moved to its team's **Triage** state. |
 | **change priority** → Urgent / High / Medium / Low / None | `P`, then `u`/`h`/`m`/`l`/`0` — **write; write-scoped key** |
 | **assign / reassign / unassign** | `a` opens a picker — type to filter people, `↑`/`↓` select, `⏎` assign (top row = **Unassign**), `esc` cancel — **writes to Linear; write-scoped key** (reassigning away from you drops the ticket off the list) |
-| open an **ad-hoc Claude session** not tied to any ticket (own tab) | `n` |
+| open an **ad-hoc Claude session** not tied to any ticket (own tab) | `n` — type a name (optional), `Tab` to pick the account, `⏎` to open. See [Ad-hoc sessions](#ad-hoc-sessions). |
 | **`/triage` in the background** | `t` — starts the ticket's session in its own (unfocused) tab if it isn't running, submits `/triage`, and keeps you on the deck (**runs a Claude turn**; herdr backend). On an "Other sessions" row it just submits `/triage` to that session. Gated the same way `Enter` is when another deck is running the ticket. |
 | **fold/unfold** a priority section (collapsed shows a ticket count) | `Space` (toggle) · `←` collapse · `→` expand — on the `PROJECTS` header this folds the whole section; on a project row (or one of its tickets) it folds that project's ticket list |
 | **search / filter the list** | `/` — type to filter tickets by key or title (live, case-insensitive; all matching groups expand). `⏎` keeps the filter and returns to list nav; `esc` clears it. While a filter is applied the footer shows `filter "…" · esc clear`. |
-| **hand the session to another Claude subscription** | `H` — for when this subscription hits a limit mid-task. Stops the session here, copies its transcript to the other account, and it becomes resumable in that deck. `⏎` confirms, `1`-`9` picks a target, `esc` cancels. Only offered when a second subscription exists — see [Multiple Claude subscriptions](#multiple-claude-subscriptions-accounts). |
+| **move the session to another Claude account** | `H` — stops it, copies its conversation, and resumes it on the chosen account in a new tab. With no session yet, opens it on the chosen account. `⏎` confirms, `1`-`9` picks, `esc` cancels. Only offered with more than one account — see [Moving a session by hand](#moving-a-session-by-hand). |
+| **accounts** | `A` — every account's usage, sessions and state, in the order new sessions go to them; `⏎`/`p` pins new sessions to one, `a` back to automatic, `m` turns auto-move on or off. |
+| **bring in sessions from older decks** | `M` — sessions still running in a per-account deck's workspace; `⏎` brings one in on the same account, `a` all of them. See [Sessions from older decks](#sessions-from-older-decks). |
+| **jump to what needs you** | `]` / `[` — the next or previous session waiting on you: a question or permission prompt, a turn nobody has read, a usage limit, an API error. Unfolds whatever hides it. The title bar counts them (`◆ 3 need you`). |
+| **every key** | `?` |
 | refresh | `r` — a manual refresh. Session badges also refresh on their own every few seconds, and the instant the deck regains focus, so you don't have to. |
 
 An **"Other sessions"** section at the bottom lists live Claude sessions not shown as a
 ticket badge — ad-hoc `n` sessions and sessions for tickets that dropped off the list
-(Done/Cancelled). With the cursor on one: `Enter` switches to it, **`x` closes it** (its
-transcript persists, so it stays resumable).
+(Done/Cancelled) — plus sessions in older decks' workspaces, and the ad-hoc sessions the
+deck remembers that aren't running. With the cursor on one: `Enter` switches to it (brings
+it in, or resumes it), **`x` closes it** (its transcript persists, so it stays resumable;
+`x` on a stopped one forgets it), **`R` renames it**, `H` moves it to another account.
 | quit | `q` (standalone) — **under the `deck` launcher `q` is disabled** so it can't orphan the deck; leave herdr with `Ctrl+b q` (detach, keeps sessions running), or `Ctrl+c` as a hard exit |
 
 **Icons / badges:**
 
 - **Priority** group headers are color-coded: Urgent (red) · High (orange) · Medium (yellow) · Low (blue) · No priority (gray), always showing a `(count)`.
-- **Session** badge per ticket: `●` working (green) · `◆` needs input (amber) · `○` idle (cyan) · `✓` done · `↻` **resumable** (an on-disk session you can reattach — shown even right after a fresh start, before any agent is running) · `·` none yet.
+- **Session** badge per ticket: `●` working (green) · `◐` background (lavender — the lead is idle but a subagent, shell command or monitor it started is still running) · `◆` needs input (amber) · `◉` your turn (it finished a turn nobody has looked at since) · `○` idle (cyan) · `⊘` limit (red — its account is out, followed by when it gets it back) · `✗` error (it stopped on an API error: a lapsed login, an unreachable API) · `↻` **resumable** (an on-disk session you can reattach — shown even right after a fresh start, before any agent is running) · `·` none yet.
+- **Status line** — the line above the key hints says what the highlighted row's session is doing, in more words than the badge has room for: its account, what it last did, how full its context is, what it is waiting on, how it stopped. On a row with no session it says where `⏎` would open it, and why.
 - **Account** dot `⦿` left of the session badge, in the owning subscription's color — which Claude account is running that ticket's session, including one running under another account. Labelled with the account name on the highlighted row. Only rendered when you have more than one subscription; see [Multiple Claude subscriptions](#multiple-claude-subscriptions-accounts).
 - **Top-10 focus** — priority sections are auto-folded unless they hold one of your top 10 tickets (by priority, then status, then recency), and this is re-applied on each refresh. So if your top 10 are all Urgent, only Urgent stays open; if they span Urgent/High/Medium, those stay open and lower sections fold (shown as `▸ Low (3)`). Expand any folded section with `→`/`Space` (it re-folds on the next refresh).
 - **Working tickets are dimmed** — a ticket whose session is actively `working` renders in faint gray (no bright id/title), so your eye is drawn to the tickets that still need you (needs-input, idle, resumable, untouched) rather than the ones already in progress. Move the cursor onto one and it still highlights normally.
@@ -178,158 +185,139 @@ deck() {
 ### Multiple Claude subscriptions (accounts)
 
 If you have more than one Claude Code subscription — each logged into its own
-config dir (`~/.claude` for the default, `~/.claude-<name>` for others, e.g.
-`~/.claude-support`) — run a separate, fully isolated deck per account:
+config dir (`~/.claude` for the primary, `~/.claude-<name>` for the others, e.g.
+`~/.claude-support`) — **one deck runs all of them**:
 
 ```sh
-deck                     # default subscription (~/.claude)
-deck --account support   # the 'support' subscription (~/.claude-support)
+deck        # every subscription on this machine
 ```
 
-Each account gets its **own herdr workspace** (separate server socket +
-`session.json`), so its ticket sessions burn *that* subscription's rate limits
-and never collide with the default deck. Both decks show the **same Linear
-tickets** (the Linear key is shared) — only which Claude subscription runs the
-sessions differs.
-
-**Telling the decks apart.** Every deck names itself — there is no unlabelled
-deck. Three cues, in order of how far away you can read them:
-
-| Cue | Where |
-| --- | --- |
-| OS window / tab title `deck ⦿ support` | your taskbar, without focusing the window |
-| `⦿ <name>` badge in a **per-account color** | title bar, top left |
-| both accounts' usage | title bar, active account first |
-
-Name the default deck something better than `default` by exporting
-`TICKETDECK_ACCOUNT` in your shell rc:
-
-```sh
-export TICKETDECK_ACCOUNT=matt   # labels the ~/.claude deck "matt"
-```
-
-The name is published into that config dir, so **every** deck calls the
-subscription `matt` — the label and its accent color stay the same whichever
-deck you're looking from.
-
-**Seeing where the headroom is.** The title bar shows *every* subscription's
-5h/7d usage, not just the one you're in — the active account on the title line
-with its reset hint, the others on the line below:
+Each session's tab gets its own account's `CLAUDE_CONFIG_DIR`, so its usage lands
+on that subscription, and the deck picks the account for you. Every account
+appears on the line under the title — its 5-hour and 7-day usage and how many
+sessions it runs — and the one a new session would open on is underlined:
 
 ```
-TicketDeck  ⦿ matt  assigned · open only  ◷ 5h 94% (12m) · 7d 61%
-            ⦿support 5h 12% · 7d 8%
+TicketDeck  assigned · open only
+  ⦿ m0 5h 1% · 7d 56% ●2   ⦿ matt 5h 52% · 7d 42% ●3   ⦿ support out until 2:50pm ●1
 ```
 
-So when one account is throttled you can see the other has room without
-switching decks to go look.
+**Naming the accounts.** The primary account takes its name from the first line
+of `~/.claude-accounts` (`rdeck` reads the same file), else from
+`TICKETDECK_ACCOUNT`, else `default`; the others are named after their
+directory. Colors are assigned by sorted name, so every deck agrees on them.
 
-**Seeing which account is on a ticket, and what it's doing.** Every ticket with
-a session carries a `⦿` dot in the owning subscription's color, in the column
-left of the status badge — including sessions running under the *other* accounts,
-which this deck otherwise can't see. Move the cursor onto a row and the dot is
-labelled with the account name:
+**First-time setup for an account:** log it in once —
+`CLAUDE_CONFIG_DIR=~/.claude-support claude /login`. The deck notices a new
+account within a minute, no restart needed.
 
-```
-          ⦿ ● working 4m    ZEN-3395  ●  fix shipworks sweep
-▶ support ⦿ ● working 12m   ZEN-3401  ○  retry backoff
-          ⦿ ↻ resumable     ZEN-3402  ○  order alert dedupe
-```
+#### Where a session opens
 
-The name only appears on the highlighted row (naming every row would cost the
-title that much width on every line), but the column is reserved either way, so
-moving the cursor never shifts the columns. A deck with one subscription doesn't
-render the column at all.
+`⏎` resumes a session on the account it already lives on — moving costs a
+transcript copy and a replayed conversation, so it needs a reason. A new session
+goes to the account with the most room:
 
-The **badge is filled in for other decks' sessions too** — `● working`,
-`◆ needs input`, `○ idle`, `↻ resumable` — so a ticket someone else's deck is
-part-way through doesn't read as untouched. Two things differ from a badge for
-one of this deck's own sessions:
+- An account is as full as its **tighter** window: 5% of the 5-hour window buys
+  nothing on a subscription at 98% of its week.
+- Accounts within ten points of each other go to the one running **fewer
+  sessions**, because sessions on one account share its budget.
+- An account is **skipped** when its limit refused one of its sessions (until
+  the limit resets), a window is spent, its login lapsed, or nobody is signed in.
+- One whose usage can't be read — usually an expired token, which is what an
+  account nobody has used for hours looks like — still takes work, ranked as if
+  it had moderate room; opening a session under it refreshes the token.
+- A **nearly spent** account (5-hour ≥ 90% or 7-day ≥ 95%) is used only when
+  nothing has more room.
+- A session that lives on an account that is out resumes somewhere with room;
+  its conversation is copied over first.
 
-- **It's colored like the deck, not like the status.** The words already say the
-  state; what a glance needs from someone else's row is whose it is. So a remote
-  `● working` is `support`-colored, not green.
-- **The time is "since it last wrote", not "time in this state."** Locally the
-  deck knows when a status changed. For another account it reads the transcript's
-  mtime, which is the more useful number anyway: a `● working` session that last
-  wrote 40m ago is wedged, not busy.
+The line above the key hints says where `⏎` would open the highlighted ticket,
+and why, before you press it. `H` on a ticket with no session yet opens it on an
+account you choose; `n` takes `Tab` to pick one for an ad-hoc session. `A` shows
+every account in the order the router ranks them, and pins new sessions to one
+of them if you'd rather choose (`⏎`/`p` pins, `a` goes back to automatic).
 
-Ownership is read from each account's transcripts on disk plus its herdr
-workspace, so an account whose deck isn't running still shows up (as `↻
-resumable`). Live status needs that account's herdr server to be up. Refreshed
-every 3 seconds, alongside this deck's own badges. When a ticket has been worked
-under both accounts — a hand-off leaves the transcript behind in the source — the
-dot names the live session, or the one that wrote most recently.
+#### When an account runs out
 
-All of this applies to **project** rows too: a project's session carries the same
-`⦿` dot and live badge, so you can see which subscription is working a project
-without switching decks.
+A session cut off by its account's usage limit **moves to the account with the
+most room and carries on**: the deck stops it, copies its conversation, resumes
+it on the other account in a new tab, and tells it why it stopped and to
+continue. A notification says so, wherever you are.
 
-**One deck per ticket.** `⏎` on a ticket that another deck is *actively running*
-stops and shows what's there instead of opening it:
+- It acts once per cut-off, and only when the limit has ended the turn — the
+  transcript records the refusal, so nothing is in flight to lose. A background
+  task the session had running stops with it, and the session is told so.
+- Claude puts up a what-now menu when it hits a limit; the deck treats a session
+  sitting on that menu exactly like one that went idle.
+- When no account has room, the session waits, and once its limit resets the
+  deck dismisses the menu and tells it to continue where it is (within half an
+  hour of the reset — a cut-off left alone since yesterday stays alone).
+- A session whose account's login lapsed moves the same way: there is no reset
+  to wait for.
+- If the session stops at a prompt of its own when it starts on the new account
+  — a folder that account hasn't trusted, say — the deck says so, and sends the
+  continue once you've answered it.
 
-```
-Already open on another deck  ZEN-3401
+Turn it off with `m` in the `A` overlay, or `TICKETDECK_AUTO_MOVE=off` for a
+deck that must never act on its own. `TICKETDECK_CONTINUE_PROMPT` replaces what
+a moved session is told.
 
-  ⦿ support   ● working right now, last wrote 2m ago
+#### Moving a session by hand
 
-  A session here would be a second one on the same ticket: both decks
-  append to their own copy of one transcript, which then diverge with no
-  way to merge them, and two agents work the ticket at once.
+`H` on a ticket, a project, or an Other sessions row moves its session to
+another account, in place: the tab closes, the conversation is copied, and it
+resumes in a new tab under the new account. On a session that isn't running it
+only copies the conversation, and the next `⏎` resumes it there.
 
- ⏎  leave it to ⦿support
-  p  open its PR here instead
-  o  open it here anyway
+- **The conversation carries over; a running process does not.** An in-flight
+  tool call is lost, so the overlay warns when the session is working.
+- **It refuses to destroy work.** If the target account already has *newer*
+  work on that session, the move fails instead of overwriting it.
+- It refuses an account nobody is signed in to, and says how to log it in.
 
-  esc  cancel
-  work it where it lives:  deck --account support
-```
+#### Sessions from older decks
 
-Both `⏎` and `esc` back out — a reflexive keypress must not be the thing that
-forks a session — and the footer then reminds you which deck to launch. Only `o`
-overrides. `t` (background `/triage`) goes through the same gate, because it
-starts the session when there isn't one here.
+Before one deck ran every account, each subscription had its own deck
+(`deck --account NAME`, or `rdeck NAME` on a remote box), each with its own herdr
+workspace. Sessions those decks started keep running there. This deck finds
+every herdr server on the machine and shows those sessions too — the title bar
+counts them (`⇣ 3 in other decks`), and their rows say which deck they are in.
 
-Two cases that look similar but aren't gated: a session **this** deck already
-runs (`⏎` re-attaches it, nothing forks) and another deck's **stopped** session
-(nothing to collide with — the row badges it `↻` in that deck's color, and
-opening it here starts fresh). To pick up a stopped session's context, hand it
-over from the deck that has it with `H`.
+`M` lists them; `⏎` brings one in, `a` brings them all. Bringing a session in
+stops it there and resumes it in this deck **on the same account** — nothing is
+copied and nothing forks. A busy one is queued and comes in once its turn ends.
+`⏎` on one of their rows in Other sessions does the same and switches to it.
 
-The gate reads the same 3-second ownership poll the badges do, so a session
-started elsewhere in the last couple of seconds can still slip past it. It
-catches the mistake people actually make: opening a ticket another deck has been
-working on for minutes.
+Once an old deck's workspace is empty, stop it:
+`herdr session stop <name>` (a named session) or close it from its own window.
+`deck --account NAME` still works for anyone who wants that layout; that deck
+runs every account too, in its own workspace.
 
-**Handing a session to the other subscription.** `H` on a ticket — or on a
-**project** — moves its session to another account, for when the current
-subscription hits a limit mid-task. It stops the session here, copies its
-transcript into the other account's config dir, and the session becomes
-resumable in that deck. A project hands off exactly as a ticket does: the move
-is keyed on the session id, which doesn't care which kind of work it holds.
+**One session per ticket.** `⏎` (and `t`) on a ticket whose session runs
+somewhere this deck can't drive stops and says so instead of opening a second
+one: both would append to their own copy of one transcript, which then diverge
+with no way to merge them. `⏎`/`esc` leaves it alone, `b` brings it into this
+deck, `p` opens its PR, and `o` opens it here anyway.
 
-Three things to know:
+#### Ad-hoc sessions
 
-- **Context carries over; a live process does not.** Resuming replays the
-  conversation, so an in-flight tool call is lost. Hand off between steps.
-- **Never run one session in two accounts at once.** That's why `H` stops the
-  session first — two accounts appending to their own copy of one transcript
-  diverge with no way to reconcile them.
-- **It refuses to destroy work.** If the target account already has *newer* work
-  on that ticket, the hand-off fails instead of overwriting it. An older copy
-  there is just stale, so a ticket can move back and forth freely.
+`n` asks for a name (optional) and the account (`Tab`; automatic by default),
+then opens the session under its own id. The deck remembers it in
+`~/.ticketdeck/sessions.json` — its id, name and account — so after a herdr
+restart it is listed under Other sessions as resumable, by name, on the
+account it ran on. `R` renames one: the deck's name for it, its herdr agent
+name and tab, and Claude's own title (so `/resume` lists it the same way). `x`
+closes a running one; `x` on a stopped one forgets it (its conversation stays on
+disk).
 
-- **Switching is non-destructive.** Detach one deck (`Ctrl+b q`) and launch the
-  other; every background session in each workspace keeps running untouched. A
-  session you started on `matt` finishes its work whether or not you're looking
-  at it — attach the matt deck again later and it's right there.
-- **Tool auth is shared.** The isolated workspace is an overlay of your real
-  `~/.config` (symlinked through), so `gh`, `gcloud`, `git`, etc. use the same
-  credentials in both decks; only Claude's own config dir differs.
-- **First-time setup for an account:** log in to its config dir once —
-  `CLAUDE_CONFIG_DIR=~/.claude-support claude /login` — then `deck --account
-  support` works. (`ticketdeck --account support` does the same for the
-  standalone, non-herdr path.)
+An ad-hoc session Claude has titled shows that title until you name it.
+
+#### From a shell
+
+`ticketdeck sessions` prints every account's headroom and every session the
+deck would show — which account runs it, which deck's workspace holds it, its
+status and what it last did — without opening the deck. `rdeck --status` prints
+it for a remote box.
 
 ## 5. A deck on another box: `rdeck`
 
@@ -339,21 +327,26 @@ server with the right Claude account, starts TicketDeck in it if it isn't
 already there, then attaches from here.
 
 ```sh
-rdeck                    # primary account (first line of ~/.claude-accounts)
-rdeck support            # the 'support' subscription on the box
-rdeck m0 --status        # report remote state, attach nothing
-rdeck support --restart  # rebuild the session server first (closes its panes)
+rdeck                    # the deck on the box — it runs every account there
+rdeck --status           # report remote state and every account's sessions, attach nothing
+rdeck support            # the older per-account deck for the 'support' subscription
+rdeck support --restart  # rebuild that session server first (closes its panes)
 ```
 
 Detaching (`Ctrl+b q`) leaves the server and every ticket session running on the
 box. Set `RDECK_HOST` to the ssh target (default `zentail-workbench`).
 
-**Accounts work differently here.** On the box they map to herdr *sessions*, not
-to the `XDG_CONFIG_HOME` overlay `deck --account` uses. `herdr --remote` picks a
-remote server by session name and has no way to name a socket, so an overlay
-server on the far end is unreachable from here. The primary account is the
-remote *default* session — the one a plain `deck` on the box already runs — and
-every other account gets a named session of the same name.
+**One deck, every account.** Plain `rdeck` attaches to the deck in the box's
+default herdr session, and that deck runs sessions under every account on the
+box. The per-account decks `rdeck <name>` used to be the only way to reach live
+in named herdr sessions of the same name; they still work, and the main deck
+finds their sessions — `M` brings them in (see
+[Sessions from older decks](#sessions-from-older-decks)). Once one is empty,
+stop it on the box with `herdr session stop <name>`.
+
+Why named sessions: `herdr --remote` picks a remote server by session name and
+has no way to name a socket, so the `XDG_CONFIG_HOME` overlay `deck --account`
+uses locally would be unreachable from here.
 
 **A server the bridge started is not usable.** If you run `herdr --remote` by
 hand and let it start a server for you, that server has a bare environment: no
@@ -371,7 +364,10 @@ ticketdeck --dry-launch            # Enter prints the launch command instead of 
 ticketdeck --demo                  # canned data, no Linear key
 ticketdeck --demo --preview        # one styled frame, then exit
 ticketdeck --root <dir>            # override where new sessions launch
-ticketdeck --account <name>        # run as the ~/.claude-<name> subscription (see "Multiple Claude subscriptions")
+ticketdeck --account <name>        # make ~/.claude-<name> this deck's own account (see "Multiple Claude subscriptions")
+ticketdeck sessions                # every account's headroom and every session, without the deck
+TICKETDECK_AUTO_MOVE=off ticketdeck   # never move a session on its own
+TICKETDECK_CONTINUE_PROMPT='…'        # what a session moved off a spent account is told
 ```
 
 Keys: `↑/↓` move · `PgUp/PgDn` page · `g`/`G` top/bottom · `enter` open · `r` refresh · `q` quit.

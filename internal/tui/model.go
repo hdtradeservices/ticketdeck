@@ -3,6 +3,7 @@ package tui
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -21,8 +22,11 @@ import (
 	"github.com/mattn/go-runewidth"
 
 	"github.com/hdtradeservices/ticketdeck/internal/account"
+	"github.com/hdtradeservices/ticketdeck/internal/fleet"
+	"github.com/hdtradeservices/ticketdeck/internal/ledger"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/quota"
+	"github.com/hdtradeservices/ticketdeck/internal/route"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
 	"github.com/hdtradeservices/ticketdeck/internal/update"
 )
@@ -182,6 +186,10 @@ type statusesMsg struct {
 	statuses map[string]session.Status
 	owners   map[string]account.Owner // ticket key → the subscription running its session
 	err      error
+	// snap is the whole poll, when it came from one: every session on every
+	// account and in every workspace. others is its Other sessions section.
+	snap   *fleet.Snapshot
+	others []session.SessionRef
 }
 
 type sessionsMsg struct {
@@ -196,6 +204,7 @@ type detachedDoneMsg struct {
 	action string
 	err    error
 	output string
+	key    string // the session a launch opened, so its in-flight mark clears
 }
 
 type tickMsg struct{}
@@ -212,14 +221,6 @@ type updateAvailableMsg struct{ latest string }
 // for comes back — "rate limited" and "token expired" are different problems
 // with different fixes, and a missing key can say neither.
 type quotaMsg struct{ entries map[string]quota.Entry }
-
-// handoffMsg is the result of moving a session to another subscription.
-type handoffMsg struct {
-	key string
-	to  string
-	cmd string // how to open the target's deck (not derivable from its name)
-	err error
-}
 
 // statusWriteMsg is the result of a MoveState write.
 type statusWriteMsg struct {
@@ -288,8 +289,7 @@ type Model struct {
 	owners        map[string]account.Owner    // ticket key → which subscription runs its session
 	ownerCol      int                         // width of the account column (0 = one account, nothing to label)
 	otherSessions []session.SessionRef        // live sessions not tied to a visible ticket
-	demoStatuses  map[string]session.Status   // --demo override; nil in real use
-	demoOwners    map[string]account.Owner    // --demo override; nil in real use
+	demo          bool                        // --demo: canned data, no live backend
 	detail        *linear.Issue               // non-nil = showing the description overlay
 	detailOffset  int                         // scroll offset within the detail overlay
 	detailView    linear.Section              // which body the overlay shows: description, investigation, or plan
@@ -318,7 +318,9 @@ type Model struct {
 	users         []linear.User          // cached workspace users for the picker
 	hideOpenHint  bool                   // user chose "don't show again" for the open-session hint
 	openHintSpec  *session.LaunchSpec    // pending launch awaiting the open-session hint
-	openHintLabel string                 // ticket key for the pending launch
+	openHintLabel string                 // what to call the pending launch
+	openHintKey   string                 // its session key, for H
+	openHintWhy   string                 // which account it opens on, and why
 	updateLatest  string                 // newer release tag, if the startup check found one
 	acct          account.Account        // the subscription this deck runs as
 	accounts      []account.Account      // Claude subscriptions on this machine, resolved once (globs the fs)
@@ -327,7 +329,32 @@ type Model struct {
 	handoffKey    string                 // ticket awaiting a hand-off confirm ("" = overlay closed)
 	handoffCands  []account.Account      // accounts that ticket can be handed to
 	handoffCursor int                    // index into handoffCands
+	handoffLabel  string                 // what to call that session on screen
 	conflict      *conflict              // non-nil = a launch is held back because another deck runs the ticket
+	fleet         fleet.Snapshot         // the last poll: every session, on every account, in every workspace
+	ledger        map[string]ledger.Entry
+	settings      settings
+	forceAcct     *account.Account          // the next launch runs here, not where the router says (H on a ticket with no session)
+	moving        map[string]bool           // session keys with a move in flight
+	handled       map[string]bool           // API error ids already acted on
+	parked        map[string]time.Time      // sessions out of usage with nowhere to move: when their limit lifts
+	adoptQueue    map[string]bool           // sessions in other decks to bring in once their turn ends
+	pendingSend   map[string]string         // moved sessions held at a startup prompt: what to send once it's answered
+	launching     map[string]bool           // sessions whose launch is still running
+	finishedAt    map[string]time.Time      // when each session last finished a turn, as the deck saw it
+	seenAt        map[string]time.Time      // when each session was last on screen
+	rawStatus     map[string]session.Status // each session's status as herdr reported it last poll
+	retryAt       map[string]time.Time      // cut-offs whose continue failed: when to try again
+	acctMenu      bool                      // the accounts overlay (A) is open
+	acctCursor    int
+	bringMenu     bool // the bring-sessions-here overlay (M) is open
+	bringCursor   int
+	prompt        *prompt // a one-line prompt (new session name, rename) is open
+	help          bool    // the key reference (?) is open
+	helpOffset    int
+	pollBusy      bool      // a status poll is in flight; the timer doesn't stack another on it
+	pollStarted   time.Time // when it started, so a lost reply can't stall polling for good
+	lastPollErr   string    // the last status poll error logged, so a lasting one is logged once
 	err           error
 	notice        string // transient status line (e.g. dry-run launch plan)
 	lastSync      time.Time
@@ -337,57 +364,40 @@ type Model struct {
 	quitting      bool
 }
 
-// demoSessioner lets --demo inject canned session statuses (real sessions won't
-// match demo ticket keys), so the badges are visible without a live daemon.
-type demoSessioner interface {
-	DemoSessions() map[string]session.Status
-}
-
-// demoOtherSessioner lets --demo inject canned "other sessions" so the bottom
-// section is visible without a live backend.
-type demoOtherSessioner interface {
-	DemoOtherSessions() []session.SessionRef
-}
-
-// demoOwner lets --demo inject canned session ownership, so the account column
-// is visible on a machine that only has one subscription.
-type demoOwner interface {
-	DemoOwners() map[string]account.Owner
+// demoFleeter lets --demo stand in for a machine with several accounts and
+// sessions in every state, so every badge, the accounts line and the router's
+// choices can be seen without a live backend or a second subscription.
+type demoFleeter interface {
+	DemoAccounts() []account.Account
+	DemoQuotas() map[string]quota.Entry
+	DemoFleet(now time.Time) fleet.Snapshot
 }
 
 func New(f Fetcher, root string, dry bool, backend Backend) Model {
 	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, inView: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, closeOnIdle: map[string]bool{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, projExpanded: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != "", comments: map[string][]linear.Comment{}, commentsErr: map[string]error{}, commentsBusy: map[string]bool{}}
+	m.moving, m.handled, m.parked, m.adoptQueue = map[string]bool{}, map[string]bool{}, map[string]time.Time{}, map[string]bool{}
+	m.pendingSend, m.launching = map[string]string{}, map[string]bool{}
+	m.finishedAt, m.seenAt, m.rawStatus = map[string]time.Time{}, map[string]time.Time{}, map[string]session.Status{}
+	m.retryAt = map[string]time.Time{}
+	m.ledger = ledger.Load()
+	m.settings = loadSettings()
 	// Resolved once, not per frame: All() globs the filesystem, and View runs on
 	// every keystroke.
 	m.acct = account.Current()
 	m.accounts = account.All()
 	m.acctColors = account.Colors(m.accounts)
 	m.quotas = map[string]quota.Entry{}
-	if ds, ok := f.(demoSessioner); ok {
-		m.demoStatuses = ds.DemoSessions()
-	}
-	if dos, ok := f.(demoOtherSessioner); ok {
-		m.otherSessions = dos.DemoOtherSessions()
-	}
-	if dow, ok := f.(demoOwner); ok {
-		m.demoOwners = dow.DemoOwners()
-		m.owners = m.demoOwners
+	if df, ok := f.(demoFleeter); ok {
 		// --demo runs on whatever machine it's on, usually a one-subscription
-		// one. Give its fabricated accounts real accent colors (appended, so the
-		// machine's own accounts keep theirs) or every dot would be the same
-		// color and the column would demonstrate nothing.
-		accts := m.accounts
-		var extra []string
-		for _, o := range m.owners {
-			if _, known := m.acctColors[o.Name]; !known && !slices.Contains(extra, o.Name) {
-				extra = append(extra, o.Name)
-			}
-		}
-		slices.Sort(extra) // map order is random; colors must not shuffle per run
-		for _, n := range extra {
-			accts = append(accts, account.Account{Name: n})
-		}
-		m.acctColors = account.Colors(accts)
+		// one, so it brings its own accounts as well as its own sessions.
+		m.demo = true
+		m.accounts = df.DemoAccounts()
+		m.acct = m.accounts[0]
+		m.acctColors = account.Colors(m.accounts)
+		m.quotas = df.DemoQuotas()
+		m.fleet = df.DemoFleet(time.Now())
+		m.ledger = map[string]ledger.Entry{}
+		m.settings = settings{}
 	}
 	m.ownerCol = ownerColWidth(m.accounts, m.owners)
 	if w, ok := f.(statusWriter); ok {
@@ -441,13 +451,17 @@ func Preview(f Fetcher, height int) (string, error) {
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{m.refresh(), m.refreshProjects(), tick(), checkUpdate(), m.fetchQuota()}
 	// Name the OS window/tab after the account, so you can tell two decks apart
-	// from the taskbar without focusing either one.
-	if m.acct.Name != "" {
+	// from the taskbar without focusing either one. A deck with several accounts
+	// runs them all.
+	switch {
+	case m.multiAccount():
+		cmds = append(cmds, tea.SetWindowTitle("deck ⦿ every account"))
+	case m.acct.Name != "":
 		cmds = append(cmds, tea.SetWindowTitle("deck ⦿ "+m.acct.Name))
 	}
 	// The fast status poll only makes sense against a live backend; --demo/--preview
 	// resolve statuses synchronously, so don't spin a ticker there.
-	if m.demoStatuses == nil {
+	if !m.demo {
 		cmds = append(cmds, statusTick())
 	}
 	return tea.Batch(cmds...)
@@ -462,7 +476,7 @@ func (m Model) Init() tea.Cmd {
 // directly meant decks × accounts requests arriving together against a budget
 // already shared with every running Claude Code status line.
 func (m Model) fetchQuota() tea.Cmd {
-	if m.demoStatuses != nil {
+	if m.demo {
 		return nil
 	}
 	accts := make([]quota.Account, 0, len(m.accounts))
@@ -514,41 +528,146 @@ func (m Model) refreshProjects() tea.Cmd {
 // (or the demo override). Read-only; no model calls.
 func (m Model) refreshStatuses() tea.Cmd {
 	keys := m.sessionKeys()
-	if m.demoStatuses != nil {
-		ds, owners := m.demoStatuses, m.demoOwners
+	if m.demo {
+		snap := m.fleet
+		visible := map[string]bool{}
+		for _, k := range keys {
+			visible[k] = true
+		}
 		return func() tea.Msg {
-			out := make(map[string]session.Status, len(keys))
-			for _, k := range keys {
-				out[k] = ds[k]
-			}
-			return statusesMsg{statuses: out, owners: owners}
+			st, owners, others := derive(snap, keys, visible)
+			return statusesMsg{statuses: st, owners: owners, snap: &snap, others: others}
 		}
 	}
-	b := m.backend
-	cwd := m.root
-	// Ownership is only a question with more than one subscription on the
-	// machine; a single-account deck skips the peer polling entirely.
-	accts := m.accounts
-	if len(accts) < 2 {
-		accts = nil
+	in := fleet.Input{
+		Accounts: m.accounts, Home: m.acct, Keys: keys, Ledger: m.ledger,
+		Herdr: m.backend != nil && m.backend.Herdr(), Peers: true, Cwd: m.root,
+	}
+	visible := map[string]bool{}
+	for _, k := range keys {
+		visible[k] = true
 	}
 	return func() tea.Msg {
-		st, err := b.Statuses(keys, cwd)
-		return statusesMsg{statuses: st, owners: account.Owners(keys, accts), err: err}
+		in.Now = time.Now()
+		snap := pollFleet(in)
+		st, owners, others := derive(snap, keys, visible)
+		return statusesMsg{statuses: st, owners: owners, err: snap.OwnErr, snap: &snap, others: others}
 	}
 }
 
-// refreshSessions lists live backend sessions (for the "other sessions"
-// section). Skipped in --demo (no live backend). Read-only.
-func (m Model) refreshSessions() tea.Cmd {
-	if m.demoStatuses != nil {
-		return nil
+// pollFleet is the status poll; tests replace it.
+var pollFleet = fleet.Poll
+
+// maxResumableOthers bounds how many stopped ad-hoc sessions the Other sessions
+// section lists: enough to come back to yesterday's, not a history.
+const maxResumableOthers = 8
+
+// markSeen turns herdr's "finished, unseen" into the deck's own reading of it.
+// herdr only learns a session was seen from an explicit focus; switching tabs
+// in the herdr client doesn't tell it, so a session you read and left would
+// read "your turn" again the moment you came back. The deck notes when each
+// session finished a turn and when it was last on screen, and a finished turn
+// that has been on screen since is plain idle.
+func (m *Model) markSeen(snap *fleet.Snapshot, statuses map[string]session.Status, others []session.SessionRef, now time.Time) {
+	raw := map[string]session.Status{}
+	for i := range snap.Sessions {
+		s := &snap.Sessions[i]
+		if !s.Live || !s.Home {
+			continue
+		}
+		raw[s.Key] = s.Status
+		if s.Focused {
+			m.seenAt[s.Key] = now
+		}
+		// herdr says "done" from the moment a turn finishes until something
+		// focuses the session through its API, so a new finished turn is the
+		// moment it starts saying so.
+		if s.Status == session.Unread && m.rawStatus[s.Key] != session.Unread {
+			m.finishedAt[s.Key] = now
+		}
+		if s.Status == session.Unread && !m.seenAt[s.Key].Before(m.finishedAt[s.Key]) {
+			s.Status = session.Idle
+		}
 	}
-	b := m.backend
-	return func() tea.Msg {
-		s, err := b.Sessions()
-		return sessionsMsg{sessions: s, err: err}
+	m.rawStatus = raw
+	for k, st := range statuses {
+		if st == session.Unread {
+			if b, ok := snap.Best(k); ok && b.Status == session.Idle {
+				statuses[k] = session.Idle
+			}
+		}
 	}
+	for i := range others {
+		if others[i].Status == session.Unread {
+			if b, ok := snap.Best(others[i].Name); ok && b.Status == session.Idle {
+				others[i].Status = session.Idle
+			}
+		}
+	}
+}
+
+// derive turns a poll into what the rows render: each key's status as this
+// deck can act on it, which account holds each one, and the Other sessions
+// section.
+//
+// A key's status is its session in this deck's workspace, or resumable when its
+// conversation is only on disk. A session running in another deck's workspace
+// leaves the key at None: the owner badge says where it runs, and opening it
+// here is gated (see blockingOwner).
+func derive(snap fleet.Snapshot, keys []string, visible map[string]bool) (map[string]session.Status, map[string]account.Owner, []session.SessionRef) {
+	st := make(map[string]session.Status, len(keys))
+	owners := map[string]account.Owner{}
+	for _, k := range keys {
+		b, ok := snap.Best(k)
+		if !ok {
+			st[k] = session.None
+			continue
+		}
+		owners[k] = account.Owner{Name: b.Account, Status: b.Status, LastActive: b.LastActive, Live: b.Live, Home: b.Home, Workspace: b.Workspace}
+		switch {
+		case b.Live && b.Home:
+			st[k] = b.Status
+		case !b.Live:
+			st[k] = session.Stopped
+		default:
+			st[k] = session.None
+		}
+	}
+	var live, stopped []fleet.Session
+	for _, s := range snap.Sessions {
+		switch {
+		case visible[s.Key]:
+		case s.Live:
+			live = append(live, s)
+		case s.Kind == ledger.Scratch:
+			stopped = append(stopped, s)
+		}
+	}
+	slices.SortStableFunc(live, func(a, b fleet.Session) int {
+		if a.Home != b.Home {
+			if a.Home {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(a.Key, b.Key)
+	})
+	slices.SortStableFunc(stopped, func(a, b fleet.Session) int { return b.LastActive.Compare(a.LastActive) })
+	if len(stopped) > maxResumableOthers {
+		stopped = stopped[:maxResumableOthers]
+	}
+	others := make([]session.SessionRef, 0, len(live)+len(stopped))
+	for _, s := range append(live, stopped...) {
+		ref := session.SessionRef{
+			Name: s.Key, Status: s.Status, Ref: s.PaneID, Socket: s.Socket, Account: s.Account,
+			Title: s.Name, SessionID: s.ID, Cwd: s.Cwd,
+		}
+		if !s.Live {
+			ref.Status = session.Stopped
+		}
+		others = append(others, ref)
+	}
+	return st, owners, others
 }
 
 // sessionKeys is the set of session keys to poll statuses for: every visible
@@ -635,21 +754,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// also how a deck that skipped a round — another deck held the poll lock —
 		// picks up the answer. A per-deck timer here would only put the decks back
 		// in lockstep — the state that earns the 429s.
-		cmds := []tea.Cmd{m.refreshStatuses(), m.refreshSessions(), tick(), m.fetchQuota()}
+		cmds := []tea.Cmd{tick(), m.fetchQuota()}
 		cmds = append(cmds, m.linearRefresh()...)
 		return m, tea.Batch(cmds...)
 
 	case statusTickMsg:
 		// Deliberately no Linear fetch or quota call — those stay on the slow tick.
-		return m, tea.Batch(m.refreshStatuses(), m.refreshSessions(), statusTick())
+		// A poll still in flight is not stacked on: a slow herdr would otherwise
+		// queue polls faster than they finish.
+		cmds := []tea.Cmd{statusTick()}
+		if !m.pollBusy || time.Since(m.pollStarted) > 30*time.Second {
+			m.pollBusy, m.pollStarted = true, time.Now()
+			cmds = append(cmds, m.refreshStatuses())
+		}
+		return m, tea.Batch(cmds...)
 
 	case tea.FocusMsg:
 		// The deck pane regained focus (e.g. returning from a ticket's tab under
 		// herdr) — refresh badges immediately so they're live on arrival rather
 		// than up to statusRefreshEvery stale.
 		m.inView = true
-		if m.demoStatuses == nil {
-			cmds := []tea.Cmd{m.refreshStatuses(), m.refreshSessions()}
+		if !m.demo {
+			cmds := []tea.Cmd{m.refreshStatuses()}
 			// Catch up on the Linear rounds skipped while this deck was out of
 			// view, but only past the point where the list would have refreshed
 			// anyway. Bouncing between the deck and a ticket tab is the common
@@ -668,16 +794,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case updateAvailableMsg:
 		m.updateLatest = msg.latest
 
-	case handoffMsg:
+	case moveDoneMsg:
+		return m.handleMoveDone(msg)
+
+	case continuedMsg:
 		if msg.err != nil {
-			debugLog.Printf("handoff %s → %s failed: %v", msg.key, msg.to, msg.err)
-			m.notice = fmt.Sprintf("hand-off failed: %v", msg.err)
+			debugLog.Printf("continue %s after its limit reset failed: %v", msg.key, msg.err)
+			m.err = fmt.Errorf("telling %s to continue: %v — trying again in a minute", m.label(msg.key), msg.err)
+			// Not handled after all: the next poll past the wait tries again.
+			if msg.errUUID != "" {
+				delete(m.handled, msg.errUUID)
+				m.retryAt[msg.errUUID] = time.Now().Add(retryContinue)
+			}
 			break
 		}
-		debugLog.Printf("handoff %s → %s ok", msg.key, msg.to)
-		m.notice = fmt.Sprintf("%s → ⦿%s ✓ resume it there (%s)", m.label(msg.key), msg.to, msg.cmd)
-		// The session is stopped here now, so refresh badges to show it.
-		return m, tea.Batch(m.refreshStatuses(), m.refreshSessions())
+		m.notice = fmt.Sprintf("%s: its usage limit reset — told it to carry on", m.label(msg.key))
+		if msg.afterPrompt {
+			m.notice = fmt.Sprintf("%s is past its startup prompt — told it to carry on", m.label(msg.key))
+		}
+		return m, m.refreshStatuses()
 
 	case quotaMsg:
 		for name, e := range msg.entries {
@@ -707,7 +842,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		prev := m.allIssues
 		m.rebuild(msg.issues)
 		m.queueFinishedCloses(prev, msg.issues)
-		return m, tea.Batch(m.refreshStatuses(), m.refreshSessions())
+		return m, m.refreshStatuses()
 
 	case projectsMsg:
 		if msg.err != nil {
@@ -754,16 +889,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case statusesMsg:
-		// Ownership is resolved from disk and the peer workspaces, not from the
-		// backend, so it stands even when the backend poll failed.
+		m.pollBusy = false
+		now := time.Now()
+		var cmds []tea.Cmd
+		if msg.snap != nil {
+			m.markSeen(msg.snap, msg.statuses, msg.others, now)
+			m.fleet = *msg.snap
+			m.otherSessions = msg.others
+			prevID, _ := m.selectedID()
+			prevRef := ""
+			if s, ok := m.selectedSession(); ok {
+				prevRef = s.Name
+			} else if p, ok := m.selectedProject(); ok {
+				prevRef = p.Key()
+			}
+			prevIdx := m.cursor
+			m.regroup()
+			m.restoreCursor(prevID, prevRef, prevIdx)
+			m.ensureVisible()
+			cmds = append(cmds, m.autoMoves(now)...)
+			cmds = append(cmds, m.adoptQueued()...)
+			cmds = append(cmds, m.sendPending()...)
+		}
+		// Ownership is resolved from disk and every workspace, not only this
+		// deck's own, so it stands even when that one failed to answer.
 		if msg.owners != nil {
 			m.owners = msg.owners
 			m.ownerCol = ownerColWidth(m.accounts, m.owners)
 		}
 		if msg.err != nil {
-			debugLog.Printf("status refresh error: %v", msg.err)
+			// A workspace that is down fails every poll; say so once, not every
+			// three seconds.
+			if e := msg.err.Error(); e != m.lastPollErr {
+				debugLog.Printf("status refresh error: %v", msg.err)
+				m.lastPollErr = e
+			}
 		} else {
-			now := time.Now()
+			m.lastPollErr = ""
 			for k, v := range msg.statuses {
 				if prev, ok := m.sessions[k]; !ok || prev != v {
 					m.statusSince[k] = now // status is new or changed → reset the timer
@@ -775,8 +937,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.sessions = msg.statuses
-			return m, m.closeIdleFinished(now)
+			cmds = append(cmds, m.closeIdleFinished(now))
 		}
+		return m, tea.Batch(cmds...)
 
 	case sessionsMsg:
 		if msg.err != nil {
@@ -805,6 +968,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.refreshStatuses()
 
 	case detachedDoneMsg:
+		delete(m.launching, msg.key)
 		if msg.err != nil {
 			debugLog.Printf("%s failed: %v — output: %s", msg.action, msg.err, msg.output)
 			// Prefer the command's output; fall back to the error itself so we
@@ -819,7 +983,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			debugLog.Printf("%s ok — output: %s", msg.action, msg.output)
 			m.notice = msg.action + " ✓"
 		}
-		return m, tea.Batch(m.refreshStatuses(), m.refreshSessions())
+		return m, m.refreshStatuses()
 
 	case statusWriteMsg:
 		if msg.err != nil {
@@ -947,6 +1111,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.openHintSpec != nil {
 			return m.updateOpenHint(msg)
 		}
+		if m.help {
+			return m.updateHelp(msg)
+		}
+		if m.acctMenu {
+			return m.updateAccounts(msg)
+		}
+		if m.bringMenu {
+			return m.updateBring(msg)
+		}
+		if m.prompt != nil {
+			return m.updatePrompt(msg)
+		}
 		if m.searchMode {
 			return m.updateSearch(msg)
 		}
@@ -1002,6 +1178,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if is, ok := m.selected(); ok {
 				return m.openHandoff(is)
 			}
+			if sr, ok := m.selectedSession(); ok {
+				return m.openHandoffFor(sr.Name, firstNonEmpty(sr.Title, sr.Name))
+			}
+		case "A":
+			if !m.multiAccount() {
+				m.notice = "only one Claude account on this machine — log another in with CLAUDE_CONFIG_DIR=~/.claude-<name> claude /login"
+				break
+			}
+			return m.openAccounts()
+		case "M":
+			return m.openBring()
+		case "R":
+			if sr, ok := m.selectedSession(); ok {
+				if s, ok := m.sessionForRef(sr); ok {
+					return m.openRenamePrompt(s)
+				}
+			}
+			m.notice = "R renames an ad-hoc session — move to one in Other sessions"
+		case "?":
+			m.help, m.helpOffset = true, 0
+		case "]":
+			m.jumpToNeedy(1)
+		case "[":
+			m.jumpToNeedy(-1)
 		case "s":
 			// Open the status-change menu (write). Unavailable in --demo.
 			if _, ok := m.selected(); !ok {
@@ -1042,11 +1242,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "n":
 			// Open an ad-hoc Claude session not tied to any ticket.
-			spec := m.backend.ScratchSpec(m.root)
-			return m.runSpec(spec, spec.Name)
+			return m.openNewPrompt()
 		case "x":
-			// Close the highlighted "other session" (transcript persists).
+			// Close the highlighted "other session" (transcript persists), or
+			// forget a stopped one.
 			if s, ok := m.selectedSession(); ok {
+				if !s.Live() {
+					return m.forgetSession(s)
+				}
 				return m.closeSession(s)
 			}
 		case "t":
@@ -1058,6 +1261,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.triageTicket(is)
 			}
 			if sr, ok := m.selectedSession(); ok {
+				if !sr.Live() || sr.Socket != "" {
+					m.notice = triageCmd + " needs the session running in this deck"
+					break
+				}
 				return m.sendToSession(sr.Name, triageCmd)
 			}
 		case "pgup", "ctrl+u":
@@ -1088,7 +1295,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(m.refresh(), m.refreshStatuses())
 		case "enter":
 			if s, ok := m.selectedSession(); ok {
-				return m.runSpec(m.backend.FocusSpec(s), s.Name)
+				return m.openOther(s)
 			}
 			return m.launchSelected()
 		}
@@ -1130,7 +1337,7 @@ func (m Model) blockingOwner(key string) (account.Owner, bool) {
 		return account.Owner{}, false
 	}
 	o := m.owners[key]
-	if o.Name == "" || o.Name == m.acct.Name || !o.Live || !o.Status.Running() {
+	if o.Name == "" || o.Home || !o.Live || !o.Status.Running() {
 		return account.Owner{}, false
 	}
 	return o, true
@@ -1160,11 +1367,54 @@ func (m Model) launchIssue(is linear.Issue) (tea.Model, tea.Cmd) {
 // launchIssueNow plans and runs (or dry-prints) the session for a specific
 // ticket, so it can be triggered from the list or from the description overlay.
 func (m Model) launchIssueNow(is linear.Issue) (tea.Model, tea.Cmd) {
-	spec, err := m.backend.Plan(toTicket(is), m.root)
+	return m.openUnit(toTicket(is), is.Identifier)
+}
+
+// openUnit opens a ticket's, project's or ad-hoc session. One running in this
+// deck's workspace is attached. Otherwise it opens on the account the router
+// picks — the one it already lives on, unless that one is out — and when that
+// is not where its conversation lives, the launch copies it over first.
+func (m Model) openUnit(t session.Ticket, label string) (tea.Model, tea.Cmd) {
+	forced := m.forceAcct
+	m.forceAcct = nil
+	// A second ⏎ while the first launch is still starting would start the same
+	// session twice; herdr refuses the second, and nothing good comes of it.
+	if m.launching[t.Key] {
+		m.notice = label + " is still opening…"
+		return m, nil
+	}
+	best, has := m.fleet.Best(t.Key)
+	attach := has && best.Live && best.Home
+	why := ""
+	if !attach && m.multiAccount() {
+		sticky := ""
+		if has && !best.Live {
+			sticky = best.Account
+		}
+		acct, w := m.launchAccount(sticky)
+		if forced != nil {
+			acct, w = *forced, "chosen"
+		}
+		why = w
+		t.Account, t.ConfigDir = acct.Name, acct.ConfigDir
+		if has && !best.Live && best.ConfigDir != acct.ConfigDir {
+			t.SessionID, t.Resume = best.ID, true
+		}
+	}
+	spec, err := m.backend.Plan(t, m.root)
 	if err != nil {
-		debugLog.Printf("plan error for %s: %v", is.Identifier, err)
+		debugLog.Printf("plan error for %s: %v", t.Key, err)
 		m.err = err
 		return m, nil
+	}
+	// A session already running here is only switched to; its conversation is
+	// wherever it is running from.
+	if t.Resume && spec.Action != "focus" {
+		spec.CopyFrom = best.ConfigDir
+	}
+	m.openHintWhy = ""
+	if spec.Account != "" && spec.Action != "focus" {
+		m.openHintWhy = "opens on ⦿" + spec.Account + " — " + why
 	}
 	// Opening in a herdr tab switches focus away from the deck; show a one-time
 	// (dismissable) reminder of how to get back before launching. Skipped for
@@ -1172,10 +1422,55 @@ func (m Model) launchIssueNow(is linear.Issue) (tea.Model, tea.Cmd) {
 	if !m.dry && !spec.Foreground && !m.hideOpenHint {
 		s := spec
 		m.openHintSpec = &s
-		m.openHintLabel = is.Identifier
+		m.openHintLabel, m.openHintKey = label, t.Key
 		return m, nil
 	}
-	return m.runSpec(spec, is.Identifier)
+	return m.runSpec(spec, label)
+}
+
+// openOther handles ⏎ on an Other sessions row: switch to one running here,
+// bring in one running in another deck, or resume a stopped one.
+func (m Model) openOther(ref session.SessionRef) (tea.Model, tea.Cmd) {
+	s, ok := m.sessionForRef(ref)
+	switch {
+	case ref.Live() && ref.Socket == "":
+		return m.runSpec(m.backend.FocusSpec(ref), ref.Name)
+	case ref.Live() && ok:
+		if !bringable(s) {
+			m.adoptQueue[s.Key] = true
+			m.notice = m.sessionLabel(s) + " is busy in the " + s.Workspace + " deck — it comes in once its turn ends"
+			return m, nil
+		}
+		m.moving[s.Key] = true
+		m.notice = "bringing " + m.sessionLabel(s) + " into this deck…"
+		return m, m.moveCmd(s, m.sessionAccount(s), moveOpts{adopt: true, focus: true, why: "opened from the " + s.Workspace + " deck"})
+	case !ref.Live() && ok:
+		t := session.Ticket{Key: s.Key, Title: s.Name, Scratch: true, SessionID: s.ID}
+		return m.openUnit(t, firstNonEmpty(s.Name, s.Key))
+	}
+	return m, nil
+}
+
+// sessionForRef finds the polled session behind an Other sessions row.
+func (m Model) sessionForRef(ref session.SessionRef) (fleet.Session, bool) {
+	for _, s := range m.fleet.Sessions {
+		if s.Key == ref.Name && s.Live == ref.Live() && s.Socket == ref.Socket {
+			return s, true
+		}
+	}
+	return fleet.Session{}, false
+}
+
+// forgetSession drops a stopped ad-hoc session from the deck. Its conversation
+// stays on disk, where `claude --resume` still finds it.
+func (m Model) forgetSession(ref session.SessionRef) (tea.Model, tea.Cmd) {
+	if ref.SessionID == "" {
+		return m, nil
+	}
+	_ = ledger.Update(ref.SessionID, func(e *ledger.Entry) { e.Forgotten = true })
+	m.ledger = ledger.Load()
+	m.notice = "forgot " + firstNonEmpty(ref.Title, ref.Name) + " (its conversation stays on disk)"
+	return m, m.refreshStatuses()
 }
 
 // updateConflict handles the "another deck is running this" gate. Cancel is the
@@ -1200,23 +1495,23 @@ func (m Model) updateConflict(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.openProjectPRs(*c.project)
 		}
 		return m.openPRFor(c.issue)
+	case "b":
+		m.conflict = nil
+		key := c.issue.Identifier
+		if c.project != nil {
+			key = c.project.Key()
+		}
+		s, ok := m.fleet.Best(key)
+		if !ok || !s.Live || s.Home || s.Socket == "" {
+			m.notice = c.name() + " isn't in a deck this one can bring it in from"
+			return m, nil
+		}
+		return m.openOther(session.SessionRef{Name: s.Key, Status: s.Status, Socket: s.Socket})
 	default:
 		m.conflict = nil
-		m.notice = c.name() + " left to ⦿" + c.owner.Name + " · " + m.deckCmd(c.owner.Name)
+		m.notice = c.name() + " left where it runs · b brings it here"
 	}
 	return m, nil
-}
-
-// deckCmd is the command that opens another account's deck, for pointing the
-// user at the deck that owns a session. Falls back to the flag form when that
-// account isn't in this deck's list (a peer that appeared mid-run).
-func (m Model) deckCmd(name string) string {
-	for _, a := range m.accounts {
-		if a.Name == name {
-			return a.LaunchCmd()
-		}
-	}
-	return "deck --account " + name
 }
 
 // renderConflict draws the gate shown when another deck already runs the
@@ -1234,7 +1529,7 @@ func (m Model) renderConflict() string {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s %s\n\n", titleStyle.Render("Already open on another deck"), idStyle.Render(c.name()))
+	fmt.Fprintf(&b, "%s %s\n\n", titleStyle.Render("Already running elsewhere"), idStyle.Render(c.name()))
 	fmt.Fprintf(&b, "  %s   %s\n\n", m.acctStyle(c.owner.Name).Bold(true).Render("⦿ "+c.owner.Name), glyph+" "+state)
 	// The blank line stays outside the Render: lipgloss pads every line of a
 	// multi-line block to the widest one, including a trailing empty line, and
@@ -1247,11 +1542,17 @@ func (m Model) renderConflict() string {
 	if c.triage {
 		anyway = "run " + triageCmd
 	}
-	fmt.Fprintf(&b, "%s\n", selStyle.Render(" ⏎  leave it to ⦿"+c.owner.Name+" "))
+	where := "the " + c.owner.Workspace + " deck"
+	if c.owner.Workspace == "" {
+		where = "another deck"
+	}
+	fmt.Fprintf(&b, "%s\n", selStyle.Render(" ⏎  leave it where it runs "))
+	if c.owner.Workspace != "" && c.owner.Workspace != "a terminal" {
+		fmt.Fprintf(&b, "  b  bring it here from %s (same account, nothing forks)\n", where)
+	}
 	fmt.Fprint(&b, "  p  open its PR here instead\n")
 	fmt.Fprintf(&b, "  o  %s here anyway\n", anyway)
-	fmt.Fprintf(&b, "\n%s\n", dimStyle.Render("  esc  cancel"))
-	fmt.Fprint(&b, dimStyle.Render("  work it where it lives:  "+m.deckCmd(c.owner.Name)))
+	fmt.Fprintf(&b, "\n%s", dimStyle.Render("  esc  cancel"))
 	return b.String()
 }
 
@@ -1267,6 +1568,10 @@ func statusPhrase(s session.Status) string {
 		return "idle"
 	case session.Background:
 		return "idle, with a background task running"
+	case session.Unread:
+		return "finished a turn nobody has looked at"
+	case session.Limited:
+		return "out of usage on its account"
 	default:
 		_, label, _ := sessionStyle(s)
 		return label
@@ -1288,6 +1593,9 @@ func (m Model) updateOpenHint(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.hideOpenHint = true
 		m.openHintSpec = nil
 		return m.runSpec(spec, label)
+	case "H":
+		m.openHintSpec = nil
+		return m.openHandoffFor(m.openHintKey, label)
 	case "esc", "q":
 		m.openHintSpec = nil
 		m.notice = "canceled"
@@ -1307,26 +1615,99 @@ func (m Model) runSpec(spec session.LaunchSpec, label string) (tea.Model, tea.Cm
 		if len(cmdline) > 140 { // the appended system prompt can be long
 			cmdline = cmdline[:137] + "…"
 		}
-		m.notice = fmt.Sprintf("[dry] %s  (cwd=%s · %s)", cmdline, spec.Cwd, spec.Action)
+		on := ""
+		if spec.Account != "" {
+			on = " · ⦿" + spec.Account
+		}
+		m.notice = fmt.Sprintf("[dry] %s  (cwd=%s · %s%s)", cmdline, spec.Cwd, spec.Action, on)
 		return m, nil
 	}
 
+	accts := m.accounts
 	if spec.Foreground {
 		// Interactive claude: hand over the terminal; return on exit.
+		if err := copyForLaunch(accts, spec, label); err != nil {
+			m.err = err
+			return m, nil
+		}
 		c := exec.Command(bin, spec.Args...)
 		c.Dir = spec.Cwd
+		c.Env = append(os.Environ(), session.AccountEnv(spec.ConfigDir)...)
 		m.notice = ""
+		recordLaunch(spec)
 		return m, tea.ExecProcess(c, func(err error) tea.Msg { return execDoneMsg{err: err} })
 	}
 	// Fire-and-return (herdr): run via the backend (which may open a new tab),
 	// capture output, stay in the deck.
 	m.notice = spec.Action + " " + label + "…"
+	if spec.Account != "" && m.multiAccount() && spec.Action != "focus" {
+		m.notice = spec.Action + " " + label + " on ⦿" + spec.Account + "…"
+	}
 	backend := m.backend
 	action := spec.Action + " " + label
-	return m, func() tea.Msg {
-		out, err := backend.RunDetached(spec)
-		return detachedDoneMsg{action: action, err: err, output: strings.TrimSpace(out)}
+	if spec.Account != "" && m.multiAccount() && spec.Action != "focus" {
+		action += " on ⦿" + spec.Account
 	}
+	key := ""
+	if spec.Action != "focus" && spec.Name != "" {
+		key = spec.Name
+		m.launching[key] = true
+	}
+	return m, func() tea.Msg {
+		if err := copyForLaunch(accts, spec, label); err != nil {
+			return detachedDoneMsg{action: action, err: err, key: key}
+		}
+		out, err := backend.RunDetached(spec)
+		if err == nil {
+			recordLaunch(spec)
+		}
+		return detachedDoneMsg{action: action, err: err, output: strings.TrimSpace(out), key: key}
+	}
+}
+
+// copyForLaunch copies a session's conversation to the account it is about to
+// resume on, when that isn't the account holding it.
+func copyForLaunch(accts []account.Account, spec session.LaunchSpec, label string) error {
+	if spec.CopyFrom == "" || spec.CopyFrom == spec.ConfigDir || spec.Action == "focus" || spec.SessionID == "" {
+		return nil
+	}
+	from, ok := account.Find(accts, spec.CopyFrom)
+	if !ok {
+		from = account.Account{Name: strings.TrimPrefix(filepath.Base(spec.CopyFrom), ".claude-"), ConfigDir: spec.CopyFrom}
+	}
+	to := account.Account{Name: spec.Account, ConfigDir: spec.ConfigDir}
+	if err := account.CopySession(from, to, spec.SessionID, label); err != nil && !errors.Is(err, account.ErrNoSession) {
+		return err
+	}
+	return nil
+}
+
+// recordLaunch remembers which account a launched session runs on, and for an
+// ad-hoc one, that it exists at all.
+func recordLaunch(spec session.LaunchSpec) {
+	if spec.SessionID == "" || spec.Action == "focus" {
+		return
+	}
+	kind := ledger.Ticket
+	switch {
+	case spec.Action == "scratch":
+		kind = ledger.Scratch
+	case strings.HasPrefix(spec.Name, linear.ProjectKeyPrefix):
+		kind = ledger.Project
+	}
+	_ = ledger.Update(spec.SessionID, func(e *ledger.Entry) {
+		e.Key = firstNonEmpty(e.Key, spec.Name)
+		if e.Kind == "" || e.Kind != ledger.Scratch {
+			e.Kind = kind
+		}
+		if spec.ConfigDir != "" {
+			e.Account, e.ConfigDir = spec.Account, spec.ConfigDir
+		}
+		e.Cwd = firstNonEmpty(e.Cwd, spec.Cwd)
+		if e.Started.IsZero() {
+			e.Started = time.Now()
+		}
+	})
 }
 
 // sendToSession fires text at a running session (by name) without switching to
@@ -1355,11 +1736,32 @@ func (m Model) triageTicket(is linear.Issue) (tea.Model, tea.Cmd) {
 
 func (m Model) triageTicketNow(is linear.Issue) (tea.Model, tea.Cmd) {
 	m.notice = "triaging " + is.Identifier + " in the background…"
-	backend := m.backend
+	backend, accts := m.backend, m.accounts
 	t := toTicket(is)
 	root := m.root
+	spec := session.LaunchSpec{}
+	best, has := m.fleet.Best(t.Key)
+	if attached := has && best.Live && best.Home; !attached && m.multiAccount() {
+		sticky := ""
+		if has && !best.Live {
+			sticky = best.Account
+		}
+		acct, _ := m.launchAccount(sticky)
+		t.Account, t.ConfigDir = acct.Name, acct.ConfigDir
+		if has && !best.Live && best.ConfigDir != acct.ConfigDir {
+			t.Resume = true
+			spec = session.LaunchSpec{CopyFrom: best.ConfigDir, ConfigDir: acct.ConfigDir, Account: acct.Name, SessionID: t.ID(), Name: t.Key}
+		}
+		m.notice = "triaging " + is.Identifier + " on ⦿" + acct.Name + " in the background…"
+	}
 	return m, func() tea.Msg {
+		if err := copyForLaunch(accts, spec, is.Identifier); err != nil {
+			return detachedDoneMsg{action: "triage " + is.Identifier, err: err}
+		}
 		out, err := backend.Triage(t, root)
+		if err == nil && t.ConfigDir != "" {
+			recordLaunch(session.LaunchSpec{Name: t.Key, SessionID: t.ID(), Account: t.Account, ConfigDir: t.ConfigDir, Cwd: root, Action: "start"})
+		}
 		return detachedDoneMsg{action: "triage " + is.Identifier, err: err, output: strings.TrimSpace(out)}
 	}
 }
@@ -1617,7 +2019,7 @@ func (m Model) closeIdleFinished(now time.Time) tea.Cmd {
 	var cmds []tea.Cmd
 	for key := range m.closeOnIdle {
 		switch st := m.sessions[key]; {
-		case st == session.Idle:
+		case st == session.Idle || st == session.Unread:
 			if now.Sub(m.statusSince[key]) < finishedIdleGrace {
 				continue
 			}
@@ -1939,21 +2341,22 @@ func (m *Model) rebuild(issues []linear.Issue) {
 	m.ensureVisible()
 }
 
-// applyDemoStatuses resolves --demo's canned session statuses synchronously, so
+// applyDemoStatuses resolves --demo's canned sessions synchronously, so
 // --preview shows badges without an event loop. Real backends populate
 // m.sessions asynchronously via statusesMsg, and this is a no-op for them. It
 // runs after every regroup, because the key set it fills grows when the project
 // rows arrive.
 func (m *Model) applyDemoStatuses() {
-	if m.demoStatuses == nil {
+	if !m.demo {
 		return
 	}
 	keys := m.sessionKeys()
-	out := make(map[string]session.Status, len(keys))
+	visible := map[string]bool{}
 	for _, k := range keys {
-		out[k] = m.demoStatuses[k]
+		visible[k] = true
 	}
-	m.sessions = out
+	m.sessions, m.owners, m.otherSessions = derive(m.fleet, keys, visible)
+	m.ownerCol = ownerColWidth(m.accounts, m.owners)
 }
 
 // restoreCursor puts the cursor back on the same ticket (prevID), or on the
@@ -2295,12 +2698,13 @@ func (m Model) viewportHeight() int {
 	if m.height <= 0 {
 		return 0
 	}
-	reserved := 1 + 1 + 1 // title + blank spacer + help line
-	if m.hasOtherQuotaLine() {
-		reserved++ // second header line: the other subscriptions' usage
-	}
-	if m.err != nil || m.notice != "" {
-		reserved++ // status line above help
+	// title + blank spacer + status line + help line. The status line is
+	// always reserved: it carries the highlighted row's details when there is
+	// no notice, and a line that came and went would shift the list under the
+	// cursor.
+	reserved := 1 + 1 + 1 + 1
+	if m.hasAccountsLine() {
+		reserved++ // second header line: every account's usage
 	}
 	h := m.height - reserved
 	if h < 1 {
@@ -2491,14 +2895,30 @@ func (m Model) View() string {
 	if m.openHintSpec != nil {
 		return m.renderOpenHint()
 	}
+	if m.help {
+		return m.renderHelp()
+	}
+	if m.acctMenu {
+		return m.renderAccounts()
+	}
+	if m.bringMenu {
+		return m.renderBring()
+	}
 	var b strings.Builder
 
 	upd := ""
 	if m.updateLatest != "" {
 		upd = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(fmt.Sprintf("  ⬆ %s available · ticketdeck update", m.updateLatest))
 	}
-	fmt.Fprintf(&b, "%s%s%s%s%s\n", titleStyle.Render("TicketDeck"), m.accountSegment(), dimStyle.Render(m.titleMeta()), m.quotaSegment(), upd)
-	fmt.Fprint(&b, m.otherQuotaLine())
+	elsewhere := ""
+	if n := m.needyCount(); n > 0 {
+		elsewhere += lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(fmt.Sprintf("  ◆ %d need you · ] next", n))
+	}
+	if n := len(m.peerSessions()); n > 0 {
+		elsewhere += lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(fmt.Sprintf("  ⇣ %d in other decks · M brings them here", n))
+	}
+	fmt.Fprintf(&b, "%s%s%s%s%s%s\n", titleStyle.Render("TicketDeck"), m.accountSegment(), dimStyle.Render(m.titleMeta()), m.quotaSegment(), elsewhere, upd)
+	fmt.Fprint(&b, m.accountsLine())
 
 	if m.loading && len(m.rows) == 0 {
 		fmt.Fprint(&b, dimStyle.Render("\n  loading tickets…\n"))
@@ -2562,25 +2982,13 @@ func (m Model) window() (int, int) {
 	return start, end
 }
 
-// otherAccounts is the cached subscriptions minus the one this deck runs as. It
-// reads the cached list rather than re-globbing, because View calls it.
-func (m Model) otherAccounts() []account.Account {
-	var out []account.Account
-	for _, a := range m.accounts {
-		if a.ConfigDir != m.acct.ConfigDir {
-			out = append(out, a)
-		}
-	}
-	return out
-}
-
 // rescanAccounts re-globs the subscriptions on disk. New() resolves the list
 // once, which made a deck blind to any account that logged in after it started
 // — the normal order, since `claude auth login` happens in another terminal
 // hours later. The account was simply absent as a hand-off target until every
 // deck on the box was restarted, with nothing on screen saying why.
 func (m *Model) rescanAccounts() {
-	if m.demoStatuses != nil {
+	if m.demo {
 		return // --demo fabricates accounts and their colors; a rescan drops them
 	}
 	accts := account.All()
@@ -2590,45 +2998,6 @@ func (m *Model) rescanAccounts() {
 	m.accounts = accts
 	m.acctColors = account.Colors(accts)
 	m.ownerCol = ownerColWidth(m.accounts, m.owners)
-}
-
-// byHeadroom orders hand-off candidates most-free first, so the default
-// selection is the subscription with the most room left.
-//
-// An account is ranked by whichever of its two windows is closer to its cap,
-// not by their average: being at 5% of the 5-hour window buys nothing on a
-// subscription sitting at 98% of its 7-day one. An account with no reading
-// sorts last — unknown headroom is not evidence of headroom — and ties break on
-// name so the list doesn't reshuffle between frames.
-func (m Model) byHeadroom(cands []account.Account) []account.Account {
-	out := slices.Clone(cands)
-	slices.SortStableFunc(out, func(a, b account.Account) int {
-		ha, oka := m.headroom(a.Name)
-		hb, okb := m.headroom(b.Name)
-		if oka != okb {
-			if oka {
-				return -1
-			}
-			return 1
-		}
-		if oka {
-			if c := cmp.Compare(hb, ha); c != 0 {
-				return c
-			}
-		}
-		return strings.Compare(a.Name, b.Name)
-	})
-	return out
-}
-
-// headroom is the percentage of an account's tighter rate window still free,
-// and whether there was a reading to compute it from.
-func (m Model) headroom(name string) (float64, bool) {
-	u := m.quotas[name].Usage
-	if u == nil {
-		return 0, false
-	}
-	return 100 - max(u.FiveHourPct, u.SevenDayPct), true
 }
 
 // openHandoff opens the confirm overlay for moving a ticket's session to
@@ -2644,22 +3013,35 @@ func (m Model) openHandoff(is linear.Issue) (tea.Model, tea.Cmd) {
 // what to call it on screen, since a project's key is a slug nobody would
 // recognise.
 func (m Model) openHandoffFor(key, label string) (tea.Model, tea.Cmd) {
-	if m.demoStatuses != nil {
-		m.notice = "hand-off needs a live backend"
+	if m.demo {
+		m.notice = "moving sessions needs a live backend"
 		return m, nil
 	}
-	cands := m.byHeadroom(m.otherAccounts())
+	if !m.multiAccount() {
+		m.notice = "only one Claude account on this machine — log another in with CLAUDE_CONFIG_DIR=~/.claude-<name> claude /login"
+		return m, nil
+	}
+	if m.moving[key] {
+		m.notice = label + " is already moving"
+		return m, nil
+	}
+	cands := m.handoffTargets(key)
 	if len(cands) == 0 {
-		m.notice = "only one Claude subscription found — see `deck --account` in SETUP.md"
-		return m, nil
-	}
-	if st := m.sessions[key]; st == session.None {
-		m.notice = label + " has no session to hand off"
+		m.notice = "no other account to move " + label + " to"
 		return m, nil
 	}
 	m.handoffKey = key
+	m.handoffLabel = label
 	m.handoffCands = cands
+	// Start on the first account that can take work, not on one that can't.
 	m.handoffCursor = 0
+	verdicts := m.verdicts()
+	for i, a := range cands {
+		if verdicts[a.Name] != route.Out {
+			m.handoffCursor = i
+			break
+		}
+	}
 	m.notice = ""
 	return m, nil
 }
@@ -2687,40 +3069,14 @@ func (m Model) updateHandoff(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) confirmHandoff(i int) (tea.Model, tea.Cmd) {
-	if i < 0 || i >= len(m.handoffCands) {
-		return m, nil
-	}
-	key, to := m.handoffKey, m.handoffCands[i]
-	m.handoffKey, m.handoffCands, m.handoffCursor = "", nil, 0
-	m.notice = fmt.Sprintf("handing %s to ⦿%s…", m.label(key), to.Name)
-	return m, m.handOff(key, to)
-}
-
-// handOff stops the ticket's session here, then copies its transcript into the
-// target account. Stopping first is mandatory: two accounts appending to their
-// own copy of one transcript diverge with no way back.
-func (m Model) handOff(key string, to account.Account) tea.Cmd {
-	backend, from := m.backend, m.acct
-	return func() tea.Msg {
-		// Best-effort: a stopped session is already fine, and the built-in claude
-		// backend has no daemon to stop one through.
-		if out, err := backend.CloseByName(key); err != nil {
-			debugLog.Printf("handoff %s: close failed (continuing): %v %s", key, err, out)
-		}
-		if err := account.HandOff(from, to, key); err != nil {
-			return handoffMsg{key: key, to: to.Name, err: err}
-		}
-		return handoffMsg{key: key, to: to.Name, cmd: to.LaunchCmd()}
-	}
-}
-
 // accountSegment names the Claude subscription this deck runs as. Every deck
 // renders one, including the primary: an unlabelled deck is ambiguous with any
 // other deck, which is what the badge exists to prevent. The color is
 // per-account so two decks never look alike at a glance.
 func (m Model) accountSegment() string {
-	if m.acct.Name == "" {
+	// With several accounts the deck runs them all, and the line under the
+	// title names every one.
+	if m.acct.Name == "" || m.multiAccount() {
 		return ""
 	}
 	return m.acctStyle(m.acct.Name).Bold(true).Render("  ⦿ " + m.acct.Name)
@@ -2744,7 +3100,15 @@ func (m Model) acctColor(name string) lipgloss.Color {
 // quotaSegment renders this account's Claude 5h/7d usage for the title bar,
 // color-coded by utilization, with a coarse "resets in" hint.
 func (m Model) quotaSegment() string {
+	if m.multiAccount() {
+		return ""
+	}
 	e := m.quotas[m.acct.Name]
+	if cur := e.Current(time.Now()); cur != nil {
+		e.Usage = cur
+	} else {
+		e.Usage = nil
+	}
 	if e.Usage == nil {
 		if e.Reason == "" {
 			return ""
@@ -2765,40 +3129,6 @@ func staleMark(e quota.Entry) string {
 		return ""
 	}
 	return dimStyle.Render(" ~")
-}
-
-// otherQuotaLine renders the OTHER subscriptions' usage on its own line under
-// the title. This is why every account is read, not just the active one: when
-// this one is throttled, the decision you need is whether another has headroom,
-// and that answer must not require switching decks to go look.
-// hasOtherQuotaLine reports whether the header carries the other-accounts row,
-// so viewportHeight can reserve a line for it. Kept beside otherQuotaLine: if
-// the two ever disagree the body is sized wrong and the footer scrolls off.
-func (m Model) hasOtherQuotaLine() bool { return len(m.otherAccounts()) > 0 }
-
-func (m Model) otherQuotaLine() string {
-	var parts []string
-	for _, a := range m.accounts {
-		if a.Name == m.acct.Name {
-			continue
-		}
-		// An account whose usage can't be read still gets a row. Dropping it made
-		// a rate-limited or logged-out subscription look like it wasn't detected
-		// at all, which is the opposite of what this line is for.
-		e := m.quotas[a.Name]
-		body := dimStyle.Render(cmp.Or(e.Reason, "usage unavailable"))
-		if e.Usage != nil {
-			body = quotaPair(e.Usage, false) + staleMark(e)
-		}
-		// "⦿ name", spaced exactly as accountSegment renders the active account —
-		// without the space this line's names sit one column left of the title
-		// bar's and the two rows visibly fail to stack.
-		parts = append(parts, m.acctStyle(a.Name).Render("⦿ "+a.Name)+" "+body)
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return "            " + strings.Join(parts, dimStyle.Render("  ")) + "\n"
 }
 
 // quotaPair formats one account's two windows. The "resets in" hint is only
@@ -2983,13 +3313,30 @@ func (m Model) elapsedInStatus(key string, st session.Status) string {
 // working or wedged.
 func (m Model) rowSession(key string) (st session.Status, elapsed string, remote bool) {
 	if local := m.sessions[key]; local != session.None {
-		return local, m.elapsedInStatus(key, local), false
+		return local, m.statusDetail(key, local), false
 	}
 	o := m.owners[key]
-	if o.Name == "" {
+	if o.Name == "" || !o.Live {
 		return session.None, "", false
 	}
-	return o.Status, elapsedLabel(o.LastActive), o.Name != m.acct.Name
+	return o.Status, elapsedLabel(o.LastActive), !o.Home
+}
+
+// statusDetail is what follows a badge's label: when a session out of usage
+// gets it back, else how long it has held its state.
+func (m Model) statusDetail(key string, st session.Status) string {
+	if st == session.Limited {
+		if s, ok := m.fleet.Best(key); ok && s.Activity.Tail.Err != nil && !s.Activity.Tail.Err.ResetsAt.IsZero() {
+			return route.Clock(s.Activity.Tail.Err.ResetsAt, time.Now())
+		}
+		return ""
+	}
+	if st == session.Errored {
+		if s, ok := m.fleet.Best(key); ok && s.Activity.Tail.Err.AuthFailed() {
+			return "login"
+		}
+	}
+	return m.elapsedInStatus(key, st)
 }
 
 // renderIssue draws one ticket row. indent is extra leading columns, used to
@@ -3128,22 +3475,52 @@ func validationTag(labels []string) (string, lipgloss.Color) {
 	return "", lipgloss.Color("")
 }
 
-// renderSession renders an "other sessions" row: its status badge + name. These
-// come from this deck's own backend, so the account column always names this
-// subscription — the peers' equivalents show up on their own decks.
+// renderSession renders an "other sessions" row: the account running it, its
+// status badge, its name, and where it runs when that isn't this deck.
 func (m Model) renderSession(ref session.SessionRef, selected bool) string {
-	cell, color := sessionCellText(ref.Status, "")
-	own, ownColor := m.ownerCell(m.acct.Name, selected)
-	name := ref.Name
+	detail := ""
+	if ref.Live() && ref.Socket == "" {
+		detail = m.statusDetail(ref.Name, ref.Status)
+	}
+	cell, color := sessionCellText(ref.Status, detail)
+	own, ownColor := m.ownerCell(cmp.Or(ref.Account, m.acct.Name), selected)
+	name := firstNonEmpty(ref.Title, ref.Name)
+	where := ""
+	switch {
+	case ref.Live() && ref.Socket != "":
+		if s, ok := m.sessionForRef(ref); ok && s.Workspace != "" {
+			where = "in the " + s.Workspace + " deck · ⏎ brings it here"
+		}
+	case !ref.Live():
+		if s, ok := m.sessionForRef(ref); ok {
+			if e := elapsedLabel(s.LastActive); e != "" {
+				where = e + " ago"
+			}
+		}
+	}
 	avail := m.rowWidth() - (2 + m.ownerCol + sessionCol + 1)
+	if where != "" {
+		avail -= cols(where) + 2
+	}
 	if avail > 0 {
-		name = truncCols(name, avail)
+		name = truncCols(name, max(avail, 12))
 	}
 	if selected {
-		return selStyle.Width(m.rowWidth()).Render(fmt.Sprintf("▶ %s%s %s", own, cell, name))
+		content := fmt.Sprintf("▶ %s%s %s", own, cell, name)
+		if where != "" {
+			content += "  " + where
+		}
+		return selStyle.Width(m.rowWidth()).Render(content)
 	}
 	badge := lipgloss.NewStyle().Foreground(color).Render(cell)
-	return fmt.Sprintf("  %s%s %s", lipgloss.NewStyle().Foreground(ownColor).Render(own), badge, name)
+	if ref.Live() && ref.Socket != "" {
+		badge = lipgloss.NewStyle().Foreground(ownColor).Render(cell)
+	}
+	out := fmt.Sprintf("  %s%s %s", lipgloss.NewStyle().Foreground(ownColor).Render(own), badge, name)
+	if where != "" {
+		out += "  " + dimStyle.Render(where)
+	}
+	return out
 }
 
 // sessionCellText returns the badge + status label as plain text padded to
@@ -3158,6 +3535,9 @@ func sessionCellText(s session.Status, elapsed string) (string, lipgloss.Color) 
 	if elapsed != "" {
 		text += " " + elapsed
 	}
+	// The cell is a fixed column: anything wider would push the rest of the row
+	// out of line with every other row.
+	text = truncCols(text, sessionCol)
 	if pad := sessionCol - cols(text); pad > 0 {
 		text += strings.Repeat(" ", pad)
 	}
@@ -3175,6 +3555,12 @@ func sessionStyle(s session.Status) (glyph, label string, color lipgloss.Color) 
 		return "○", "idle", lipgloss.Color("81") // cyan
 	case session.Background:
 		return "◐", "background", lipgloss.Color("141") // lavender
+	case session.Unread:
+		return "◉", "your turn", lipgloss.Color("48") // bright green: finished, unseen
+	case session.Limited:
+		return "⊘", "limit", lipgloss.Color("203") // red: its account is out
+	case session.Errored:
+		return "✗", "error", lipgloss.Color("203")
 	case session.Completed:
 		return "✓", "done", lipgloss.Color("71") // muted green
 	case session.Stopped:
@@ -3257,6 +3643,9 @@ func DescribeText(is linear.Issue, width int) string {
 func (m Model) renderOpenHint() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s\n\n", titleStyle.Render("Opening"), idStyle.Render(m.openHintLabel))
+	if m.openHintWhy != "" {
+		fmt.Fprintf(&b, "%s\n\n", dimStyle.Render(m.openHintWhy+" · H picks another account"))
+	}
 	fmt.Fprintf(&b, "%s opens in its own tab. To come back to this ticket list:\n\n", m.openHintLabel)
 	fmt.Fprintf(&b, "    %s  — jump straight to the deck (tab 1)\n", noticeStyle.Render("Ctrl+b 1"))
 	fmt.Fprintf(&b, "    %s  — search all tabs by name\n\n", noticeStyle.Render("Ctrl+b g"))
@@ -3307,39 +3696,65 @@ func (m Model) renderAssign() string {
 	return b.String()
 }
 
-// renderHandoff draws the hand-off confirm: which subscription the ticket's
-// session moves to, and what that costs. It spells out the two things that
-// surprise people — the session stops here, and resuming replays context rather
-// than continuing a live process.
+// renderHandoff draws the move confirm: which account the session moves to,
+// and what that costs. It spells out the thing that surprises people — what
+// carries over is the conversation, not a running process.
 func (m Model) renderHandoff() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s %s\n", titleStyle.Render("Hand off session"), idStyle.Render(m.label(m.handoffKey)))
-	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render("↑/↓ select · ⏎ hand off · 1-9 pick · esc cancel"))
+	s, has := m.fleet.Best(m.handoffKey)
+	title := "Move session"
+	if !has {
+		title = "Open on an account"
+	}
+	fmt.Fprintf(&b, "%s %s\n", titleStyle.Render(title), idStyle.Render(firstNonEmpty(m.handoffLabel, m.label(m.handoffKey))))
+	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render("↑/↓ select · ⏎ choose · 1-9 pick · esc cancel"))
 
-	fmt.Fprintf(&b, "  from  %s\n\n", m.acctStyle(m.acct.Name).Bold(true).Render("⦿ "+m.acct.Name))
+	if has {
+		state := "resumable"
+		if s.Live {
+			_, state, _ = sessionStyle(s.Status)
+		}
+		fmt.Fprintf(&b, "  from  %s  %s\n\n", m.acctStyle(s.Account).Bold(true).Render("⦿ "+s.Account), dimStyle.Render(state))
+	}
+	ranked := map[string]string{}
+	for _, r := range m.acctRows() {
+		ranked[r.Name] = r.Note
+	}
 	for i, a := range m.handoffCands {
 		num := " "
 		if i < 9 {
 			num = strconv.Itoa(i + 1)
 		}
-		row := fmt.Sprintf("%s  to    %s", num, "⦿ "+a.Name)
-		if e := m.quotas[a.Name]; e.Usage != nil {
-			row += fmt.Sprintf("   %s", quotaPair(e.Usage, true)+staleMark(e))
+		to := "to  "
+		if !has {
+			to = "on  "
 		}
-		if i == m.handoffCursor {
+		row := fmt.Sprintf("%s  %s  %-12s %s", num, to, "⦿ "+a.Name, ranked[a.Name])
+		switch {
+		case i == m.handoffCursor:
 			fmt.Fprintf(&b, "%s\n", selStyle.Render("▶ "+row))
-		} else {
-			fmt.Fprintf(&b, "  %s\n", row)
+		case m.verdicts()[a.Name] == route.Out:
+			fmt.Fprintf(&b, "  %s\n", dimStyle.Render(row))
+		default:
+			fmt.Fprintf(&b, "  %s\n", m.acctStyle(a.Name).Render(row))
 		}
 	}
-
-	warn := ""
-	if m.sessions[m.handoffKey] == session.Working {
-		warn = "\n  ⚠ that session is working right now — handing off interrupts it"
+	if !has {
+		return b.String()
 	}
-	fmt.Fprintf(&b, "\n%s%s\n", dimStyle.Render(
-		"  stops the session here, copies its transcript over, and it becomes\n"+
-			"  resumable in that deck. Context carries; an in-flight tool call does not."), warn)
+	warn := ""
+	switch {
+	case s.Live && s.Status == session.Working:
+		warn = "\n  ⚠ it is working right now — moving it stops what it is doing"
+	case s.Activity.InFlight.Any():
+		warn = "\n  ⚠ it has background work running — that stops with it"
+	}
+	what := "  copies its conversation over; the next ⏎ resumes it there."
+	if s.Live {
+		what = "  stops it, copies its conversation over, and resumes it there in a new\n" +
+			"  tab of this deck. The conversation carries; a running process does not."
+	}
+	fmt.Fprintf(&b, "\n%s%s\n", dimStyle.Render(what), warn)
 	return b.String()
 }
 
@@ -3427,7 +3842,9 @@ func (m Model) renderDetail() string {
 	if e := m.elapsedInStatus(is.Identifier, st); e != "" {
 		sess += dimStyle.Render(" · " + e + " in this state")
 	}
-	if label == "" {
+	if fs, ok := m.fleet.Best(is.Identifier); ok {
+		sess = strings.TrimLeft(m.describe(fs), " ")
+	} else if label == "" {
 		sess = dimStyle.Render("· no session yet — press ⏎ to start one")
 	}
 	fmt.Fprintf(&b, "%s\n", sess)
@@ -3557,6 +3974,43 @@ func (m Model) detailBody(is linear.Issue, width int) string {
 }
 
 func (m Model) footer() string {
+	help := m.helpLine()
+	// A line wider than the terminal wraps onto a second one, which the layout
+	// doesn't reserve: the frame grows past the screen and the title scrolls off.
+	if m.width > 0 && lipgloss.Width(help) > m.width {
+		help = truncANSI(help, m.width)
+	}
+	return m.statusLine() + "\n" + help
+}
+
+// statusLine is the line above the key hints: an open prompt, then an error,
+// then a notice, and otherwise the highlighted row's session in a few words.
+func (m Model) statusLine() string {
+	var line string
+	switch {
+	case m.prompt != nil:
+		line = m.promptLine()
+	case m.err != nil:
+		line = errStyle.Render("  " + m.err.Error())
+	case m.notice != "":
+		line = noticeStyle.Render("  " + m.notice)
+	default:
+		line = m.infoLine()
+	}
+	if m.width > 0 && lipgloss.Width(line) > m.width {
+		line = truncANSI(line, m.width)
+	}
+	return line
+}
+
+// truncANSI cuts a styled line to width columns without breaking an escape
+// sequence.
+func truncANSI(s string, width int) string {
+	return lipgloss.NewStyle().MaxWidth(width).Render(s)
+}
+
+// helpLine is the key hints for the highlighted row, or the open menu's choices.
+func (m Model) helpLine() string {
 	if m.statusMenu {
 		if p, ok := m.selectedProject(); ok {
 			name := truncCols(p.Name, 30)
@@ -3591,9 +4045,17 @@ func (m Model) footer() string {
 	if m.underHerdr {
 		quitHint = "Ctrl+b q leave" // q keeps the deck open under herdr
 	}
-	// On an "other session" row the actions differ (open/close), so show those.
-	if _, ok := m.selectedSession(); ok {
-		return dimStyle.Render(fmt.Sprintf("↑↓ move · ⏎ open · t %s · x close · n new · r refresh · %s · synced %s", triageCmd, quitHint, sync))
+	acctHint := ""
+	if m.multiAccount() {
+		acctHint = "H account · A accounts · "
+	}
+	// On an "other session" row the actions differ (open/close/rename).
+	if sr, ok := m.selectedSession(); ok {
+		close := "x close"
+		if !sr.Live() {
+			close = "x forget"
+		}
+		return dimStyle.Render(fmt.Sprintf("↑↓ move · ⏎ open · %s · R rename · %sn new · ? keys · %s · synced %s", close, acctHint, quitHint, sync))
 	}
 	statusHint := ""
 	if m.writer != nil {
@@ -3624,31 +4086,10 @@ func (m Model) footer() string {
 	if m.searchQuery != "" {
 		filterHint = fmt.Sprintf("filter %q · esc clear · ", m.searchQuery)
 	}
-	// Only advertise hand-off when there is somewhere to hand off to, and name
-	// the destination when there's exactly one — the common two-subscription case.
-	handoffHint := ""
-	switch others := m.otherAccounts(); len(others) {
-	case 0:
-	case 1:
-		handoffHint = "H hand to ⦿" + others[0].Name + " · "
-	default:
-		handoffHint = "H hand off · "
-	}
 	// `t` only applies to a ticket, so a project row doesn't offer it.
 	triageHint := "t " + triageCmd + " · "
 	if _, ok := m.selectedProject(); ok {
 		triageHint = ""
 	}
-	help := dimStyle.Render(fmt.Sprintf("%s↑↓ move · ⏎ open · d desc · o web · %s · %s%s%s/ search · n new · ␣/←→ fold · r refresh · %s · synced %s", filterHint, prHint, triageHint, statusHint, handoffHint, quitHint, sync))
-	var status string
-	switch {
-	case m.err != nil:
-		status = errStyle.Render("  " + m.err.Error())
-	case m.notice != "":
-		status = noticeStyle.Render("  " + m.notice)
-	}
-	if status != "" {
-		return status + "\n" + help
-	}
-	return help
+	return dimStyle.Render(fmt.Sprintf("%s↑↓ move · ⏎ open · d desc · o web · %s · %s%s%s/ search · n new · ? keys · %s · synced %s", filterHint, prHint, triageHint, statusHint, acctHint, quitHint, sync))
 }

@@ -3,6 +3,7 @@ package quota
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -46,7 +47,7 @@ func writeCreds(t *testing.T, dir string, exp time.Time) string {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	body := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"sk-test","expiresAt":%d}}`, exp.UnixMilli())
+	body := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"sk-test","refreshToken":"rt-test","expiresAt":%d}}`, exp.UnixMilli())
 	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -145,6 +146,43 @@ func TestRejectedTokenWaitsTheNormalInterval(t *testing.T) {
 
 // A valid-looking token must not be skipped: the expiry guard is there to save
 // doomed requests, not to stop the real one.
+// Logged out leaves the file in place with both tokens cleared. A session
+// launched there stops at its first message asking for /login, so this must
+// read as signed out, not as an idle account whose token will refresh.
+func TestClearedCredentialsReadAsSignedOut(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Fetch(context.Background(), dir); !errors.Is(err, ErrSignedOut) || reasonFor(err) != "not signed in" {
+		t.Errorf("err = %v (%q), want not signed in", err, reasonFor(err))
+	}
+	// An expired token with a refresh token is just an idle account.
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Fetch(context.Background(), dir); !errors.Is(err, ErrTokenExpired) {
+		t.Errorf("err = %v, want token expired", err)
+	}
+}
+
+// macOS keeps credentials in the keychain, so the file is missing there by
+// design. That must read as unreadable usage — still usable — not as signed
+// out, which would rule every account out.
+func TestMissingCredentialsOnMacOSAreNotSignedOut(t *testing.T) {
+	old := goos
+	t.Cleanup(func() { goos = old })
+	dir := t.TempDir()
+	goos = "darwin"
+	if _, err := Fetch(context.Background(), dir); reasonFor(err) == "not signed in" {
+		t.Errorf("macOS: %v reads as signed out", err)
+	}
+	goos = "linux"
+	if _, err := Fetch(context.Background(), dir); reasonFor(err) != "not signed in" {
+		t.Errorf("linux: %v (%q), want not signed in", err, reasonFor(err))
+	}
+}
+
 func TestUnexpiredTokenIsUsed(t *testing.T) {
 	home := tempHome(t)
 	dir := writeCreds(t, filepath.Join(home, ".claude-live"), time.Now().Add(time.Hour))
@@ -225,6 +263,26 @@ func TestPollPersistsWhatItLearned(t *testing.T) {
 	}
 	if !e.RetryAt.After(now) {
 		t.Error("persisted entry should carry when to try again")
+	}
+}
+
+func TestCurrentForgetsWindowsThatHaveReset(t *testing.T) {
+	now := time.Now()
+	e := Entry{FetchedAt: now.Add(-3 * time.Hour), Usage: &Usage{
+		FiveHourPct: 97, FiveHourReset: now.Add(-time.Hour),
+		SevenDayPct: 60, SevenDayReset: now.Add(48 * time.Hour),
+	}}
+	c := e.Current(now)
+	if c == nil || c.FiveHourPct != 0 || c.SevenDayPct != 60 {
+		t.Errorf("Current = %+v, want the 5h window started over and the week kept", c)
+	}
+	if e.Usage.FiveHourPct != 97 {
+		t.Error("Current must not change the stored reading")
+	}
+	// Taken before this week began: it says nothing about now.
+	e.Usage.SevenDayReset = now.Add(-time.Hour)
+	if c := e.Current(now); c != nil {
+		t.Errorf("Current = %+v, want nil for last week's reading", c)
 	}
 }
 

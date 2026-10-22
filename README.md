@@ -75,9 +75,14 @@ ticketdeck --demo --dump        # plain-text grouped list
 | change status (Done/Validate/Monitoring/Blocked/Cancel) | `s` → key → `y` |
 | change priority (Urgent/High/Medium/Low/None) | `P` → key |
 | assign / reassign / unassign | `a` |
-| open an ad-hoc (non-ticket) session | `n` |
+| move the session to another Claude account — or, with no session yet, open it on one | `H` |
+| accounts: usage, sessions, pin new sessions to one, auto-move on/off | `A` |
+| bring in the sessions still running in older per-account decks | `M` |
+| open an ad-hoc (non-ticket) session — name it, pick its account with `Tab` | `n` |
+| rename an ad-hoc session · close it (`x` again on a stopped one forgets it) | `R` · `x` |
+| jump to the next / previous session waiting on you (unfolds what hides it) | `]` · `[` |
 | fold/unfold a priority section, the **Projects** section, or one project's tickets | `Space` · `←`/`→` |
-| refresh · quit | `r` · `q` |
+| every key · refresh · quit | `?` · `r` · `q` |
 
 On a **project** row the same keys act on the project: `⏎` opens its session, `d` its
 detail, `o` the project page, `p` the PRs across its tickets, `H` hands it to another
@@ -125,10 +130,17 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   sections that hold none of your **top 10** tickets so the view stays focused (re-applied on
   refresh).
 - Refreshes every ~60s with jitter and keeps the last good list on API error.
-- **Session badges** per ticket: `●` working · `◆` needs input · `○` idle · `✓` done ·
-  `↻` resumable (an on-disk session you can reattach) · `·` none. Working tickets are dimmed
-  so your eye goes to what needs you. Linked PRs show a `⇄` flag; validation labels show a
-  `⚑` flag.
+- **Session badges** per ticket: `●` working · `◐` background (the lead is idle but a
+  subagent, shell command or monitor it started is still running) · `◆` needs input ·
+  `◉` your turn (it finished a turn you haven't looked at) · `○` idle · `⊘` out of usage on
+  its account, with when it gets it back · `✗` stopped on an API error (login expired, API
+  unreachable) · `↻` resumable (an on-disk session you can reattach) · `·` none. Working
+  tickets are dimmed so your eye goes to what needs you. Linked PRs show a `⇄` flag;
+  validation labels show a `⚑` flag.
+- **The line above the keys** says what the highlighted row's session is doing: which
+  account it is on, what it last did (`last: Bash: go test ./...`), how full its context is,
+  what it is waiting on, and how it stopped. A row with no session says where `⏎` would open
+  it, and why — so the account choice is visible before you act on it.
 - **Blocked tickets** show what's holding them up: a red `⛔ ZEN-1234, …` note lists the open
   tickets a Blocked ticket is blocked by (also in the `d` detail view).
 - **Multiple PRs per ticket** — a ticket's work usually splits across repos, so `p` opens a
@@ -150,41 +162,55 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   rendered description, resolved from whichever ticket pane you invoked it in (so you don't have
   to jump back to the deck). It's a read-only Linear fetch — no model turn. The deck's own `d`
   overlay shows the same for the cursor ticket.
-- **Multiple Claude subscriptions** — if you have more than one Claude account
-  (each in its own config dir), run an isolated deck per subscription:
-  `deck --account support` uses `~/.claude-support`, gets its own herdr workspace
-  (own server + tabs), and shows a `⦿ support` badge with that account's usage
-  bar. Both decks show the same Linear tickets; switching is just detach + launch
-  the other, and background sessions keep running. Tool auth (`gh`/`gcloud`/…) is
-  shared. See [`SETUP.md`](SETUP.md#multiple-claude-subscriptions-accounts).
+- **One deck runs every Claude account.** If you have several subscriptions — each in its
+  own config dir, `~/.claude` and `~/.claude-<name>` — one `deck` runs sessions under all of
+  them. Each session's tab gets its account's `CLAUDE_CONFIG_DIR`, so its usage lands on that
+  subscription. The line under the title shows every account's 5-hour and 7-day usage and
+  how many sessions it runs; the one a new session would open on is underlined. See
+  [`SETUP.md`](SETUP.md#multiple-claude-subscriptions-accounts).
+- **It picks the account.** `⏎` resumes a session on the account it already lives on. A new
+  one goes to the account with the most room, measured by whichever window is closer to its
+  cap; accounts within ten points of each other go to the one running fewer sessions. An
+  account that is out — its limit refused a session, a window is spent, or nobody is signed
+  in — is skipped. `A` shows the ranking, and pins new sessions to one account if you'd
+  rather choose.
+- **It keeps going when an account runs out.** When a session's account hits its usage
+  limit, the deck moves the session to the account with the most room and tells it to carry
+  on — on its own, once per cut-off, and only after the limit has ended the turn. With
+  nowhere to go it waits, and continues where it is once the limit resets. A lapsed login is
+  handled the same way. `A` turns this off; `TICKETDECK_AUTO_MOVE=off` does too.
+- **`H` moves a session by hand**, in place: the tab closes, the conversation is copied to
+  the other account, and it resumes in a new tab. What carries over is the conversation, not
+  the process.
+- **Sessions from older decks come along.** Sessions started by the old one-deck-per-account
+  layout (`deck --account`, or `rdeck <name>`) still run in those decks' workspaces. The deck
+  sees them — the title bar counts them — and `M` brings them in on the same account; a busy
+  one follows once its turn ends.
 - **Which account is on a ticket, and what it's doing** — every ticket with a session carries
   a `⦿` dot in the owning subscription's color, and the highlighted row spells out the name.
-  That includes sessions running under the *other* accounts, which a deck otherwise can't see:
-  ownership is read from each account's transcripts and its herdr workspace. One subscription,
-  no column.
-
-  A session another deck holds badges its state right on the row — `● working`, `◆ needs
-  input`, `○ idle`, `↻ resumable` — with how long since it last wrote, so a peer that's wedged
-  looks different from one that's busy. Those badges are colored by **deck** rather than by
-  status: the words already say the state, and what a glance needs from someone else's row is
-  whose it is. Refreshed every 3s.
-- **One deck per ticket, and per project** — `⏎` (and `t`) on a ticket another deck is actively running stops
-  and says so instead of opening it. A second session would fork the ticket: the session id
-  comes from the ticket key alone, so both decks would append to their own copy of one
-  transcript and diverge with no way to merge them — and two agents would work the ticket at
-  once. `⏎`/`esc` leaves it alone, `p` opens its PR instead, and `o` overrides. A session
-  *this* deck already runs is not a conflict (it re-attaches), nor is a stopped one elsewhere
-  (nothing to collide with — the row badges it `↻` in that deck's color). Project rows take
-  the same gate for the same reason: a project's session id comes from its slug alone.
+  One subscription, no column.
+- **One session per ticket, and per project** — `⏎` (and `t`) on a ticket whose session runs
+  somewhere this deck can't drive — another deck's workspace, or a plain terminal — stops
+  and says so instead of opening a second one. A second session would fork the ticket: the
+  session id comes from the ticket key alone, so both would append to their own copy of one
+  transcript and diverge with no way to merge them. `⏎`/`esc` leaves it alone, `b` brings it
+  into this deck, `p` opens its PR instead, and `o` overrides.
+- **Ad-hoc sessions have names and survive restarts.** `n` asks for a name and opens the
+  session under its own id on the account with most room; `R` renames one. The deck
+  remembers them (`~/.ticketdeck/sessions.json`), so after a herdr restart they are listed
+  under Other sessions as resumable, by name, on the account they ran on.
 - **Claude usage** — the title bar shows your Claude 5-hour and 7-day rate-limit
-  utilization (`◷ 5h 52% · 7d 42%`), color-coded, with a rough reset countdown. Same source
+  utilization (`◷ 5h 52% · 7d 42%`, or one entry per account when there are several),
+  color-coded, with a rough reset countdown. Same source
   as Claude Code's status line (the OAuth usage endpoint); it's a metadata read, so it does
   **not** spend model tokens. Shown only for OAuth logins (not API-key setups). Every deck on
   the machine shares one reading per account through `~/.ticketdeck/usage.json`, refreshed at
   most every 5 minutes — polling per deck earned 429s and blanked the line. When a reading is
-  missing the row says why: `rate limited` clears itself, `token expired` means that account's
-  token needs a refresh, which only happens when you next run Claude Code under it. A `~` after
-  the numbers means they're more than two intervals old.
+  missing the row says why: `rate limited` clears itself; `token expired` means nobody has
+  used that account lately — it still takes work, and opening a session under it refreshes
+  the token; `not signed in` means it can't run anything until someone logs it in again. A
+  `~` after the numbers means they're more than two intervals old, and a reading from before
+  the weekly window last reset is not shown at all: it is history, not headroom.
 - **Backends** (`--backend claude|herdr|auto`, default `auto`): `herdr` gives the
   detach/re-attach + tab-per-ticket workflow; `claude` drives the `claude` CLI directly
   (foreground per ticket). `auto` uses herdr when it's installed.

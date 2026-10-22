@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -23,7 +24,20 @@ import (
 // (see the Makefile / release workflow). "dev" for local `go build`.
 var version = "dev"
 
+// subcommands are the verbs registered by the files that implement them.
+var subcommands = map[string]func(args []string) error{}
+
 func main() {
+	if len(os.Args) > 1 {
+		if run, ok := subcommands[os.Args[1]]; ok {
+			if err := run(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "ticketdeck:", err)
+				os.Exit(1)
+			}
+			return
+		}
+	}
+
 	// Subcommand: `ticketdeck update` self-updates to the latest release.
 	if len(os.Args) > 1 && os.Args[1] == "update" {
 		if err := update.Run(); err != nil {
@@ -131,13 +145,71 @@ func setupLog(path string) func() {
 		_ = os.MkdirAll(dir, 0o755)
 		path = filepath.Join(dir, "ticketdeck.log")
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	w, err := openRotating(path, logMax)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ticketdeck: cannot open log:", err)
 		return nil
 	}
-	tui.SetLog(f)
-	return func() { _ = f.Close() }
+	tui.SetLog(w)
+	return func() { _ = w.Close() }
+}
+
+// logMax caps the debug log. It used to grow without bound — one machine's
+// reached 361 MB, most of it a line per three-second status poll.
+const logMax = 10 << 20
+
+// rotating is an append-only file that moves itself aside to <path>.1 once it
+// passes max bytes, so the log keeps its last stretch and never much more.
+type rotating struct {
+	mu   sync.Mutex
+	path string
+	max  int64
+	f    *os.File
+	size int64
+}
+
+func openRotating(path string, max int64) (*rotating, error) {
+	r := &rotating{path: path, max: max}
+	if fi, err := os.Stat(path); err == nil && fi.Size() >= max {
+		_ = os.Rename(path, path+".1")
+	}
+	if err := r.open(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *rotating) open() error {
+	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	r.f, r.size = f, 0
+	if fi, err := f.Stat(); err == nil {
+		r.size = fi.Size()
+	}
+	return nil
+}
+
+func (r *rotating) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.size+int64(len(p)) > r.max {
+		_ = r.f.Close()
+		_ = os.Rename(r.path, r.path+".1")
+		if err := r.open(); err != nil {
+			return 0, err
+		}
+	}
+	n, err := r.f.Write(p)
+	r.size += int64(n)
+	return n, err
+}
+
+func (r *rotating) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.f.Close()
 }
 
 // resolveBackend picks the launch backend: explicit claude/herdr, or auto

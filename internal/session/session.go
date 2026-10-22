@@ -6,13 +6,16 @@
 package session
 
 import (
+	"crypto/rand"
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Status is a ticket's Claude Code session status, granular enough to badge.
@@ -26,11 +29,28 @@ const (
 	Completed                // finished (state=done); resumable
 	Stopped                  // exists but not running and not done; resumable
 	Background               // running, lead idle, a shell command or monitor still going
+	Unread                   // running, finished a turn nobody has looked at yet
+	Limited                  // running, stopped because its account hit a usage limit
+	Errored                  // running, stopped on an API error (login lapsed, API unreachable)
 )
 
 // Running reports whether a session process is live (attach, don't fork).
 func (s Status) Running() bool {
-	return s == Working || s == NeedsInput || s == Idle || s == Background
+	switch s {
+	case Working, NeedsInput, Idle, Background, Unread, Limited, Errored:
+		return true
+	}
+	return false
+}
+
+// Waiting reports whether a live session is waiting on nobody but the user:
+// its turn is over and nothing it started is still running.
+func (s Status) Waiting() bool {
+	switch s {
+	case Idle, Unread, Limited, Errored:
+		return true
+	}
+	return false
 }
 
 // resumable reports whether a stopped session can be reopened from disk.
@@ -55,6 +75,20 @@ func DeterministicID(ticketKey string) string {
 	var u [16]byte
 	copy(u[:], sum[:16])
 	u[6] = (u[6] & 0x0f) | 0x50 // version 5
+	u[8] = (u[8] & 0x3f) | 0x80 // RFC-4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+}
+
+// NewID returns a random (v4) session id, for an ad-hoc session: one the deck
+// names itself so it can find the session's transcript and account again.
+func NewID() string {
+	var u [16]byte
+	if _, err := rand.Read(u[:]); err != nil {
+		// crypto/rand does not fail on any supported platform; fall back to the
+		// clock rather than handing claude an invalid id.
+		binary.BigEndian.PutUint64(u[:8], uint64(time.Now().UnixNano()))
+	}
+	u[6] = (u[6] & 0x0f) | 0x40 // version 4
 	u[8] = (u[8] & 0x3f) | 0x80 // RFC-4122 variant
 	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }
@@ -171,7 +205,23 @@ type SessionRef struct {
 	Name   string
 	Status Status
 	Ref    string
+	// Socket is the herdr server the session runs in: "" for this deck's own
+	// workspace, else another server's socket (another deck's workspace).
+	Socket string
+	// Account is the subscription running it, when known.
+	Account string
+	// Title is what to call it on screen when it isn't Name: the name the user
+	// gave it, or the one Claude generated from the conversation.
+	Title string
+	// SessionID is the Claude session it runs, when known.
+	SessionID string
+	// Cwd is where it was started.
+	Cwd string
 }
+
+// Live reports whether the session is running, as opposed to one the deck
+// remembers that is only resumable.
+func (r SessionRef) Live() bool { return r.Status.Running() }
 
 // Ticket carries the fields seeded into a launched session's identity. No
 // description is fetched here (zero extra Linear calls); the URL lets Claude
@@ -196,7 +246,32 @@ type Ticket struct {
 	// summary, and the keys of my open tickets in it, so the session starts
 	// knowing its own scope instead of having to go find it.
 	Context string
+	// Scratch marks an ad-hoc session: no ticket identity is seeded, and Key is
+	// only the name it is filed under.
+	Scratch bool
+	// SessionID overrides the id derived from Key. An ad-hoc session carries a
+	// random one, and a session adopted from another deck keeps whatever id it
+	// was started with.
+	SessionID string
+	// Account and ConfigDir name the Claude subscription to run it under. Empty
+	// means the one this process runs as.
+	Account   string
+	ConfigDir string
+	// Resume opens the session's existing conversation even though its account
+	// doesn't hold the transcript yet: the launch copies it there first.
+	Resume bool
 }
+
+// ID is the Claude session id the unit runs as.
+func (t Ticket) ID() string {
+	if t.SessionID != "" {
+		return t.SessionID
+	}
+	return DeterministicID(t.Key)
+}
+
+// Dir is the config dir of the account the unit runs under.
+func (t Ticket) Dir() string { return firstNonEmpty(t.ConfigDir, ConfigDir()) }
 
 // LaunchSpec is a fully-resolved command for TicketDeck to run.
 type LaunchSpec struct {
@@ -209,6 +284,44 @@ type LaunchSpec struct {
 	// false the command is fire-and-return (herdr dispatches a pane and exits),
 	// run detached with its output captured.
 	Foreground bool
+	// Account and ConfigDir name the subscription the session runs under; the
+	// backend gives the process that account's environment (see AccountEnv).
+	// Empty means this process's own.
+	Account   string
+	ConfigDir string
+	// SessionID is the Claude session the launch opens.
+	SessionID string
+	// NoFocus starts the session without switching to it.
+	NoFocus bool
+	// Submit is a prompt to send once the session is ready for input.
+	Submit string
+	// CopyFrom is the config dir holding the session's conversation, when it
+	// isn't ConfigDir's: the launch copies it over before resuming.
+	CopyFrom string
+}
+
+// AccountEnv is the environment that runs claude as the account at configDir.
+//
+// For this process's own account it is nothing at all: the session inherits
+// exactly what this process has. That is not the same as naming the directory
+// — Claude Code keeps its settings, trusted folders included, in
+// ~/.claude.json while CLAUDE_CONFIG_DIR is unset but in
+// $CLAUDE_CONFIG_DIR/.claude.json once it is set, even to ~/.claude, so
+// setting it would land the primary account's sessions on a second, emptier
+// config that asks to trust every folder again.
+//
+// CLAUDE_CODE_OAUTH_TOKEN is cleared for any other account: set, it belongs to
+// whichever account exported it and silently overrides the config dir this
+// sets, so the session would bill the wrong subscription.
+func AccountEnv(configDir string) []string {
+	if configDir == "" || filepath.Clean(configDir) == filepath.Clean(ConfigDir()) {
+		return nil
+	}
+	env := []string{"CLAUDE_CONFIG_DIR=" + configDir}
+	if os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") != "" {
+		env = append(env, "CLAUDE_CODE_OAUTH_TOKEN=")
+	}
+	return env
 }
 
 // Bin returns the claude binary name (for building the exec.Cmd).
@@ -266,9 +379,27 @@ func projectSystemPrompt(t Ticket) string {
 	return b.String()
 }
 
-// LaunchArgs are the claude args that seed a session's ticket identity.
+// LaunchArgs are the claude args that seed a session's ticket identity. An
+// ad-hoc session has none to seed.
 func LaunchArgs(t Ticket) []string {
+	if t.Scratch {
+		return nil
+	}
 	return []string{"--append-system-prompt", SystemPrompt(t)}
+}
+
+// ClaudeArgs is the claude argv (after the binary) that opens t: resume when its
+// account already holds a transcript for it, else start fresh bound to its id.
+func ClaudeArgs(t Ticket) []string {
+	id := t.ID()
+	if t.Resume || FindTranscript(t.Dir(), id) != "" {
+		return append([]string{"--resume", id}, LaunchArgs(t)...)
+	}
+	name := t.Key
+	if t.Scratch && t.Title != "" {
+		name = t.Title // an ad-hoc session's key is its agent name; its title is what the user called it
+	}
+	return append([]string{"--session-id", id, "--name", name}, LaunchArgs(t)...)
 }
 
 // TabLabel is the herdr tab title for a ticket: the key plus a short slice of
@@ -281,8 +412,8 @@ func TabLabel(t Ticket) string {
 		return t.Key
 	}
 	// A project's key is a synthetic "proj-<slug>" that means nothing to a
-	// reader, so its tab is titled by name alone.
-	if t.Project {
+	// reader, so its tab is titled by name alone, as is an ad-hoc session's.
+	if t.Project || t.Scratch {
 		return truncRunes(title, 32)
 	}
 	return truncRunes(t.Key+"  "+title, 32)
@@ -303,7 +434,11 @@ func truncRunes(s string, max int) string {
 // Plan resolves what should happen when a ticket is selected, given the current
 // session list and a default working directory (the repos-root fallback).
 func Plan(t Ticket, infos []Info, defaultCwd string) (LaunchSpec, error) {
-	id := DeterministicID(t.Key)
+	id := t.ID()
+	acct := func(s LaunchSpec) LaunchSpec {
+		s.Account, s.ConfigDir, s.SessionID = t.Account, t.ConfigDir, id
+		return s
+	}
 
 	if in, ok := findByBinding(t.Key, infos); ok {
 		st := statusOf(in)
@@ -311,24 +446,24 @@ func Plan(t Ticket, infos []Info, defaultCwd string) (LaunchSpec, error) {
 		case st.Running():
 			// One terminal per session (BR-4): don't fork a running session —
 			// hand off to the interactive agent view to attach it there.
-			return LaunchSpec{Args: []string{"agents"}, Cwd: firstNonEmpty(in.Cwd, defaultCwd), Action: "agents-view", Foreground: true}, nil
+			return acct(LaunchSpec{Args: []string{"agents"}, Cwd: firstNonEmpty(in.Cwd, defaultCwd), Action: "agents-view", Foreground: true}), nil
 		case st.resumable():
 			args := append([]string{"--resume", id}, LaunchArgs(t)...)
-			return LaunchSpec{Args: args, Cwd: firstNonEmpty(in.Cwd, defaultCwd), Action: "resume", Foreground: true}, nil
+			return acct(LaunchSpec{Args: args, Cwd: firstNonEmpty(in.Cwd, defaultCwd), Action: "resume", Foreground: true}), nil
 		}
 	}
 
 	// Not in the daemon's list, but a transcript may still be on disk (the
 	// daemon drops stopped sessions) — resume it rather than colliding on
 	// --session-id.
-	if SessionExists(id, defaultCwd) {
+	if t.Resume || FindTranscript(t.Dir(), id) != "" {
 		args := append([]string{"--resume", id}, LaunchArgs(t)...)
-		return LaunchSpec{Args: args, Cwd: defaultCwd, Action: "resume", Foreground: true}, nil
+		return acct(LaunchSpec{Args: args, Cwd: defaultCwd, Action: "resume", Foreground: true}), nil
 	}
 
-	// No session at all → launch a fresh one bound to the deterministic id.
+	// No session at all → launch a fresh one bound to its id.
 	args := append([]string{"--session-id", id, "--name", t.Key}, LaunchArgs(t)...)
-	return LaunchSpec{Args: args, Cwd: defaultCwd, Action: "new", Foreground: true}, nil
+	return acct(LaunchSpec{Args: args, Cwd: defaultCwd, Action: "new", Foreground: true}), nil
 }
 
 // SessionExists reports whether a claude transcript for the given session id
@@ -374,13 +509,18 @@ func ConfigDir() string {
 	return filepath.Join(home, ".claude")
 }
 
-// TranscriptPath is where claude stores a session's transcript for a given cwd.
-// The project slug is the cwd with every non-alphanumeric rune replaced by '-'.
-func TranscriptPath(id, cwd string) string {
-	return filepath.Join(ConfigDir(), "projects", projectSlug(cwd), id+".jsonl")
+// TranscriptPath is where claude stores a session's transcript for a given cwd,
+// under this process's own account.
+func TranscriptPath(id, cwd string) string { return TranscriptPathIn(ConfigDir(), id, cwd) }
+
+// TranscriptPathIn is TranscriptPath under the account at configDir. The project
+// slug is the cwd with every non-alphanumeric rune replaced by '-'.
+func TranscriptPathIn(configDir, id, cwd string) string {
+	return filepath.Join(configDir, "projects", ProjectSlug(cwd), id+".jsonl")
 }
 
-func projectSlug(p string) string {
+// ProjectSlug is the directory name Claude Code files a cwd's sessions under.
+func ProjectSlug(p string) string {
 	var b strings.Builder
 	for _, r := range p {
 		switch {

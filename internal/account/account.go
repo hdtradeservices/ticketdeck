@@ -1,17 +1,21 @@
-// Package account resolves which Claude subscription a deck runs as, discovers
-// the other subscriptions available on this machine, and moves a ticket's
-// session between them.
+// Package account resolves the Claude subscriptions on this machine — which one
+// this process runs as, and every other one a session can run under — and moves
+// a session between them.
 //
-// TicketDeck runs one deck per subscription (`deck --account NAME`), each with
-// its own Claude config dir and its own herdr workspace. Two consequences drive
-// this package: a deck must name itself unambiguously so you know whose rate
-// limits you are spending, and it must be able to hand a session to a
-// subscription with headroom when the current one runs out.
+// One deck runs sessions under every subscription: each session's pane gets its
+// account's CLAUDE_CONFIG_DIR. The subscription a deck itself runs as is only
+// its home: what it falls back to when nothing better is known. Two needs drive
+// this package: every account needs one stable name and color, so you can see
+// whose rate limits a session is spending, and a session must be able to move
+// to a subscription with headroom when the one it is on runs out.
 package account
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -64,16 +68,25 @@ func (a Account) LaunchCmd() string {
 	return "deck --account " + strings.TrimPrefix(base, ".claude-")
 }
 
-// All lists every subscription with credentials on disk (~/.claude and
-// ~/.claude-*), sorted by name. Current is always present even if its
-// credentials are unreadable, so a deck can always name itself.
+// All lists every subscription on this machine, sorted by name: each of ~/.claude
+// and ~/.claude-* that holds credentials, plus any ~/.claude-accounts names (on
+// macOS the credentials live in the keychain, not in the directory). Current is
+// always present even if its credentials are unreadable, so a deck can always
+// name itself.
 func All() []Account {
 	cur := Current()
 	byDir := map[string]Account{cur.ConfigDir: cur}
 	if home, err := os.UserHomeDir(); err == nil {
+		listed := map[string]bool{}
+		for _, dir := range listedDirs(home) {
+			listed[dir] = true
+		}
 		matches, _ := filepath.Glob(filepath.Join(home, ".claude*"))
 		for _, dir := range matches {
-			if _, seen := byDir[dir]; seen || !isAccountDir(home, dir) || !hasCreds(dir) {
+			if _, seen := byDir[dir]; seen || !isAccountDir(home, dir) || (!hasCreds(dir) && !listed[dir]) {
+				continue
+			}
+			if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 				continue
 			}
 			byDir[dir] = Account{Name: nameFor(dir), ConfigDir: dir}
@@ -178,7 +191,80 @@ func nameFor(configDir string) string {
 	if n := strings.TrimPrefix(base, ".claude-"); n != base && n != "" {
 		return n
 	}
+	if base != ".claude" {
+		// A config dir outside the ~/.claude family (CLAUDE_CONFIG_DIR pointed
+		// somewhere else): its own name is the only honest label.
+		if n := strings.TrimPrefix(strings.TrimPrefix(base, "."), "claude-"); n != "" {
+			return n
+		}
+	}
+	if p := primaryName(); p != "" {
+		return p
+	}
 	return Default
+}
+
+// accountsFile lists this machine's accounts, one name per line: the first owns
+// ~/.claude, the rest ~/.claude-<name>. rdeck reads it too, to know which
+// account is the primary.
+const accountsFile = ".claude-accounts"
+
+func listedNames() []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	f, err := os.Open(filepath.Join(home, accountsFile))
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = f.Close() }()
+	var out []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, strings.Fields(line)[0])
+	}
+	return out
+}
+
+// primaryName is the name ~/.claude-accounts gives ~/.claude, "" without one.
+func primaryName() string {
+	if names := listedNames(); len(names) > 0 {
+		return names[0]
+	}
+	return ""
+}
+
+func listedDirs(home string) []string {
+	var out []string
+	for i, n := range listedNames() {
+		if i == 0 {
+			out = append(out, filepath.Join(home, ".claude"))
+			continue
+		}
+		out = append(out, filepath.Join(home, ".claude-"+n))
+	}
+	return out
+}
+
+// Find returns the account with this name, or the one at this config dir.
+func Find(accts []Account, nameOrDir string) (Account, bool) {
+	for _, a := range accts {
+		if a.Name == nameOrDir {
+			return a, true
+		}
+	}
+	clean := filepath.Clean(nameOrDir)
+	for _, a := range accts {
+		if filepath.Clean(a.ConfigDir) == clean {
+			return a, true
+		}
+	}
+	return Account{}, false
 }
 
 func hasCreds(configDir string) bool {
@@ -198,13 +284,26 @@ func hasCreds(configDir string) bool {
 // Resuming replays the conversation, so what carries over is context, not a
 // live process — an in-flight tool call is lost.
 func HandOff(from, to Account, ticketKey string) error {
+	return CopySession(from, to, session.DeterministicID(ticketKey), ticketKey)
+}
+
+// ErrNoSession reports that the account holds no transcript for the session.
+// A session nobody has typed into yet may have none at all: Claude writes the
+// file only once there is something to record.
+var ErrNoSession = errors.New("nothing to copy")
+
+// CopySession is HandOff by session id, for a session whose id doesn't derive
+// from a ticket key (an ad-hoc one). label names it in errors. Alongside the
+// transcript it copies the session's own directory — its subagents' transcripts
+// and the large tool outputs the transcript points at — so the copy stands on
+// its own.
+func CopySession(from, to Account, id, label string) error {
 	if from.ConfigDir == to.ConfigDir {
 		return fmt.Errorf("%s and %s are the same account", from.Name, to.Name)
 	}
-	id := session.DeterministicID(ticketKey)
 	src, err := findTranscript(from.ConfigDir, id)
 	if err != nil {
-		return fmt.Errorf("no %s session found under ⦿%s", ticketKey, from.Name)
+		return fmt.Errorf("%w: no %s session found under ⦿%s", ErrNoSession, label, from.Name)
 	}
 	// Mirror the source's project dir rather than deriving one from a cwd, so a
 	// session started in a repo subdir lands where the other deck will look.
@@ -220,10 +319,46 @@ func HandOff(from, to Account, ticketKey string) error {
 			return err
 		}
 		if di.ModTime().After(si.ModTime()) {
-			return fmt.Errorf("⦿%s already has newer %s work — resume it there instead", to.Name, ticketKey)
+			return fmt.Errorf("⦿%s already has newer %s work — resume it there instead", to.Name, label)
 		}
 	}
+	// The directory first: once the transcript lands, the destination is a
+	// session that can be resumed, and it should be whole by then.
+	if err := copyTree(strings.TrimSuffix(src, ".jsonl"), strings.TrimSuffix(dst, ".jsonl")); err != nil {
+		return err
+	}
 	return copyFile(src, dst)
+}
+
+// copyTree copies a session directory, replacing files that differ. A missing
+// source directory is not an error: a session that never ran a subagent or
+// saved a large tool output has none.
+func copyTree(src, dst string) error {
+	if fi, err := os.Stat(src); err != nil || !fi.IsDir() {
+		return nil
+	}
+	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		if si, err := d.Info(); err == nil {
+			if di, err := os.Stat(target); err == nil && di.Size() == si.Size() && !di.ModTime().Before(si.ModTime()) {
+				return nil // already there
+			}
+		}
+		return copyFile(p, target)
+	})
 }
 
 // findTranscript locates a session's transcript anywhere under an account's

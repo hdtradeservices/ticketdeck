@@ -211,6 +211,12 @@ directory. Colors are assigned by sorted name, so every deck agrees on them.
 `CLAUDE_CONFIG_DIR=~/.claude-support claude /login`. The deck notices a new
 account within a minute, no restart needed.
 
+**Hiding an account.** A seat that belongs to an unattended worker, like
+`~/.claude-suggest-loop`, must never take a ticket. Mark its directory and the
+deck leaves it out of routing, `H`, `A` and the title bar:
+`touch ~/.claude-suggest-loop/.ticketdeck-hide`. The marker wins over
+`~/.claude-accounts`.
+
 #### Where a session opens
 
 `⏎` resumes a session on the account it already lives on — moving costs a

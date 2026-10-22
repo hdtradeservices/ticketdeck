@@ -70,9 +70,9 @@ func (a Account) LaunchCmd() string {
 
 // All lists every subscription on this machine, sorted by name: each of ~/.claude
 // and ~/.claude-* that holds credentials, plus any ~/.claude-accounts names (on
-// macOS the credentials live in the keychain, not in the directory). Current is
-// always present even if its credentials are unreadable, so a deck can always
-// name itself.
+// macOS the credentials live in the keychain, not in the directory). A dir holding
+// hideFile is left out, even when listed. Current is always present even if its
+// credentials are unreadable, so a deck can always name itself.
 func All() []Account {
 	cur := Current()
 	byDir := map[string]Account{cur.ConfigDir: cur}
@@ -83,7 +83,7 @@ func All() []Account {
 		}
 		matches, _ := filepath.Glob(filepath.Join(home, ".claude*"))
 		for _, dir := range matches {
-			if _, seen := byDir[dir]; seen || !isAccountDir(home, dir) || (!hasCreds(dir) && !listed[dir]) {
+			if _, seen := byDir[dir]; seen || !isAccountDir(home, dir) || (!hasCreds(dir) && !listed[dir]) || isHidden(dir) {
 				continue
 			}
 			if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
@@ -270,6 +270,15 @@ func Find(accts []Account, nameOrDir string) (Account, bool) {
 func hasCreds(configDir string) bool {
 	fi, err := os.Stat(filepath.Join(configDir, ".credentials.json"))
 	return err == nil && !fi.IsDir()
+}
+
+// hideFile marks a config dir the deck must never route work to, such as the
+// seat an unattended worker runs on (~/.claude-suggest-loop).
+const hideFile = ".ticketdeck-hide"
+
+func isHidden(configDir string) bool {
+	_, err := os.Stat(filepath.Join(configDir, hideFile))
+	return err == nil
 }
 
 // HandOff moves a ticket's session to another subscription by copying its

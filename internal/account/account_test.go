@@ -144,6 +144,40 @@ func TestAllSkipsDirsWithoutCredentials(t *testing.T) {
 	}
 }
 
+// A worker's seat has real credentials, but the deck must never route a ticket
+// onto it — the marker keeps it out even when ~/.claude-accounts lists it.
+func TestAllSkipsHiddenDirs(t *testing.T) {
+	home := fakeHome(t, Default, "support", "suggest-loop")
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("TICKETDECK_ACCOUNT", "")
+	if err := os.WriteFile(filepath.Join(home, ".claude-accounts"), []byte("matt\nsupport\nsuggest-loop\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude-suggest-loop", hideFile), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, a := range All() {
+		names = append(names, a.Name)
+	}
+	if got := strings.Join(names, ","); got != "matt,support" {
+		t.Errorf("All() = %s, want matt,support", got)
+	}
+}
+
+// A deck running as a hidden account still has to name itself.
+func TestAllKeepsHiddenCurrent(t *testing.T) {
+	home := fakeHome(t, Default, "suggest-loop")
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude-suggest-loop"))
+	t.Setenv("TICKETDECK_ACCOUNT", "")
+	if err := os.WriteFile(filepath.Join(home, ".claude-suggest-loop", hideFile), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := Find(All(), "suggest-loop"); !ok {
+		t.Errorf("All() dropped the current account because it is hidden")
+	}
+}
+
 func TestColorsAreDistinctPerAccount(t *testing.T) {
 	accts := []Account{{Name: "matt"}, {Name: "support"}, {Name: "third"}}
 	c := Colors(accts)

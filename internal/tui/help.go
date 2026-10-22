@@ -107,7 +107,22 @@ func (m Model) describe(s fleet.Session) string {
 		parts = append(parts, dimStyle.Render("last: "+truncCols(tail.LastTool, 50)))
 	}
 	if n := tail.ContextTokens; n > 0 {
-		parts = append(parts, dimStyle.Render(fmt.Sprintf("context %dk", (n+500)/1000)))
+		txt := "context " + kTokens(n)
+		if c, big := contextColor(n); big {
+			if s.Live && s.Home {
+				txt += " — C compacts it"
+			}
+			parts = append(parts, lipgloss.NewStyle().Foreground(c).Render(txt))
+		} else {
+			parts = append(parts, dimStyle.Render(txt))
+		}
+	}
+	if b := s.Activity.Burn; s.Live && b >= 0.01 {
+		txt := dollars(b) + " in 5h"
+		if total := m.spentBy()[s.Account]; total > b {
+			txt += fmt.Sprintf(" (%.0f%% of ⦿%s's)", 100*b/total, s.Account)
+		}
+		parts = append(parts, dimStyle.Render(txt))
 	}
 	if e, ok := m.ledger[s.ID]; ok {
 		if mv, ok := e.LastMove(); ok && now.Sub(mv.At) < 24*time.Hour {
@@ -153,7 +168,7 @@ func (m Model) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 var helpText = []struct{ key, what string }{
 	{"", "Tickets and projects"},
-	{"⏎", "open the session: attach, resume where it lives, or start on the account with most room"},
+	{"⏎", "open the session: attach, resume where it lives, or start on the best-placed account"},
 	{"d", "description · in it: i investigation · P plan · r re-read comments"},
 	{"o / p", "open in the browser / open its PR (several: a picker)"},
 	{"t", "/triage in the background (tickets only)"},
@@ -167,6 +182,7 @@ var helpText = []struct{ key, what string }{
 	{"n", "new ad-hoc session — name it, pick its account with tab"},
 	{"R", "rename an ad-hoc session (Other sessions rows)"},
 	{"x", "close an Other sessions row (its conversation stays resumable)"},
+	{"C", "compact the session's conversation now, with an optional focus (it must be idle)"},
 	{"] [", "jump to the next / previous session waiting on you"},
 	{"", "Badges"},
 	{"● ◐", "working · lead idle but background work running"},
@@ -176,6 +192,7 @@ var helpText = []struct{ key, what string }{
 	{"⊘", "out of usage on its account — it moves on its own when auto-move is on"},
 	{"✗", "stopped on an API error (login expired, API unreachable)"},
 	{"↻", "resumable — its conversation is on disk"},
+	{"◔640k", "its context is that large: every turn re-reads all of it (orange 300k+, red 600k+)"},
 	{"⦿", "the account running it, in that account's color"},
 	{"", "herdr"},
 	{"Ctrl+b 1", "back to the deck from any session"},

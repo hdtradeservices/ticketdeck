@@ -23,6 +23,7 @@ type promptKind int
 const (
 	promptNew promptKind = iota
 	promptRename
+	promptCompact
 )
 
 type prompt struct {
@@ -31,7 +32,7 @@ type prompt struct {
 	// acct is the account a new session opens on: 0 is "wherever the router
 	// says", then one entry per account in the router's order.
 	acct int
-	// target is the session being renamed.
+	// target is the session being renamed or compacted.
 	target fleet.Session
 }
 
@@ -69,8 +70,11 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		m.prompt = nil
-		if p.kind == promptNew {
+		switch p.kind {
+		case promptNew:
 			return m.startNew(strings.TrimSpace(p.text), p.acct)
+		case promptCompact:
+			return m.compact(p.target, strings.TrimSpace(p.text))
 		}
 		return m.rename(p.target, strings.TrimSpace(p.text))
 	case "backspace":
@@ -89,7 +93,11 @@ func (m Model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			p.acct = (p.acct + step) % n
 		}
 	default:
-		if len(msg.Runes) > 0 && cols(p.text) < 60 {
+		limit := 60
+		if p.kind == promptCompact {
+			limit = 200 // a focus is a sentence, not a name
+		}
+		if len(msg.Runes) > 0 && cols(p.text) < limit {
 			p.text += string(msg.Runes)
 		}
 	}
@@ -102,6 +110,14 @@ func (m Model) promptLine() string {
 	p := m.prompt
 	if p.kind == promptRename {
 		return noticeStyle.Render(fmt.Sprintf("  rename %s: %s▏   ⏎ save · esc cancel", truncCols(m.sessionLabel(p.target), 30), p.text))
+	}
+	if p.kind == promptCompact {
+		focus := p.text
+		if focus == "" {
+			focus = dimStyle.Render("(optional: what to keep)")
+		}
+		return noticeStyle.Render(fmt.Sprintf("  compact %s, focus: ", truncCols(m.sessionLabel(p.target), 24))) + focus +
+			noticeStyle.Render("▏   ⏎ compact · esc cancel  ") + dimStyle.Render(compactCost(p.target, time.Now()))
 	}
 	name := p.text
 	if name == "" {
@@ -205,4 +221,63 @@ func (m Model) rename(s fleet.Session, name string) (tea.Model, tea.Cmd) {
 		}
 		return detachedDoneMsg{action: "renamed " + name}
 	}
+}
+
+// selectedFleetSession is the session behind the highlighted row: a ticket's,
+// a project's, or an Other sessions row's.
+func (m Model) selectedFleetSession() (fleet.Session, bool) {
+	if m.cursor < 0 || m.cursor >= len(m.rows) {
+		return fleet.Session{}, false
+	}
+	switch r := m.rows[m.cursor]; r.kind {
+	case rowIssue:
+		return m.fleet.Best(r.issue.Identifier)
+	case rowProject:
+		return m.fleet.Best(r.project.Key())
+	case rowSession:
+		return m.sessionForRef(r.ref)
+	}
+	return fleet.Session{}, false
+}
+
+// openCompactPrompt asks what a compaction should keep. Compacting is a turn
+// of the session's own, so it is only offered where it can run at once: a
+// session in this deck's workspace that is between turns.
+func (m Model) openCompactPrompt() (tea.Model, tea.Cmd) {
+	s, ok := m.selectedFleetSession()
+	switch {
+	case !ok || !s.Live:
+		m.notice = "C compacts a running session's conversation"
+	case !s.Home:
+		m.notice = m.sessionLabel(s) + " runs in the " + firstNonEmpty(s.Workspace, "other") + " deck — M brings it here first"
+	case s.Status != session.Idle && s.Status != session.Unread:
+		m.notice = m.sessionLabel(s) + " is " + statusPhrase(s.Status) + " — compact it once its turn is over"
+	default:
+		m.prompt = &prompt{kind: promptCompact, target: s}
+		m.notice = ""
+	}
+	return m, nil
+}
+
+// compact sends /compact, with the focus given, to a session.
+func (m Model) compact(s fleet.Session, focus string) (tea.Model, tea.Cmd) {
+	text := "/compact"
+	if focus != "" {
+		text += " " + focus
+	}
+	return m.sendToSession(s.Key, text)
+}
+
+// compactCost says what a compaction costs: it re-reads the conversation once,
+// from the prompt cache while that is warm. Claude Code keeps a subscription
+// session's cache for an hour.
+func compactCost(s fleet.Session, now time.Time) string {
+	n := s.Activity.Tail.ContextTokens
+	if n == 0 {
+		return ""
+	}
+	if !s.LastActive.IsZero() && now.Sub(s.LastActive) > 55*time.Minute {
+		return "reads its " + kTokens(n) + " context once, uncached: its prompt cache has expired"
+	}
+	return "reads its " + kTokens(n) + " context once, from the warm cache"
 }

@@ -95,14 +95,16 @@ func NewID() string {
 
 // Info is one entry from `claude agents --json`.
 type Info struct {
-	PID       int    `json:"pid"`
-	ID        string `json:"id"`
-	Cwd       string `json:"cwd"`
-	Kind      string `json:"kind"` // "background" | "interactive"
-	SessionID string `json:"sessionId"`
-	Name      string `json:"name"`
-	Status    string `json:"status"` // "busy" | "idle"
-	State     string `json:"state"`  // "working" | "done" | ...
+	PID        int    `json:"pid"`
+	ID         string `json:"id"`
+	Cwd        string `json:"cwd"`
+	Kind       string `json:"kind"` // "background" | "interactive"
+	SessionID  string `json:"sessionId"`
+	Name       string `json:"name"`
+	Status     string `json:"status"` // "busy" | "idle" | "waiting"
+	State      string `json:"state"`  // "working" | "done" | ...
+	WaitingFor string `json:"waitingFor"`
+	StartedAt  int64  `json:"startedAt"` // epoch milliseconds
 }
 
 // claudeBin is the CLI to invoke; overridable in tests.
@@ -260,6 +262,10 @@ type Ticket struct {
 	// Resume opens the session's existing conversation even though its account
 	// doesn't hold the transcript yet: the launch copies it there first.
 	Resume bool
+	// Model pins the model the session runs, "" for its account's default. A
+	// move sets it, so a session keeps its model on an account whose default
+	// differs.
+	Model string
 }
 
 // ID is the Claude session id the unit runs as.
@@ -392,14 +398,20 @@ func LaunchArgs(t Ticket) []string {
 // account already holds a transcript for it, else start fresh bound to its id.
 func ClaudeArgs(t Ticket) []string {
 	id := t.ID()
+	var args []string
 	if t.Resume || FindTranscript(t.Dir(), id) != "" {
-		return append([]string{"--resume", id}, LaunchArgs(t)...)
+		args = append([]string{"--resume", id}, LaunchArgs(t)...)
+	} else {
+		name := t.Key
+		if t.Scratch && t.Title != "" {
+			name = t.Title // an ad-hoc session's key is its agent name; its title is what the user called it
+		}
+		args = append([]string{"--session-id", id, "--name", name}, LaunchArgs(t)...)
 	}
-	name := t.Key
-	if t.Scratch && t.Title != "" {
-		name = t.Title // an ad-hoc session's key is its agent name; its title is what the user called it
+	if t.Model != "" {
+		args = append(args, "--model", t.Model)
 	}
-	return append([]string{"--session-id", id, "--name", name}, LaunchArgs(t)...)
+	return args
 }
 
 // TabLabel is the herdr tab title for a ticket: the key plus a short slice of

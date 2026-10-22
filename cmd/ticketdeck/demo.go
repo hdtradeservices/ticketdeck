@@ -103,7 +103,7 @@ func (demoFetcher) DemoQuotas() map[string]quota.Entry {
 		return &quota.Usage{FiveHourPct: fh, FiveHourReset: now.Add(2 * time.Hour), SevenDayPct: sd, SevenDayReset: now.Add(4 * 24 * time.Hour)}
 	}
 	return map[string]quota.Entry{
-		"matt":    {Usage: use(52, 42), FetchedAt: now},
+		"matt":    {Usage: use(52, 78), FetchedAt: now}, // runs out before its week renews
 		"m0":      {Usage: use(93, 61), FetchedAt: now},
 		"m1":      {Reason: "token expired"},
 		"support": {Usage: use(12, 8), FetchedAt: now},
@@ -130,7 +130,8 @@ func (demoFetcher) DemoFleet(now time.Time) fleet.Snapshot {
 	}
 	working := s("DEMO-101", "m0", session.Working)
 	working.Activity.InFlight.Agents = 2
-	working.Activity.Tail = session.Tail{LastTool: "Agent: review the checkout fix", ContextTokens: 142000, Model: "claude-opus-5-5"}
+	working.Activity.Tail = session.Tail{LastTool: "Agent: review the checkout fix", ContextTokens: 642000, Model: "claude-opus-5-5"}
+	working.Activity.Burn = 6.4
 	asking := s("DEMO-102", "support", session.NeedsInput)
 	asking.WaitingFor = "permission to run git push"
 	elsewhere := s("DEMO-103", "support", session.Working)
@@ -143,10 +144,12 @@ func (demoFetcher) DemoFleet(now time.Time) fleet.Snapshot {
 	background.Activity.Tail.LastTool = "Bash: gh pr checks 912 --watch"
 	unread := s("DEMO-110", "support", session.Unread)
 	unread.Activity.Tail = session.Tail{LastTool: "Edit: policy_sync.go", ContextTokens: 61000}
+	unread.Activity.Burn = 1.2
 	limited := s("DEMO-111", "m0", session.Limited)
 	limited.Activity.Tail.Err = &session.APIError{Kind: "rate_limit", LimitType: "five_hour", ResetsAt: now.Add(40 * time.Minute), UUID: "demo"}
 	project := s("proj-demo0001", "matt", session.Working)
 	project.Activity.Tail.LastTool = "Read: onboarding_flow.go"
+	project.Activity.Burn = 3.1
 	stoppedProj := s("proj-demo0003", "support", session.Stopped)
 	stoppedProj.Live, stoppedProj.Home, stoppedProj.LastActive = false, false, now.Add(-3*time.Hour)
 

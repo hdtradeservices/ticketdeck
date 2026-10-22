@@ -84,6 +84,7 @@ type bgScan struct {
 	offset int64
 	open   map[string]openTask // task id → launched, not yet finished
 	tail   Tail
+	spends []spend   // API responses inside the burn window, oldest first
 	used   time.Time // last read, for pruning scans of sessions nobody polls any more
 }
 
@@ -117,8 +118,7 @@ func BackgroundWorkIn(configDir, id, cwd string, procStart time.Time) InFlight {
 	if path == "" {
 		return InFlight{}
 	}
-	open, _ := scanTranscript(path)
-	return inFlight(path, open, procStart)
+	return inFlight(path, scanFile(path, time.Now()).open, procStart)
 }
 
 func inFlight(path string, open map[string]openTask, procStart time.Time) InFlight {
@@ -149,6 +149,9 @@ func inFlight(path string, open map[string]openTask, procStart time.Time) InFlig
 type Activity struct {
 	InFlight InFlight
 	Tail     Tail
+	// Burn is what the session and its subagents spent in the last
+	// BurnWindow, in dollars at API rates.
+	Burn     float64
 	Path     string    // the transcript read, "" when there is none
 	Modified time.Time // its mtime: when the session last wrote
 }
@@ -164,8 +167,8 @@ func ActivityAt(path string, procStart time.Time) Activity {
 	if path == "" {
 		return Activity{}
 	}
-	open, tail := scanTranscript(path)
-	a := Activity{InFlight: inFlight(path, open, procStart), Tail: tail, Path: path}
+	r := scanTranscript(path)
+	a := Activity{InFlight: inFlight(path, r.open, procStart), Tail: r.tail, Burn: r.burn, Path: path}
 	if fi, err := os.Stat(path); err == nil {
 		a.Modified = fi.ModTime()
 	}
@@ -300,13 +303,28 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-// scanTranscript returns the tasks launched in path and not yet finished, and
-// the transcript's tail. The returned map is a copy.
-func scanTranscript(path string) (map[string]openTask, Tail) {
+// scanResult is what one read of a transcript found: the tasks launched and
+// not yet finished (a copy), the tail, and the spend inside the burn window.
+type scanResult struct {
+	open map[string]openTask
+	tail Tail
+	burn float64
+}
+
+// scanTranscript reads a session's transcript, and adds its subagents' spend
+// to its own.
+func scanTranscript(path string) scanResult {
+	now := time.Now()
+	r := scanFile(path, now)
+	r.burn += subagentBurn(path, now)
+	return r
+}
+
+// scanFile reads what was appended to one transcript since the last read.
+func scanFile(path string, now time.Time) scanResult {
 	bgMu.Lock()
 	defer bgMu.Unlock()
 
-	now := time.Now()
 	for p, s := range bgScans {
 		if now.Sub(s.used) > scanIdleFor {
 			delete(bgScans, p)
@@ -317,7 +335,7 @@ func scanTranscript(path string) (map[string]openTask, Tail) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		delete(bgScans, path)
-		return nil, Tail{}
+		return scanResult{}
 	}
 	if s == nil || fi.Size() < s.offset {
 		s = &bgScan{open: map[string]openTask{}}
@@ -332,13 +350,12 @@ func scanTranscript(path string) (map[string]openTask, Tail) {
 	for k, v := range s.open {
 		out[k] = v
 	}
-	return out, s.tail
+	return scanResult{open: out, tail: s.tail, burn: s.burn(now)}
 }
 
 // scanBackground is scanTranscript without the tail.
 func scanBackground(path string) map[string]openTask {
-	open, _ := scanTranscript(path)
-	return open
+	return scanFile(path, time.Now()).open
 }
 
 // advance reads complete lines from s.offset onward. A trailing line still
@@ -364,7 +381,9 @@ func (s *bgScan) advance(path string) {
 }
 
 func (s *bgScan) apply(line []byte) {
-	s.tail.apply(line)
+	if sp, ok := s.tail.apply(line); ok {
+		s.addSpend(sp)
+	}
 	// Cheap prefilter: most lines are neither a launch nor a notification, and
 	// some are megabytes of tool output.
 	if !bytes.Contains(line, []byte("<task-id>")) && !bytes.Contains(line, []byte(`"toolUseResult"`)) {

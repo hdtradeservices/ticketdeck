@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -249,5 +250,36 @@ func TestNewIDIsAValidUniqueV4(t *testing.T) {
 	}
 	if len(a) != 36 || a[14] != '4' || !strings.ContainsRune("89ab", rune(a[19])) {
 		t.Errorf("not a v4 uuid: %s", a)
+	}
+}
+
+// `claude agents --json` as Claude Code 2.1.280 prints it on the workbench
+// (2026-10-22): interactive sessions carry a pid, a background session the
+// daemon parked has none.
+func TestAgentsReadsTheDocumentedListing(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "claude")
+	listing := fmt.Sprintf(`[
+  {"pid": %d, "cwd": "/home/x/Repos", "kind": "interactive", "startedAt": 1792066254440, "sessionId": "s-live", "status": "waiting", "waitingFor": "input needed", "name": "ZEN-1"},
+  {"id": "4f543507", "cwd": "/home/x/Repos", "kind": "background", "startedAt": 1787758123098, "sessionId": "s-parked", "name": "ZEN-2", "state": "blocked"},
+  {"pid": 2147480000, "kind": "interactive", "sessionId": "s-gone", "status": "idle"}
+]`, os.Getpid())
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n[ \"$1 $2\" = \"agents --json\" ] || exit 2\ncat <<'JSON'\n"+listing+"\nJSON\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := claudeBin
+	claudeBin = bin
+	t.Cleanup(func() { claudeBin = old })
+
+	procs, err := Agents(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(procs) != 1 {
+		t.Fatalf("procs = %+v, want only the live interactive session", procs)
+	}
+	p := procs[0]
+	if p.SessionID != "s-live" || p.Status != "waiting" || p.WaitingFor != "input needed" || p.StartedAt.IsZero() {
+		t.Errorf("proc = %+v", p)
 	}
 }

@@ -168,20 +168,43 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   subscription. The line under the title shows every account's 5-hour and 7-day usage and
   how many sessions it runs; the one a new session would open on is underlined. See
   [`SETUP.md`](SETUP.md#multiple-claude-subscriptions-accounts).
-- **It picks the account.** `⏎` resumes a session on the account it already lives on. A new
-  one goes to the account with the most room, measured by whichever window is closer to its
-  cap; accounts within ten points of each other go to the one running fewer sessions. An
-  account that is out — its limit refused a session, a window is spent, or nobody is signed
-  in — is skipped. `A` shows the ranking, and pins new sessions to one account if you'd
-  rather choose.
+- **It picks the account the way `claude-pick` does.** `⏎` resumes a session on the account
+  it already lives on. A new one goes where `claude-pick` (in the shared `~/claude` repo)
+  would send it: to the weekly allowance that renews soonest, since whatever is left at the
+  reset is lost; away from an account whose 5-hour limit would stop the session within the
+  next few hours; and spread across accounts by how busy each one's sessions are. Both read
+  the same `CLAUDE_PICK_*` settings and the same pending-launch markers, so a burst from
+  either lands on different accounts. The deck ports the score rather than running
+  `claude-pick`, which refreshes an expired login by spending a small model turn. An account
+  that is out — its limit refused a session, a window is spent, or nobody is signed in — is
+  skipped, and so is one whose config dir holds a `.ticketdeck-hide` file (a background
+  worker's seat). `A` shows the ranking and why the next account is next, and pins new
+  sessions to one account if you'd rather choose.
 - **It keeps going when an account runs out.** When a session's account hits its usage
-  limit, the deck moves the session to the account with the most room and tells it to carry
-  on — on its own, once per cut-off, and only after the limit has ended the turn. With
-  nowhere to go it waits, and continues where it is once the limit resets. A lapsed login is
-  handled the same way. `A` turns this off; `TICKETDECK_AUTO_MOVE=off` does too.
+  limit, the deck moves the session to the best-placed account and tells it to carry on — on
+  its own, once per cut-off, and only after the limit has ended the turn. With nowhere to go
+  it waits, and continues where it is once the limit resets. A lapsed login is handled the
+  same way. `A` turns this off; `TICKETDECK_AUTO_MOVE=off` does too.
 - **`H` moves a session by hand**, in place: the tab closes, the conversation is copied to
   the other account, and it resumes in a new tab. What carries over is the conversation, not
-  the process.
+  the process. A moved session keeps the model it was running, whatever the new account's
+  default; `H` says what else differs there (MCP servers, hooks, plugins, Remote Control).
+- **It says when the accounts are set up differently.** Accounts are configured one at a
+  time and drift apart. `A` lists, for each account, what a session moved there would gain
+  or lose against this deck's own: model, effort, auto-compact window, MCP servers, hooks,
+  plugins, env names, Remote Control.
+- **It forecasts the week.** The line under the title adds `→ out Fri 9am` to an account
+  that will run out before its week renews at the pace it has been spent so far, and `A`
+  has the same for every account.
+- **It shows who is spending.** The highlighted session's line says what it spent in the
+  last five hours, at API rates (the rate usage credits bill at), and its share of its
+  account's spend; `A` lists the five biggest spenders. Subagents count toward the session
+  that started them.
+- **It flags big contexts, and compacts on request.** Every turn re-reads the whole
+  context, so a row whose session carries 300k tokens or more shows `◔` and the size
+  (orange; red from 600k). `C` sends `/compact` to the highlighted session, with an optional
+  focus, once its turn is over — while its prompt cache is still warm, that costs a fraction
+  of a turn.
 - **Sessions from older decks come along.** Sessions started by the old one-deck-per-account
   layout (`deck --account`, or `rdeck <name>`) still run in those decks' workspaces. The deck
   sees them — the title bar counts them — and `M` brings them in on the same account; a busy
@@ -196,7 +219,7 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   transcript and diverge with no way to merge them. `⏎`/`esc` leaves it alone, `b` brings it
   into this deck, `p` opens its PR instead, and `o` overrides.
 - **Ad-hoc sessions have names and survive restarts.** `n` asks for a name and opens the
-  session under its own id on the account with most room; `R` renames one. The deck
+  session under its own id on the best-placed account; `R` renames one. The deck
   remembers them (`~/.ticketdeck/sessions.json`), so after a herdr restart they are listed
   under Other sessions as resumable, by name, on the account they ran on.
 - **Claude usage** — the title bar shows your Claude 5-hour and 7-day rate-limit
@@ -211,6 +234,16 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   the token; `not signed in` means it can't run anything until someone logs it in again. A
   `~` after the numbers means they're more than two intervals old, and a reading from before
   the weekly window last reset is not shown at all: it is history, not headroom.
+- **It checks its own assumptions.** Much of what the deck reads is undocumented — Claude
+  Code's session registry and transcripts, the usage endpoint — and Claude Code ships most
+  days. At start and every ten minutes the deck checks each account's registry against
+  `claude agents --json`, that live sessions' transcripts are where it looks and still
+  parse, that the usage endpoint still answers in the shape it knows, and herdr's version. A
+  failed check is named under the title, and an account whose registry stopped matching is
+  read through `claude agents --json` instead. `ticketdeck doctor` prints every check.
+- **herdr's events, not just a timer.** Under herdr the deck subscribes to the server's
+  pane and agent-status events and refreshes the moment one arrives; the 3-second poll
+  slows to 10 seconds while the subscription is up, and comes back if it drops.
 - **Backends** (`--backend claude|herdr|auto`, default `auto`): `herdr` gives the
   detach/re-attach + tab-per-ticket workflow; `claude` drives the `claude` CLI directly
   (foreground per ticket). `auto` uses herdr when it's installed.

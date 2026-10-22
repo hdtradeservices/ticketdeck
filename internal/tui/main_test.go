@@ -16,7 +16,7 @@ var realEnv = map[string]string{}
 // every account's live sessions; a test that reached any of those would read
 // the developer's real sessions, or write into their real ledger.
 func TestMain(m *testing.M) {
-	for _, k := range []string{"HOME", "HERDR_SOCKET_PATH", "HERDR_CLIENT_SOCKET_PATH"} {
+	for _, k := range []string{"HOME", "HERDR_SOCKET_PATH", "HERDR_CLIENT_SOCKET_PATH", "XDG_RUNTIME_DIR"} {
 		realEnv[k] = os.Getenv(k)
 	}
 	home, err := os.MkdirTemp("", "ticketdeck-tui-test")
@@ -24,6 +24,9 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	_ = os.Setenv("HOME", home)
+	// Launches leave claude-pick's pending markers here; the real ones would
+	// steer the developer's next claude-pick.
+	_ = os.Setenv("XDG_RUNTIME_DIR", home)
 	for _, k := range []string{"CLAUDE_CONFIG_DIR", "TICKETDECK_ACCOUNT", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "XDG_CONFIG_HOME", "TICKETDECK_AUTO_MOVE"} {
 		_ = os.Unsetenv(k)
 	}

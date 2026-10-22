@@ -319,6 +319,33 @@ deck would show — which account runs it, which deck's workspace holds it, its
 status and what it last did — without opening the deck. `rdeck --status` prints
 it for a remote box.
 
+`ticketdeck doctor` runs the deck's self-check and prints every result: each
+account's session registry against `claude agents --json`, whether live
+sessions' transcripts are where the deck looks and still parse, whether the
+usage endpoint still answers in the shape the deck knows, herdr's version, and
+how each account's setup differs from the deck's own. It exits non-zero when a
+check fails. The deck runs the same checks at start and every ten minutes, and
+names a failure under its title.
+
+#### Keeping contexts small
+
+Every turn re-reads a session's whole context, so a session at 600k tokens
+spends its account several times faster than one at 100k for the same work.
+The deck flags 300k and up on the row (`◔`), and `C` compacts the highlighted
+session — with an optional focus, once its turn is over. Claude Code's own
+controls, per account (each config dir has its own `settings.json`):
+
+- `"autoCompactWindow": 400000` compacts at that size instead of near the
+  1M-token limit Opus 5 and later run with by default. `/autocompact 400k`
+  saves the same per model (Claude Code 2.1.288 or later).
+- Idle compaction (Claude Code 2.1.290 or later, on by default) compacts a
+  session of 200k tokens or more that has sat idle about 54 minutes, just
+  before its one-hour prompt cache expires, so the next turn starts from a
+  summary instead of re-reading everything uncached.
+  `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS` changes the threshold.
+
+`A` shows each account's auto-compact window next to its other settings.
+
 ## 5. A deck on another box: `rdeck`
 
 `rdeck` attaches to a TicketDeck running somewhere else — a cloud workstation,

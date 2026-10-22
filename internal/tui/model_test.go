@@ -2151,9 +2151,10 @@ func TestHandoffCandidatesOrderedByTighterWindow(t *testing.T) {
 		{Name: "free", ConfigDir: "/x/.claude-free"},
 		{Name: "unread", ConfigDir: "/x/.claude-unread"},
 	}
+	week := time.Now().Add(72 * time.Hour)
 	m.quotas = map[string]quota.Entry{
-		"loaded": {Usage: &quota.Usage{FiveHourPct: 5, SevenDayPct: 98}, FetchedAt: time.Now()},
-		"free":   {Usage: &quota.Usage{FiveHourPct: 40, SevenDayPct: 20}, FetchedAt: time.Now()},
+		"loaded": {Usage: &quota.Usage{FiveHourPct: 5, SevenDayPct: 98, SevenDayReset: week}, FetchedAt: time.Now()},
+		"free":   {Usage: &quota.Usage{FiveHourPct: 40, SevenDayPct: 20, SevenDayReset: week}, FetchedAt: time.Now()},
 	}
 	m = liveOn(m, "ZEN-9", "matt", session.NeedsInput)
 	next, _ := m.Update(runes("H"))

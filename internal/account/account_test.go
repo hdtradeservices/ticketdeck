@@ -144,6 +144,24 @@ func TestAllSkipsDirsWithoutCredentials(t *testing.T) {
 	}
 }
 
+// A seat a background worker spends carries .ticketdeck-hide, and the router
+// must never see it — even though it holds credentials like any other.
+func TestAllSkipsHiddenAccounts(t *testing.T) {
+	home := fakeHome(t, Default, "support", "suggest-loop")
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("TICKETDECK_ACCOUNT", "")
+	if err := os.WriteFile(filepath.Join(home, ".claude-suggest-loop", hideFile), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, a := range All() {
+		names = append(names, a.Name)
+	}
+	if strings.Join(names, ",") != "default,support" {
+		t.Errorf("All() = %v, want [default support]", names)
+	}
+}
+
 func TestColorsAreDistinctPerAccount(t *testing.T) {
 	accts := []Account{{Name: "matt"}, {Name: "support"}, {Name: "third"}}
 	c := Colors(accts)

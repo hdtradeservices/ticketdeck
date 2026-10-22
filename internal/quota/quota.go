@@ -30,7 +30,8 @@ import (
 	"github.com/hdtradeservices/ticketdeck/internal/session"
 )
 
-const usageURL = "https://api.anthropic.com/api/oauth/usage"
+// usageURL is a var so tests can point Fetch at a local server.
+var usageURL = "https://api.anthropic.com/api/oauth/usage"
 
 // Every is how long a reading is served before an account is re-read.
 // Utilization moves slowly and the budget is shared with every Claude Code
@@ -76,6 +77,11 @@ var ErrSignedOut = errors.New("not signed in")
 // macOS keychain rather than in .credentials.json. The deck can't read its
 // usage, but nothing says it is signed out.
 var ErrKeychain = errors.New("credentials in the keychain")
+
+// ErrFormat reports a usage answer without the two windows the deck reads:
+// the endpoint is undocumented, and this is what a change to it looks like.
+// Reading it as zero would show every account as empty.
+var ErrFormat = errors.New("usage endpoint: unexpected answer")
 
 // goos is runtime.GOOS; tests set it.
 var goos = runtime.GOOS
@@ -145,6 +151,45 @@ func (e Entry) Current(now time.Time) *Usage {
 // SignedOut reports an account that can't run a session until someone logs it
 // in again.
 func (e Entry) SignedOut() bool { return e.Reason == "not signed in" }
+
+// WeekRunsOut projects when the weekly allowance runs out at the pace it has
+// been spent so far this week: the share used, over the hours since the week
+// began, carried forward from when the reading was taken. ok is false when
+// that pace lasts until the week renews, or the week is too young to have a
+// pace worth projecting.
+func (e Entry) WeekRunsOut(now time.Time) (time.Time, bool) {
+	if e.Usage == nil {
+		return time.Time{}, false
+	}
+	return runsOut(e.Usage.SevenDayPct, e.Usage.SevenDayReset, 7*24*time.Hour, 12*time.Hour, e.FetchedAt, now)
+}
+
+// FiveHourRunsOut is WeekRunsOut for the 5-hour window.
+func (e Entry) FiveHourRunsOut(now time.Time) (time.Time, bool) {
+	if e.Usage == nil {
+		return time.Time{}, false
+	}
+	return runsOut(e.Usage.FiveHourPct, e.Usage.FiveHourReset, 5*time.Hour, 30*time.Minute, e.FetchedAt, now)
+}
+
+func runsOut(pct float64, reset time.Time, length, minOpen time.Duration, readAt, now time.Time) (time.Time, bool) {
+	if reset.IsZero() || !reset.After(now) || pct <= 0 || readAt.IsZero() {
+		return time.Time{}, false
+	}
+	if pct >= 100 {
+		return readAt, true
+	}
+	open := readAt.Sub(reset.Add(-length))
+	if open < minOpen {
+		return time.Time{}, false
+	}
+	perHour := pct / open.Hours()
+	t := readAt.Add(time.Duration((100 - pct) / perHour * float64(time.Hour)))
+	if !t.Before(reset) {
+		return time.Time{}, false
+	}
+	return t, true
+}
 
 // Poll returns every account's latest entry, refreshing the ones that are due.
 // Due accounts are fetched only by the one deck that holds the poll lock; any
@@ -243,9 +288,15 @@ func reasonFor(err error) string {
 		return "not signed in"
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return "no response"
+	case errors.Is(err, ErrFormat):
+		return ReasonFormat
 	}
 	return "usage unavailable"
 }
+
+// ReasonFormat is the Reason an account carries when the usage endpoint
+// answered in a shape the deck doesn't know.
+const ReasonFormat = "usage format changed"
 
 func retryIn(err error) time.Duration {
 	switch {
@@ -394,17 +445,20 @@ func Fetch(ctx context.Context, configDir string) (Usage, error) {
 		return Usage{}, fmt.Errorf("usage endpoint: http %d", res.StatusCode)
 	}
 	var body struct {
-		FiveHour struct {
+		FiveHour *struct {
 			Utilization float64 `json:"utilization"`
 			ResetsAt    string  `json:"resets_at"`
 		} `json:"five_hour"`
-		SevenDay struct {
+		SevenDay *struct {
 			Utilization float64 `json:"utilization"`
 			ResetsAt    string  `json:"resets_at"`
 		} `json:"seven_day"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		return Usage{}, err
+	}
+	if body.FiveHour == nil || body.SevenDay == nil {
+		return Usage{}, ErrFormat
 	}
 	return Usage{
 		FiveHourPct:   body.FiveHour.Utilization,

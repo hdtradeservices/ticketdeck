@@ -22,6 +22,7 @@ import (
 	"github.com/mattn/go-runewidth"
 
 	"github.com/hdtradeservices/ticketdeck/internal/account"
+	"github.com/hdtradeservices/ticketdeck/internal/doctor"
 	"github.com/hdtradeservices/ticketdeck/internal/fleet"
 	"github.com/hdtradeservices/ticketdeck/internal/ledger"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
@@ -115,6 +116,10 @@ const refreshEvery = 60 * time.Second
 // poll only hits the local backend (herdr socket / on-disk claude agents), never
 // the rate-limited Linear API.
 const statusRefreshEvery = 3 * time.Second
+
+// eventPollEvery is the status poll's interval while herdr's events report the
+// changes in this deck's workspace as they happen.
+const eventPollEvery = 10 * time.Second
 
 // finishedIdleGrace is how long a session must sit idle, after its ticket went
 // Done outside the deck, before the deck closes it. Idle also means "between
@@ -352,9 +357,15 @@ type Model struct {
 	prompt        *prompt // a one-line prompt (new session name, rename) is open
 	help          bool    // the key reference (?) is open
 	helpOffset    int
-	pollBusy      bool      // a status poll is in flight; the timer doesn't stack another on it
-	pollStarted   time.Time // when it started, so a lost reply can't stall polling for good
-	lastPollErr   string    // the last status poll error logged, so a lasting one is logged once
+	pollBusy      bool          // a status poll is in flight; the timer doesn't stack another on it
+	pollStarted   time.Time     // when it started, so a lost reply can't stall polling for good
+	pollAgain     bool          // something changed while a poll was in flight: poll again when it lands
+	pollQueued    bool          // an event-driven poll is waiting out minPollGap
+	events        chan tea.Msg  // herdr's event watcher reports here; nil without herdr
+	eventsUp      bool          // the watcher is subscribed, so polls can be far apart
+	doctor        doctor.Report // the last self-check (internal/doctor)
+	doctorBusy    bool
+	lastPollErr   string // the last status poll error logged, so a lasting one is logged once
 	err           error
 	notice        string // transient status line (e.g. dry-run launch plan)
 	lastSync      time.Time
@@ -418,6 +429,9 @@ func New(f Fetcher, root string, dry bool, backend Backend) Model {
 	m.hideOpenHint = openHintDismissed()
 	if backend != nil {
 		debugLog.Printf("start: backend=%s root=%q dry=%v", backend.Bin(), root, dry)
+		if backend.Herdr() && !m.demo {
+			m.events = make(chan tea.Msg, 16)
+		}
 	}
 	return m
 }
@@ -462,7 +476,7 @@ func (m Model) Init() tea.Cmd {
 	// The fast status poll only makes sense against a live backend; --demo/--preview
 	// resolve statuses synchronously, so don't spin a ticker there.
 	if !m.demo {
-		cmds = append(cmds, statusTick())
+		cmds = append(cmds, statusTick(statusRefreshEvery), m.watchHerdr(), m.runDoctor())
 	}
 	return tea.Batch(cmds...)
 }
@@ -542,6 +556,7 @@ func (m Model) refreshStatuses() tea.Cmd {
 	in := fleet.Input{
 		Accounts: m.accounts, Home: m.acct, Keys: keys, Ledger: m.ledger,
 		Herdr: m.backend != nil && m.backend.Herdr(), Peers: true, Cwd: m.root,
+		ViaAgents: m.doctor.ViaAgents,
 	}
 	visible := map[string]bool{}
 	for _, k := range keys {
@@ -734,8 +749,19 @@ func (m Model) linearStale(now time.Time) bool {
 
 // statusTick schedules the next fast status-only poll. No jitter: it only hits
 // the local backend, not the shared Linear API, so there's no herd to spread.
-func statusTick() tea.Cmd {
-	return tea.Tick(statusRefreshEvery, func(time.Time) tea.Msg { return statusTickMsg{} })
+func statusTick(every time.Duration) tea.Cmd {
+	return tea.Tick(every, func(time.Time) tea.Msg { return statusTickMsg{} })
+}
+
+// pollEvery is the status poll's interval: the fast one, unless herdr's events
+// already say when something in this deck's workspace changes. The slower
+// poll is still needed for what no event reports — a turn that ended on a
+// usage limit, other decks' workspaces, sessions outside herdr.
+func (m Model) pollEvery() time.Duration {
+	if m.eventsUp {
+		return eventPollEvery
+	}
+	return statusRefreshEvery
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -756,18 +782,46 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// in lockstep — the state that earns the 429s.
 		cmds := []tea.Cmd{tick(), m.fetchQuota()}
 		cmds = append(cmds, m.linearRefresh()...)
+		if !m.demo && !m.doctorBusy && time.Since(m.doctor.At) > doctorEvery {
+			m.doctorBusy = true
+			cmds = append(cmds, m.runDoctor())
+		}
 		return m, tea.Batch(cmds...)
 
 	case statusTickMsg:
 		// Deliberately no Linear fetch or quota call — those stay on the slow tick.
 		// A poll still in flight is not stacked on: a slow herdr would otherwise
 		// queue polls faster than they finish.
-		cmds := []tea.Cmd{statusTick()}
+		cmds := []tea.Cmd{statusTick(m.pollEvery())}
 		if !m.pollBusy || time.Since(m.pollStarted) > 30*time.Second {
 			m.pollBusy, m.pollStarted = true, time.Now()
 			cmds = append(cmds, m.refreshStatuses())
 		}
 		return m, tea.Batch(cmds...)
+
+	case herdrChangedMsg:
+		next, cmd := m.pollOnEvent()
+		return next, tea.Batch(m.waitHerdr(), cmd)
+
+	case queuedPollMsg:
+		m.pollQueued = false
+		return m.pollOnEvent()
+
+	case herdrUpMsg:
+		if msg.up != m.eventsUp {
+			debugLog.Printf("herdr events: subscribed=%v", msg.up)
+		}
+		m.eventsUp = msg.up
+		return m, m.waitHerdr()
+
+	case doctorMsg:
+		m.doctorBusy = false
+		for _, c := range msg.report.Failures() {
+			if !slices.ContainsFunc(m.doctor.Failures(), func(p doctor.Check) bool { return p == c }) {
+				debugLog.Printf("self-check failed: %s: %s", c.Name, c.Detail)
+			}
+		}
+		m.doctor = msg.report
 
 	case tea.FocusMsg:
 		// The deck pane regained focus (e.g. returning from a ticket's tab under
@@ -892,6 +946,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pollBusy = false
 		now := time.Now()
 		var cmds []tea.Cmd
+		if m.pollAgain {
+			m.pollAgain = false
+			var cmd tea.Cmd
+			m, cmd = m.pollOnEvent()
+			cmds = append(cmds, cmd)
+		}
 		if msg.snap != nil {
 			m.markSeen(msg.snap, msg.statuses, msg.others, now)
 			m.fleet = *msg.snap
@@ -1189,6 +1249,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.openAccounts()
 		case "M":
 			return m.openBring()
+		case "C":
+			return m.openCompactPrompt()
 		case "R":
 			if sr, ok := m.selectedSession(); ok {
 				if s, ok := m.sessionForRef(sr); ok {
@@ -1399,6 +1461,8 @@ func (m Model) openUnit(t session.Ticket, label string) (tea.Model, tea.Cmd) {
 		t.Account, t.ConfigDir = acct.Name, acct.ConfigDir
 		if has && !best.Live && best.ConfigDir != acct.ConfigDir {
 			t.SessionID, t.Resume = best.ID, true
+			// Resuming on another account is a move, and keeps its model the same way.
+			t.Model = session.TailOf(best.ConfigDir, best.ID).Model
 		}
 	}
 	spec, err := m.backend.Plan(t, m.root)
@@ -1688,6 +1752,7 @@ func recordLaunch(spec session.LaunchSpec) {
 	if spec.SessionID == "" || spec.Action == "focus" {
 		return
 	}
+	fleet.MarkLaunch(firstNonEmpty(spec.ConfigDir, session.ConfigDir()))
 	kind := ledger.Ticket
 	switch {
 	case spec.Action == "scratch":
@@ -2706,6 +2771,9 @@ func (m Model) viewportHeight() int {
 	if m.hasAccountsLine() {
 		reserved++ // second header line: every account's usage
 	}
+	if m.hasDoctorLine() {
+		reserved++ // a self-check that failed
+	}
 	h := m.height - reserved
 	if h < 1 {
 		h = 1
@@ -2770,6 +2838,7 @@ var (
 	idStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
 	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	warnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	noticeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	sectionStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("245"))
 	// working tickets recede: uniform faint gray so attention goes elsewhere.
@@ -2919,6 +2988,7 @@ func (m Model) View() string {
 	}
 	fmt.Fprintf(&b, "%s%s%s%s%s%s\n", titleStyle.Render("TicketDeck"), m.accountSegment(), dimStyle.Render(m.titleMeta()), m.quotaSegment(), elsewhere, upd)
 	fmt.Fprint(&b, m.accountsLine())
+	fmt.Fprint(&b, m.doctorLine())
 
 	if m.loading && len(m.rows) == 0 {
 		fmt.Fprint(&b, dimStyle.Render("\n  loading tickets…\n"))
@@ -3355,16 +3425,17 @@ func (m Model) renderIssue(is linear.Issue, selected bool, indent int) string {
 	prG, prC := prMark(is.PRs)
 	tagText, tagColor := validationTag(is.Labels)
 	note := blockedNote(is) // "⛔ ZEN-1, ZEN-2" on a Blocked ticket, else ""
+	ctxText, ctxColor := m.contextTag(is.Identifier)
 
 	// Truncate the title to what's left after the fixed columns:
 	// indent(2) + owner + badge + space + id(9) + space + prmark(2) + space, minus
-	// the trailing validation tag and blocked-by note (each with a leading space).
+	// the trailing validation tag, blocked-by note and context flag (each with a
+	// leading space).
 	avail := m.rowWidth() - (2 + indent + m.ownerCol + sessionCol + 1 + 9 + 1 + prMarkCol + 1)
-	if tagText != "" {
-		avail -= cols(tagText) + 1
-	}
-	if note != "" {
-		avail -= cols(note) + 1
+	for _, t := range []string{tagText, note, ctxText} {
+		if t != "" {
+			avail -= cols(t) + 1
+		}
 	}
 	if avail < 12 {
 		avail = 12
@@ -3380,6 +3451,9 @@ func (m Model) renderIssue(is linear.Issue, selected bool, indent int) string {
 		if note != "" {
 			content += " " + note
 		}
+		if ctxText != "" {
+			content += " " + ctxText
+		}
 		style := selStyle
 		if is.IsDone() && !is.IsValidate() {
 			style = style.Strikethrough(true)
@@ -3393,6 +3467,9 @@ func (m Model) renderIssue(is linear.Issue, selected bool, indent int) string {
 	noteR := ""
 	if note != "" {
 		noteR = " " + blockedStyle.Render(note)
+	}
+	if ctxText != "" {
+		noteR += " " + lipgloss.NewStyle().Foreground(ctxColor).Render(ctxText)
 	}
 	// Recently-done tickets linger struck-through so finished work stays visible
 	// for a while without drawing the eye. Strike only the text tokens, not the
@@ -3498,15 +3575,22 @@ func (m Model) renderSession(ref session.SessionRef, selected bool) string {
 			}
 		}
 	}
+	ctxText, ctxColor := m.contextTag(ref.Name)
 	avail := m.rowWidth() - (2 + m.ownerCol + sessionCol + 1)
 	if where != "" {
 		avail -= cols(where) + 2
+	}
+	if ctxText != "" {
+		avail -= cols(ctxText) + 1
 	}
 	if avail > 0 {
 		name = truncCols(name, max(avail, 12))
 	}
 	if selected {
 		content := fmt.Sprintf("▶ %s%s %s", own, cell, name)
+		if ctxText != "" {
+			content += " " + ctxText
+		}
 		if where != "" {
 			content += "  " + where
 		}
@@ -3517,6 +3601,9 @@ func (m Model) renderSession(ref session.SessionRef, selected bool) string {
 		badge = lipgloss.NewStyle().Foreground(ownColor).Render(cell)
 	}
 	out := fmt.Sprintf("  %s%s %s", lipgloss.NewStyle().Foreground(ownColor).Render(own), badge, name)
+	if ctxText != "" {
+		out += " " + lipgloss.NewStyle().Foreground(ctxColor).Render(ctxText)
+	}
 	if where != "" {
 		out += "  " + dimStyle.Render(where)
 	}
@@ -3742,6 +3829,15 @@ func (m Model) renderHandoff() string {
 	if !has {
 		return b.String()
 	}
+	if m.handoffCursor < len(m.handoffCands) {
+		// A move keeps the session's model, so only the rest of the setup can
+		// differ underneath it.
+		if a := m.handoffCands[m.handoffCursor]; a.Name != s.Account {
+			if d := account.WithoutModel(m.setupDrift(s.Account, a.Name)); len(d) > 0 {
+				fmt.Fprintf(&b, "\n  %s\n", warnStyle.Render("⦿"+a.Name+" is set up differently: "+joinDrift(d)))
+			}
+		}
+	}
 	warn := ""
 	switch {
 	case s.Live && s.Status == session.Working:
@@ -3753,6 +3849,9 @@ func (m Model) renderHandoff() string {
 	if s.Live {
 		what = "  stops it, copies its conversation over, and resumes it there in a new\n" +
 			"  tab of this deck. The conversation carries; a running process does not."
+		if model := s.Activity.Tail.Model; model != "" {
+			what += "\n  It keeps running " + model + "."
+		}
 	}
 	fmt.Fprintf(&b, "\n%s%s\n", dimStyle.Render(what), warn)
 	return b.String()

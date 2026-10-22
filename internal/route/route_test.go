@@ -35,15 +35,85 @@ func TestRankByTheTighterWindow(t *testing.T) {
 	}
 }
 
-// Within one 10-point band, the account running fewer sessions wins: sessions
-// on one account share its budget.
+// Near-equal accounts split the work: sessions on one account share its
+// budget, so three busy ones there divide its urgency down.
 func TestNearEqualAccountsSpreadSessions(t *testing.T) {
 	got := Rank([]Candidate{
-		{Name: "a", Usage: use(10, 22), Live: 3},
-		{Name: "b", Usage: use(15, 25), Live: 0},
+		{Name: "a", Usage: use(10, 22), Live: 3, Load: 3},
+		{Name: "b", Usage: use(15, 25)},
 	}, now)
 	if n := names(got); n != "b,a" {
 		t.Errorf("order = %s, want b,a", n)
+	}
+}
+
+// claude-pick's own example: unused weekly allowance is lost at the reset, so
+// 40% left that renews tonight outranks 80% left that renews in six days.
+func TestSpendTheWeekThatRenewsFirst(t *testing.T) {
+	soon := &quota.Usage{FiveHourPct: 10, FiveHourReset: now.Add(3 * time.Hour), SevenDayPct: 60, SevenDayReset: now.Add(10 * time.Hour)}
+	late := &quota.Usage{FiveHourPct: 10, FiveHourReset: now.Add(3 * time.Hour), SevenDayPct: 20, SevenDayReset: now.Add(6 * 24 * time.Hour)}
+	d := Pick([]Candidate{{Name: "late", Usage: late}, {Name: "soon", Usage: soon}}, Request{Now: now})
+	if d.Account != "soon" {
+		t.Fatalf("pick = %s (%s), want soon", d.Account, d.Why)
+	}
+	if !strings.Contains(d.Why, "40% of its week left, renewing") {
+		t.Errorf("why = %q, want it to name the week left and its renewal", d.Why)
+	}
+}
+
+// And its other example: an account at 80% of its 5-hour window with six busy
+// sessions is about to stall, whatever its week looks like.
+func TestAvoidAPredictedFiveHourStall(t *testing.T) {
+	busy := &quota.Usage{FiveHourPct: 80, FiveHourReset: now.Add(4 * time.Hour), SevenDayPct: 10, SevenDayReset: now.Add(20 * time.Hour)}
+	calm := &quota.Usage{FiveHourPct: 30, FiveHourReset: now.Add(4 * time.Hour), SevenDayPct: 50, SevenDayReset: now.Add(5 * 24 * time.Hour)}
+	got := Rank([]Candidate{{Name: "busy", Usage: busy, Load: 6}, {Name: "calm", Usage: calm, Load: 1}}, now)
+	if n := names(got); n != "calm,busy" {
+		t.Fatalf("order = %s, want calm,busy", n)
+	}
+	if got[1].Stall <= 0 || got[1].Score >= 0 {
+		t.Errorf("busy: stall %.2fh score %.2f, want a stall and a negative score", got[1].Stall, got[1].Score)
+	}
+	if !strings.Contains(Fit(got[1], now), "likely to stop a session there") {
+		t.Errorf("fit = %q", Fit(got[1], now))
+	}
+}
+
+// The burn rate is measured once some account has an hour of history and real
+// load behind it: 40% over two hours at a load of 2 is 10%/h a session. At that
+// rate the other account's 35% outlasts the 3-hour horizon; at an assumed
+// 30%/h, with nothing to measure, it doesn't.
+func TestMeasuredBurnRate(t *testing.T) {
+	old := Tune
+	t.Cleanup(func() { Tune = old })
+	Tune.SessionRate = 30
+	measured := &quota.Usage{FiveHourPct: 40, FiveHourReset: now.Add(3 * time.Hour), SevenDayPct: 50, SevenDayReset: now.Add(100 * time.Hour)}
+	other := &quota.Usage{FiveHourPct: 65, FiveHourReset: now.Add(270 * time.Minute), SevenDayPct: 50, SevenDayReset: now.Add(100 * time.Hour)}
+	stallOf := func(rs []Ranked, name string) float64 {
+		for _, r := range rs {
+			if r.Name == name {
+				return r.Stall
+			}
+		}
+		t.Fatalf("%s not ranked", name)
+		return 0
+	}
+	both := Rank([]Candidate{{Name: "measured", Usage: measured, Load: 2}, {Name: "other", Usage: other}}, now)
+	if s := stallOf(both, "other"); s != 0 {
+		t.Errorf("other stalls %.2fh at the measured 10%%/h, want none", s)
+	}
+	alone := Rank([]Candidate{{Name: "other", Usage: other}}, now)
+	if s := stallOf(alone, "other"); s < 1.8 || s > 1.9 {
+		t.Errorf("other stalls %.2fh at the assumed 30%%/h, want ~1.83h", s)
+	}
+}
+
+func TestTunablesFromEnv(t *testing.T) {
+	t.Setenv("CLAUDE_PICK_SESSION_RATE", "20")
+	t.Setenv("CLAUDE_PICK_HORIZON", "nope")
+	t.Setenv("CLAUDE_PICK_LOAD_PENALTY", "-1")
+	got := tunablesFromEnv()
+	if got != (Tunables{SessionRate: 20, Horizon: 3, LoadPenalty: 0.5}) {
+		t.Errorf("tunables = %+v: values claude-pick would refuse keep the default", got)
 	}
 }
 
@@ -167,7 +237,7 @@ func TestPickWithNowhereToGoNamesTheFirstReset(t *testing.T) {
 // account nobody has used for hours has an expired token and an empty window.
 func TestUnreadableAccountRanksBehindPlentyAheadOfLittle(t *testing.T) {
 	got := Rank([]Candidate{
-		{Name: "low", Usage: use(75, 70)},
+		{Name: "low", Usage: use(75, 75)},
 		{Name: "idle", Reason: "token expired"},
 		{Name: "plenty", Usage: use(10, 20)},
 	}, now)

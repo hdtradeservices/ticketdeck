@@ -131,6 +131,11 @@ func (m Model) sessionAccount(s fleet.Session) account.Account {
 func (m Model) moveCmd(s fleet.Session, to account.Account, o moveOpts) tea.Cmd {
 	from := m.sessionAccount(s)
 	t := m.ticketFor(s)
+	if from.ConfigDir != to.ConfigDir {
+		// Accounts drift apart in their settings; a session halfway through a
+		// task keeps the model it started on, not the new account's default.
+		t.Model = s.Activity.Tail.Model
+	}
 	label := m.sessionLabel(s)
 	mv := Move{
 		Name: s.Key, From: from, To: to, Ticket: t,
@@ -166,6 +171,9 @@ func (m Model) moveCmd(s fleet.Session, to account.Account, o moveOpts) tea.Cmd 
 			return msg
 		}
 		msg.newKey = mv.NewName
+		if s.Live {
+			fleet.MarkLaunch(to.ConfigDir)
+		}
 		_ = ledger.Update(id, func(e *ledger.Entry) {
 			e.Key = firstNonEmpty(mv.NewName, key)
 			e.Kind = firstNonEmpty(e.Kind, s.Kind)
@@ -218,7 +226,7 @@ func continuePrompt(s fleet.Session) string {
 }
 
 // autoMoves acts on the sessions in this workspace that their account's usage
-// limit cut off: each moves to the account with the most room and is told to
+// limit cut off: each moves to the account the router ranks best and is told to
 // continue. When no account has room it waits, and once the limit lifts it is
 // told to continue where it is. Each cut-off is acted on once — recorded here
 // and in the ledger, so a restarted deck doesn't act on it again.
@@ -277,7 +285,10 @@ func (m *Model) autoMoves(now time.Time) []tea.Cmd {
 		m.moving[s.Key] = true
 		for i := range cands {
 			if cands[i].Name == to.Name {
-				cands[i].Live++ // spread a burst of cut-offs instead of piling them on one account
+				// Spread a burst of cut-offs instead of piling them on one account:
+				// each is told to carry on, so it lands busy.
+				cands[i].Live++
+				cands[i].Load++
 			}
 		}
 		why := fmt.Sprintf("⦿%s hit its %s limit", s.Account, limitName(e.LimitType))

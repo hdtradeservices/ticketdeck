@@ -72,6 +72,7 @@ type tailLine struct {
 	CustomTitle string `json:"customTitle"`
 	AITitle     string `json:"aiTitle"`
 	Message     struct {
+		ID      string `json:"id"`
 		Model   string `json:"model"`
 		Content []struct {
 			Type  string          `json:"type"`
@@ -79,12 +80,20 @@ type tailLine struct {
 			Name  string          `json:"name"`
 			Input json.RawMessage `json:"input"`
 		} `json:"content"`
-		Usage *struct {
-			InputTokens         int `json:"input_tokens"`
-			CacheCreationTokens int `json:"cache_creation_input_tokens"`
-			CacheReadTokens     int `json:"cache_read_input_tokens"`
-		} `json:"usage"`
+		Usage *usage `json:"usage"`
 	} `json:"message"`
+}
+
+// usage is one API response's token counts.
+type usage struct {
+	InputTokens         int `json:"input_tokens"`
+	CacheCreationTokens int `json:"cache_creation_input_tokens"`
+	CacheReadTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+	CacheCreation       *struct {
+		OneHour  int `json:"ephemeral_1h_input_tokens"`
+		FiveMins int `json:"ephemeral_5m_input_tokens"`
+	} `json:"cache_creation"`
 }
 
 var (
@@ -94,15 +103,21 @@ var (
 
 // apply folds one transcript line into the tail. Only assistant entries and
 // title records are parsed; everything else — tool results especially, which
-// can run to megabytes — is skipped on a byte search.
-func (t *Tail) apply(line []byte) {
+// can run to megabytes — is skipped on a byte search. An API response's line
+// also returns what the response spent. Claude Code writes a line per content
+// block, each repeating the response's usage, so the caller counts each
+// response id once.
+func (t *Tail) apply(line []byte) (spent spend, ok bool) {
 	isTitle := bytes.Contains(line, titleMarks[0]) || bytes.Contains(line, titleMarks[1])
 	if !isTitle && !bytes.Contains(line, assistantMark) {
-		return
+		return spend{}, false
 	}
 	var l tailLine
 	if json.Unmarshal(line, &l) != nil {
-		return
+		return spend{}, false
+	}
+	if l.Type == "assistant" && l.Message.Usage != nil && l.Message.ID != "" && !l.IsAPIErrorMessage {
+		spent, ok = spend{id: l.Message.ID, at: l.Timestamp, usd: costOf(l.Message.Model, *l.Message.Usage)}, true
 	}
 	if !l.Timestamp.IsZero() && l.Timestamp.After(t.UpdatedAt) {
 		t.UpdatedAt = l.Timestamp
@@ -112,18 +127,18 @@ func (t *Tail) apply(line []byte) {
 		if s := strings.TrimSpace(l.CustomTitle); s != "" {
 			t.Title, t.CustomTitle = s, true
 		}
-		return
+		return spent, ok
 	case "ai-title":
 		if s := strings.TrimSpace(l.AITitle); s != "" && !t.CustomTitle {
 			t.Title = s
 		}
-		return
+		return spent, ok
 	case "assistant":
 	default:
-		return
+		return spent, ok
 	}
 	if l.IsSidechain {
-		return
+		return spent, ok
 	}
 	if l.IsAPIErrorMessage {
 		e := &APIError{Kind: l.Error, At: l.Timestamp, UUID: l.UUID}
@@ -142,7 +157,7 @@ func (t *Tail) apply(line []byte) {
 			e.LimitType = q.RateLimitType
 		}
 		t.Err = e
-		return
+		return spent, ok
 	}
 	// A real reply: whatever error came before it has been answered.
 	t.Err = nil
@@ -159,6 +174,7 @@ func (t *Tail) apply(line []byte) {
 			t.LastTool, t.LastToolAt = summarizeTool(c.Name, c.Input), l.Timestamp
 		}
 	}
+	return spent, ok
 }
 
 // summarizeTool renders a tool call as a few words: the tool, and the one input
@@ -222,6 +238,5 @@ func TailOf(configDir, id string) Tail {
 	if path == "" {
 		return Tail{}
 	}
-	_, t := scanTranscript(path)
-	return t
+	return scanFile(path, time.Now()).tail
 }

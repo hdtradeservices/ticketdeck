@@ -2,8 +2,11 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -174,4 +177,56 @@ func ProcExited(pid int) bool {
 	}
 	err := syscall.Kill(pid, 0)
 	return err != nil && err != syscall.EPERM
+}
+
+// agentsTimeout bounds one `claude agents --json`. It answers in a fraction of
+// a second; one that hangs must not hold up the caller.
+const agentsTimeout = 10 * time.Second
+
+// Agents lists the live sessions under one account through `claude agents
+// --json`, the listing Claude Code documents for scripts. Registry reads the
+// same records straight from disk, many times cheaper — the deck polls every
+// few seconds, and each `claude agents` costs a tenth of a second of CPU — but
+// in a format nobody promised to keep. The deck checks one against the other
+// (internal/doctor) and reads an account through this when they disagree.
+func Agents(configDir string) ([]Proc, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), agentsTimeout)
+	defer cancel()
+	c := exec.CommandContext(ctx, claudeBin, "agents", "--json")
+	c.Env = append(os.Environ(), AccountEnv(configDir)...)
+	if home, err := os.UserHomeDir(); err == nil {
+		c.Dir = home
+	}
+	out, err := c.Output()
+	if err != nil {
+		return nil, fmt.Errorf("claude agents --json: %w", err)
+	}
+	infos, err := parseInfos(out)
+	if err != nil {
+		return nil, err
+	}
+	var procs []Proc
+	for _, in := range infos {
+		// A background session the daemon parked has no process of its own.
+		if in.PID <= 0 || in.SessionID == "" || !procAlive(in.PID, "") {
+			continue
+		}
+		p := Proc{
+			PID: in.PID, SessionID: in.SessionID, Cwd: in.Cwd, Name: in.Name, Kind: in.Kind,
+			Status: in.Status, WaitingFor: in.WaitingFor, ConfigDir: configDir,
+		}
+		if in.StartedAt > 0 {
+			p.StartedAt = time.UnixMilli(in.StartedAt)
+		}
+		if boot := bootTime(); !boot.IsZero() {
+			p.ProcStart = procStartTime(filepath.Join(procRoot, strconv.Itoa(in.PID)), boot)
+		}
+		if p.ProcStart.IsZero() {
+			p.ProcStart = p.StartedAt
+		}
+		env := procEnv(in.PID, "HERDR_SOCKET_PATH", "HERDR_PANE_ID")
+		p.HerdrSocket, p.HerdrPane = env["HERDR_SOCKET_PATH"], env["HERDR_PANE_ID"]
+		procs = append(procs, p)
+	}
+	return procs, nil
 }

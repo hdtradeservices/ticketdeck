@@ -10,8 +10,8 @@ import (
 // settings are the deck choices worth keeping across restarts. Every deck on
 // the machine shares them.
 type settings struct {
-	// Pin names the account new sessions open under. Empty routes each one to
-	// whichever account has the most room.
+	// Pin names the account new sessions open under. Empty lets the router pick
+	// (internal/route).
 	Pin string `json:"pin,omitempty"`
 	// AutoMove moves a session cut off by its account's usage limit to an
 	// account with room and tells it to carry on. nil means the default, on.

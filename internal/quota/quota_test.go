@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -298,5 +300,68 @@ func TestStaleMarksOldReadingsOnly(t *testing.T) {
 	}
 	if (Entry{Reason: "rate limited"}).Stale(now) {
 		t.Error("an entry with no reading at all isn't a stale reading")
+	}
+}
+
+// The deck's reading of matt on 2026-10-22 04:00 UTC: 82% used with 4.7 days
+// of its week left is 82% in 2.3 days, so the 18% left goes in about half a
+// day.
+func TestWeekRunsOutAtThisPace(t *testing.T) {
+	read := time.Date(2026, 10, 22, 4, 0, 0, 0, time.UTC)
+	matt := Entry{FetchedAt: read, Usage: &Usage{SevenDayPct: 82, SevenDayReset: read.Add(time.Duration(4.7 * 24 * float64(time.Hour)))}}
+	got, ok := matt.WeekRunsOut(read.Add(time.Minute))
+	if !ok {
+		t.Fatal("matt should run out before its reset")
+	}
+	if h := got.Sub(read).Hours(); h < 11 || h > 13 {
+		t.Errorf("matt runs out %.1fh after the reading, want ~12h", h)
+	}
+	// A week spent slowly lasts to the reset.
+	calm := Entry{FetchedAt: read, Usage: &Usage{SevenDayPct: 20, SevenDayReset: read.Add(3 * 24 * time.Hour)}}
+	if _, ok := calm.WeekRunsOut(read); ok {
+		t.Error("20% in four days lasts the week")
+	}
+	// Too early in the week to have a pace.
+	fresh := Entry{FetchedAt: read, Usage: &Usage{SevenDayPct: 30, SevenDayReset: read.Add(7*24*time.Hour - 2*time.Hour)}}
+	if _, ok := fresh.WeekRunsOut(read); ok {
+		t.Error("two hours into the week is no pace to project")
+	}
+	// Spent is out now.
+	spent := Entry{FetchedAt: read, Usage: &Usage{SevenDayPct: 100, SevenDayReset: read.Add(24 * time.Hour)}}
+	if got, ok := spent.WeekRunsOut(read); !ok || !got.Equal(read) {
+		t.Errorf("a spent week runs out at its reading, got %v %v", got, ok)
+	}
+	// A week renewed since the reading has no forecast.
+	if _, ok := matt.WeekRunsOut(read.Add(5 * 24 * time.Hour)); ok {
+		t.Error("the week renewed since the reading")
+	}
+}
+
+// The endpoint is undocumented. An answer without the two windows is a change
+// to it, and must read as one rather than as two empty windows.
+func TestFetchNoticesAChangedAnswer(t *testing.T) {
+	tempHome(t)
+	cfg := t.TempDir()
+	creds := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"tok","refreshToken":"r","expiresAt":%d}}`, time.Now().Add(time.Hour).UnixMilli())
+	if err := os.WriteFile(filepath.Join(cfg, ".credentials.json"), []byte(creds), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"five_hour":{"utilization":12,"resets_at":"2026-10-22T20:00:00+00:00"},"seven_day":{"utilization":40,"resets_at":"2026-10-25T17:00:00+00:00"}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }))
+	defer srv.Close()
+	old := usageURL
+	usageURL = srv.URL
+	t.Cleanup(func() { usageURL = old })
+
+	u, err := Fetch(context.Background(), cfg)
+	if err != nil || u.FiveHourPct != 12 || u.SevenDayPct != 40 {
+		t.Fatalf("Fetch = %+v, %v", u, err)
+	}
+	body = `{"limits":[{"window":"5h","used":12}]}`
+	if _, err := Fetch(context.Background(), cfg); !errors.Is(err, ErrFormat) {
+		t.Errorf("a changed answer = %v, want ErrFormat", err)
+	}
+	if got := reasonFor(ErrFormat); got != ReasonFormat {
+		t.Errorf("reason = %q", got)
 	}
 }

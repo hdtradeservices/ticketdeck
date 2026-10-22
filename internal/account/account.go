@@ -72,7 +72,7 @@ func (a Account) LaunchCmd() string {
 // and ~/.claude-* that holds credentials, plus any ~/.claude-accounts names (on
 // macOS the credentials live in the keychain, not in the directory). Current is
 // always present even if its credentials are unreadable, so a deck can always
-// name itself.
+// name itself. A dir holding a .ticketdeck-hide file is left out.
 func All() []Account {
 	cur := Current()
 	byDir := map[string]Account{cur.ConfigDir: cur}
@@ -83,7 +83,7 @@ func All() []Account {
 		}
 		matches, _ := filepath.Glob(filepath.Join(home, ".claude*"))
 		for _, dir := range matches {
-			if _, seen := byDir[dir]; seen || !isAccountDir(home, dir) || (!hasCreds(dir) && !listed[dir]) {
+			if _, seen := byDir[dir]; seen || !isAccountDir(home, dir) || (!hasCreds(dir) && !listed[dir]) || hidden(dir) {
 				continue
 			}
 			if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
@@ -270,6 +270,16 @@ func Find(accts []Account, nameOrDir string) (Account, bool) {
 func hasCreds(configDir string) bool {
 	fi, err := os.Stat(filepath.Join(configDir, ".credentials.json"))
 	return err == nil && !fi.IsDir()
+}
+
+// hideFile marks a config dir that is not the deck's to use: a seat a
+// background worker spends (the suggest-worker's, on the workbench), where a
+// session the router sent would eat the worker's rate limit.
+const hideFile = ".ticketdeck-hide"
+
+func hidden(configDir string) bool {
+	_, err := os.Stat(filepath.Join(configDir, hideFile))
+	return err == nil
 }
 
 // HandOff moves a ticket's session to another subscription by copying its

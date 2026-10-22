@@ -378,3 +378,44 @@ func TestWithoutHerdrSessionsAreHome(t *testing.T) {
 		t.Errorf("ZEN-6 = %+v, want a working session of the deck's own", s)
 	}
 }
+
+// Load counts every session an account's registry lists, as claude-pick does —
+// including ones outside the deck and Claude's own background sessions — plus
+// the launches either tool made in the last minute.
+func TestLoadCountsEverySessionAndRecentLaunches(t *testing.T) {
+	a := setup(t, "matt", "support")
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	world{procs: map[string][]session.Proc{
+		a.dir("support"): {
+			{PID: 1, SessionID: "x", Status: "busy", Kind: "interactive"},
+			{PID: 2, SessionID: "y", Status: "waiting", Kind: "interactive"},
+			{PID: 3, SessionID: "z", Status: "idle", Kind: "background"},
+		},
+	}}.install(t)
+	MarkLaunch(a.dir("matt"))
+	MarkLaunch(a.dir("matt"))
+	// An expired marker no longer counts, and is cleared away.
+	old := filepath.Join(pendingDir(), filepath.Base(a.dir("matt"))+".1.2.3")
+	if err := os.WriteFile(old, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-2 * pendingFor)
+	if err := os.Chtimes(old, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	snap := Poll(input(a))
+	if got := snap.Load["support"]; got < 1.59 || got > 1.61 {
+		t.Errorf("support load = %.2f, want 1.6 (busy 1 + waiting 0.5 + idle 0.1)", got)
+	}
+	if got := snap.Load["matt"]; got != 2 {
+		t.Errorf("matt load = %.2f, want 2 from two fresh launches", got)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Errorf("the expired marker is still there: %v", err)
+	}
+	// ~/.claude and ~/.claude-m0 must not share markers: the glob is on the
+	// whole basename and a dot.
+	if n := pendingLaunches(filepath.Join(a.home, ".claude-support"), time.Now()); n != 0 {
+		t.Errorf("support counted %d of matt's launches", n)
+	}
+}

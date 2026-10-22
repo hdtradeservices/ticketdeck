@@ -46,6 +46,10 @@ type Input struct {
 	Peers    bool   // also ask the other herdr servers on the machine
 	Cwd      string // the launch root, where transcripts are looked for first
 	Now      time.Time
+	// ViaAgents marks the accounts, by config dir, to read through `claude
+	// agents --json` because their registry stopped matching it (see
+	// internal/doctor).
+	ViaAgents map[string]bool
 }
 
 // Session is one Claude session as the deck sees it.
@@ -90,6 +94,10 @@ type Snapshot struct {
 	OwnErr error
 	Peers  []herd.Workspace
 	At     time.Time
+	// Load is each account's live load as claude-pick counts it, from every
+	// session its registry lists — the deck's or not, interactive or
+	// background — plus launches too recent to be listed yet.
+	Load map[string]float64
 }
 
 // The outside world, in vars so tests can drive a poll without herdr, without
@@ -99,6 +107,7 @@ var (
 	peers      = herd.Peers
 	ownSocket  = herd.OwnSocket
 	registry   = session.Registry
+	agentsOf   = session.Agents
 	activityOf = session.ActivityOf
 	activityAt = session.ActivityAt
 )
@@ -110,13 +119,21 @@ func Poll(in Input) Snapshot {
 	if in.Now.IsZero() {
 		in.Now = time.Now()
 	}
-	snap := Snapshot{At: in.Now}
+	snap := Snapshot{At: in.Now, Load: map[string]float64{}}
 
 	// Registries first: they are what ties a pane to an account.
 	type paneKey struct{ socket, pane string }
 	var procs []session.Proc
 	for _, a := range in.Accounts {
-		for _, p := range registry(a.ConfigDir) {
+		load := float64(pendingLaunches(a.ConfigDir, in.Now))
+		regs := registry(a.ConfigDir)
+		if in.ViaAgents[a.ConfigDir] {
+			if ps, err := agentsOf(a.ConfigDir); err == nil {
+				regs = ps
+			}
+		}
+		for _, p := range regs {
+			load += loadOf(p.Status)
 			// Under herdr the deck's sessions are interactive panes; Claude's own
 			// background sessions run outside any of them. Without herdr those
 			// are as much the deck's to show as any other.
@@ -125,6 +142,7 @@ func Poll(in Input) Snapshot {
 			}
 			procs = append(procs, p)
 		}
+		snap.Load[a.Name] = load
 	}
 	own := filepath.Clean(ownSocket())
 	byPane := map[paneKey]session.Proc{}

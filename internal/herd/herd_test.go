@@ -331,3 +331,17 @@ func TestScratchSpecPicksLowestFreeName(t *testing.T) {
 		})
 	}
 }
+
+func TestAtLeast(t *testing.T) {
+	for _, c := range []struct {
+		v    string
+		want bool
+	}{
+		{"0.9.1", false}, {"0.9.2", true}, {"0.9.5", true}, {"0.10.0", true}, {"1.0.0", true},
+		{"0.8.9", false}, {"v0.9.3", true}, {"0.9.2-preview", true}, {"garbage", false}, {"", false},
+	} {
+		if got := AtLeast(c.v, 0, 9, 2); got != c.want {
+			t.Errorf("AtLeast(%q, 0.9.2) = %v, want %v", c.v, got, c.want)
+		}
+	}
+}

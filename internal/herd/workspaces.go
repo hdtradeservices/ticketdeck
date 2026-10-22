@@ -3,8 +3,10 @@ package herd
 import (
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -125,5 +127,48 @@ func alive(socket string) bool {
 		return false
 	}
 	_ = c.Close()
+	return true
+}
+
+// ServerVersion is the version of the herdr server this process talks to, as
+// `herdr status server` reports it — which, after an upgrade nobody restarted
+// for, is not the installed binary's. Falls back to the binary's own version
+// when no server answers.
+func ServerVersion() (string, error) {
+	if out, err := exec.Command(herdrBin, "status", "server").Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(line), "version:"); ok {
+				return strings.TrimSpace(v), nil
+			}
+		}
+	}
+	out, err := exec.Command(herdrBin, "--version").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(strings.TrimSpace(string(out)), "herdr "), nil
+}
+
+// AtLeast reports whether a version as herdr prints it ("0.9.1") is at least
+// the one given. Anything unparseable counts as older.
+func AtLeast(v string, major, minor, patch int) bool {
+	var got [3]int
+	parts := strings.SplitN(strings.TrimPrefix(v, "v"), ".", 3)
+	if len(parts) != 3 {
+		return false
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(strings.TrimRightFunc(p, func(r rune) bool { return r < '0' || r > '9' }))
+		if err != nil {
+			return false
+		}
+		got[i] = n
+	}
+	want := [3]int{major, minor, patch}
+	for i := range got {
+		if got[i] != want[i] {
+			return got[i] > want[i]
+		}
+	}
 	return true
 }

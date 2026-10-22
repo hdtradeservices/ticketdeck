@@ -50,26 +50,23 @@ func runSessions(w io.Writer) error {
 		Accounts: accts, Home: home, Keys: keys, Ledger: led,
 		Herdr: herd.Available(), Peers: true, Now: now,
 	})
-	until, authFailed := snap.Limits(now)
-	live := snap.LiveOn()
-
-	cands := make([]route.Candidate, 0, len(accts))
-	for _, a := range accts {
-		e := readings[a.Name]
-		cands = append(cands, route.Candidate{
-			Name: a.Name, Usage: e.Current(now), Stale: e.Stale(now), Reason: e.Reason,
-			LimitedUntil: until[a.Name], AuthFailed: authFailed[a.Name], Live: live[a.Name],
-			Home: a.ConfigDir == home.ConfigDir,
-		})
-	}
+	cands := snap.Candidates(accts, readings, home, now)
 	next := route.Pick(cands, route.Request{Pin: tui.Pin(), Now: now})
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ACCOUNT\t5H\t7D\tSESSIONS\tSTATE")
+	fmt.Fprintln(tw, "ACCOUNT\t5H\t7D\tAT THIS PACE\tSESSIONS\tSTATE")
 	for _, r := range route.Rank(cands, now) {
-		five, seven := "—", "—"
+		five, seven, pace := "—", "—", "—"
 		if r.Usage != nil {
 			five, seven = fmt.Sprintf("%.0f%%", r.Usage.FiveHourPct), fmt.Sprintf("%.0f%%", r.Usage.SevenDayPct)
+			switch t, ok := readings[r.Name].WeekRunsOut(now); {
+			case r.Usage.SevenDayPct >= 100:
+				pace = "spent"
+			case ok:
+				pace = "out " + route.Clock(t, now)
+			default:
+				pace = "lasts the week"
+			}
 		}
 		state := r.Note
 		if r.Verdict == route.Usable {
@@ -78,7 +75,7 @@ func runSessions(w io.Writer) error {
 		if r.Name == next.Account {
 			state += "  ← next new session"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n", r.Name, five, seven, r.Live, state)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n", r.Name, five, seven, pace, r.Live, state)
 	}
 	if err := tw.Flush(); err != nil {
 		return err

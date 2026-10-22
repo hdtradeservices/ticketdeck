@@ -178,7 +178,8 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   `claude-pick`, which refreshes an expired login by spending a small model turn. An account
   that is out — its limit refused a session, a window is spent, or nobody is signed in — is
   skipped, and so is one whose config dir holds a `.ticketdeck-hide` file (a background
-  worker's seat). `A` shows the ranking and why the next account is next, and pins new
+  worker's seat). A first line of `until 2026-10-26` hides it only until that date, for
+  an account you set up before it's yours to use. `A` shows the ranking and why the next account is next, and pins new
   sessions to one account if you'd rather choose.
 - **It keeps going when an account runs out.** When a session's account hits its usage
   limit, the deck moves the session to the best-placed account and tells it to carry on — on

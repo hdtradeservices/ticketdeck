@@ -162,6 +162,32 @@ func TestAllSkipsHiddenAccounts(t *testing.T) {
 	}
 }
 
+// A lent account is set up ahead of time and hidden until the day it's lent
+// from; a marker the deck can't read a date from hides for good.
+func TestHideUntilADate(t *testing.T) {
+	home := fakeHome(t, Default, "k0", "k1")
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("TICKETDECK_ACCOUNT", "")
+	writeFile(t, filepath.Join(home, ".claude-k0", hideFile), "until 2026-10-26\n# Ken's, from Monday\n")
+	writeFile(t, filepath.Join(home, ".claude-k1", hideFile), "whenever\n")
+	t.Cleanup(func() { now = time.Now })
+	names := func() string {
+		var out []string
+		for _, a := range All() {
+			out = append(out, a.Name)
+		}
+		return strings.Join(out, ",")
+	}
+	now = func() time.Time { return time.Date(2026, 10, 25, 23, 0, 0, 0, time.Local) }
+	if got := names(); got != "default" {
+		t.Errorf("before Monday: %s, want default only", got)
+	}
+	now = func() time.Time { return time.Date(2026, 10, 26, 0, 1, 0, 0, time.Local) }
+	if got := names(); got != "default,k0" {
+		t.Errorf("on Monday: %s, want default,k0 (k1's marker has no date)", got)
+	}
+}
+
 func TestColorsAreDistinctPerAccount(t *testing.T) {
 	accts := []Account{{Name: "matt"}, {Name: "support"}, {Name: "third"}}
 	c := Colors(accts)

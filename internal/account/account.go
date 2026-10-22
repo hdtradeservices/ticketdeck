@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/hdtradeservices/ticketdeck/internal/session"
 )
@@ -274,12 +275,41 @@ func hasCreds(configDir string) bool {
 
 // hideFile marks a config dir that is not the deck's to use: a seat a
 // background worker spends (the suggest-worker's, on the workbench), where a
-// session the router sent would eat the worker's rate limit.
+// session the router sent would eat the worker's rate limit. A first line of
+// "until 2026-10-26" (or an RFC 3339 time) hides it only until then — an
+// account lent from a later date.
 const hideFile = ".ticketdeck-hide"
 
+// now is time.Now; tests set it.
+var now = time.Now
+
 func hidden(configDir string) bool {
-	_, err := os.Stat(filepath.Join(configDir, hideFile))
-	return err == nil
+	b, err := os.ReadFile(filepath.Join(configDir, hideFile))
+	if err != nil {
+		return false
+	}
+	until, ok := hiddenUntil(string(b))
+	return !ok || now().Before(until)
+}
+
+// hiddenUntil reads the date a hide marker lifts, ok false when it names none
+// and so hides for good.
+func hiddenUntil(s string) (time.Time, bool) {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		v := strings.TrimSpace(strings.TrimPrefix(line, "until"))
+		if t, err := time.ParseInLocation("2006-01-02", v, time.Local); err == nil {
+			return t, true
+		}
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			return t, true
+		}
+		return time.Time{}, false
+	}
+	return time.Time{}, false
 }
 
 // HandOff moves a ticket's session to another subscription by copying its

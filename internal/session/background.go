@@ -50,6 +50,9 @@ type InFlight struct {
 	Tasks  int // shell commands and monitors
 }
 
+// Any reports whether anything at all is still running.
+func (f InFlight) Any() bool { return f.Agents > 0 || f.Tasks > 0 }
+
 type transcriptLine struct {
 	Type      string          `json:"type"`
 	Operation string          `json:"operation"`
@@ -80,6 +83,8 @@ type launchResult struct {
 type bgScan struct {
 	offset int64
 	open   map[string]openTask // task id → launched, not yet finished
+	tail   Tail
+	used   time.Time // last read, for pruning scans of sessions nobody polls any more
 }
 
 var (
@@ -87,22 +92,39 @@ var (
 	bgScans = map[string]*bgScan{}
 )
 
+// scanIdleFor is how long a transcript's parse state is kept without a read.
+// The deck polls every few seconds, so anything this old belongs to a session
+// that has dropped off the deck.
+const scanIdleFor = 30 * time.Minute
+
 // BackgroundWork reports what the session with this id has running in the
-// background. cwd is the launch root the transcript is filed under. procStart
-// is when the session's current process started, or zero when unknown.
+// background, reading the deck's own account. See BackgroundWorkIn.
+func BackgroundWork(id, cwd string, procStart time.Time) InFlight {
+	return BackgroundWorkIn(ConfigDir(), id, cwd, procStart)
+}
+
+// BackgroundWorkIn reports what the session with this id, under the account at
+// configDir, has running in the background. cwd is the launch root the
+// transcript is filed under. procStart is when the session's current process
+// started, or zero when unknown.
 //
 // Background tasks die with the process that started them, so a task launched
 // before procStart is gone even though no notice says so. A shell task only
 // counts when procStart is known: unlike a subagent it has no transcript of its
 // own to show it is still alive.
-func BackgroundWork(id, cwd string, procStart time.Time) InFlight {
-	path := findTranscript(id, cwd)
+func BackgroundWorkIn(configDir, id, cwd string, procStart time.Time) InFlight {
+	path := findTranscriptIn(configDir, id, cwd)
 	if path == "" {
 		return InFlight{}
 	}
+	open, _ := scanTranscript(path)
+	return inFlight(path, open, procStart)
+}
+
+func inFlight(path string, open map[string]openTask, procStart time.Time) InFlight {
 	dir := filepath.Join(strings.TrimSuffix(path, ".jsonl"), "subagents")
 	var bg InFlight
-	for tid, t := range scanBackground(path) {
+	for tid, t := range open {
 		if !procStart.IsZero() && t.started.Before(procStart) {
 			continue
 		}
@@ -119,6 +141,35 @@ func BackgroundWork(id, cwd string, procStart time.Time) InFlight {
 		}
 	}
 	return bg
+}
+
+// Activity is everything the transcript says about a session that its live
+// status can't: what it has running in the background, and how its last turn
+// ended.
+type Activity struct {
+	InFlight InFlight
+	Tail     Tail
+	Path     string    // the transcript read, "" when there is none
+	Modified time.Time // its mtime: when the session last wrote
+}
+
+// ActivityOf reads a session's transcript under one account. procStart bounds
+// which background tasks can still be alive (see BackgroundWorkIn).
+func ActivityOf(configDir, id, cwd string, procStart time.Time) Activity {
+	return ActivityAt(findTranscriptIn(configDir, id, cwd), procStart)
+}
+
+// ActivityAt is ActivityOf for a transcript already found.
+func ActivityAt(path string, procStart time.Time) Activity {
+	if path == "" {
+		return Activity{}
+	}
+	open, tail := scanTranscript(path)
+	a := Activity{InFlight: inFlight(path, open, procStart), Tail: tail, Path: path}
+	if fi, err := os.Stat(path); err == nil {
+		a.Modified = fi.ModTime()
+	}
+	return a
 }
 
 // procStarts is overridable in tests.
@@ -154,7 +205,7 @@ func sessionProcStarts() map[string]time.Time {
 	if boot.IsZero() {
 		return out
 	}
-	pids, _ := filepath.Glob("/proc/[0-9]*")
+	pids, _ := filepath.Glob(filepath.Join(procRoot, "[0-9]*"))
 	for _, p := range pids {
 		b, err := os.ReadFile(filepath.Join(p, "cmdline"))
 		if err != nil || !bytes.Contains(b, []byte("claude")) {
@@ -185,7 +236,7 @@ func sessionProcStarts() map[string]time.Time {
 const clockTicks = 100
 
 func bootTime() time.Time {
-	b, err := os.ReadFile("/proc/stat")
+	b, err := os.ReadFile(filepath.Join(procRoot, "stat"))
 	if err != nil {
 		return time.Time{}
 	}
@@ -199,39 +250,49 @@ func bootTime() time.Time {
 	return time.Time{}
 }
 
-// procStartTime reads field 22 (starttime) of /proc/<pid>/stat. Fields are
-// counted after the ")" that closes the command name, which may hold spaces.
+// procStartTime reads field 22 (starttime) of /proc/<pid>/stat.
 func procStartTime(procDir string, boot time.Time) time.Time {
 	b, err := os.ReadFile(filepath.Join(procDir, "stat"))
 	if err != nil {
 		return time.Time{}
 	}
-	i := bytes.LastIndexByte(b, ')')
-	if i < 0 {
-		return time.Time{}
-	}
-	f := strings.Fields(string(b[i+1:]))
-	if len(f) < 20 {
-		return time.Time{}
-	}
-	ticks, err := strconv.ParseInt(f[19], 10, 64)
+	ticks, err := strconv.ParseInt(statField(b, 22), 10, 64)
 	if err != nil {
 		return time.Time{}
 	}
 	return boot.Add(time.Duration(ticks) * time.Second / clockTicks)
 }
 
-// findTranscript locates a session's transcript: under cwd's project first, then
-// any project, since a session keeps the slug of wherever it was started.
-func findTranscript(id, cwd string) string {
-	if p := TranscriptPath(id, cwd); fileExists(p) {
-		return p
+// findTranscriptIn locates a session's transcript under one account: under
+// cwd's project first, then any project, since a session keeps the slug of
+// wherever it was started.
+func findTranscriptIn(configDir, id, cwd string) string {
+	if cwd != "" {
+		if p := TranscriptPathIn(configDir, id, cwd); fileExists(p) {
+			return p
+		}
 	}
-	m, _ := filepath.Glob(filepath.Join(ConfigDir(), "projects", "*", id+".jsonl"))
-	if len(m) > 0 {
-		return m[0]
+	return FindTranscript(configDir, id)
+}
+
+// FindTranscript returns the newest transcript for a session id anywhere under
+// an account's projects/ tree, or "" when that account has none.
+func FindTranscript(configDir, id string) string {
+	if configDir == "" || id == "" {
+		return ""
 	}
-	return ""
+	matches, _ := filepath.Glob(filepath.Join(configDir, "projects", "*", id+".jsonl"))
+	best, bestMod := "", time.Time{}
+	for _, p := range matches {
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if best == "" || fi.ModTime().After(bestMod) {
+			best, bestMod = p, fi.ModTime()
+		}
+	}
+	return best
 }
 
 func fileExists(p string) bool {
@@ -239,22 +300,30 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-// scanBackground returns the tasks launched in path and not yet finished. The
-// returned map is a copy.
-func scanBackground(path string) map[string]openTask {
+// scanTranscript returns the tasks launched in path and not yet finished, and
+// the transcript's tail. The returned map is a copy.
+func scanTranscript(path string) (map[string]openTask, Tail) {
 	bgMu.Lock()
 	defer bgMu.Unlock()
+
+	now := time.Now()
+	for p, s := range bgScans {
+		if now.Sub(s.used) > scanIdleFor {
+			delete(bgScans, p)
+		}
+	}
 
 	s := bgScans[path]
 	fi, err := os.Stat(path)
 	if err != nil {
 		delete(bgScans, path)
-		return nil
+		return nil, Tail{}
 	}
 	if s == nil || fi.Size() < s.offset {
 		s = &bgScan{open: map[string]openTask{}}
 		bgScans[path] = s
 	}
+	s.used = now
 	if fi.Size() > s.offset {
 		s.advance(path)
 	}
@@ -263,7 +332,13 @@ func scanBackground(path string) map[string]openTask {
 	for k, v := range s.open {
 		out[k] = v
 	}
-	return out
+	return out, s.tail
+}
+
+// scanBackground is scanTranscript without the tail.
+func scanBackground(path string) map[string]openTask {
+	open, _ := scanTranscript(path)
+	return open
 }
 
 // advance reads complete lines from s.offset onward. A trailing line still
@@ -289,6 +364,7 @@ func (s *bgScan) advance(path string) {
 }
 
 func (s *bgScan) apply(line []byte) {
+	s.tail.apply(line)
 	// Cheap prefilter: most lines are neither a launch nor a notification, and
 	// some are megabytes of tool output.
 	if !bytes.Contains(line, []byte("<task-id>")) && !bytes.Contains(line, []byte(`"toolUseResult"`)) {

@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -65,6 +66,20 @@ var ErrRateLimited = errors.New("usage endpoint: rate limited")
 // token and could log the account out.
 var ErrTokenExpired = errors.New("token expired")
 
+// ErrSignedOut reports an account with no way to authenticate at all: no
+// access token, and no refresh token to get one with. Unlike an expired token,
+// launching a session under it doesn't fix it — the session stops at its first
+// message asking for /login — so nothing should be sent there.
+var ErrSignedOut = errors.New("not signed in")
+
+// ErrKeychain reports an account whose credentials Claude Code keeps in the
+// macOS keychain rather than in .credentials.json. The deck can't read its
+// usage, but nothing says it is signed out.
+var ErrKeychain = errors.New("credentials in the keychain")
+
+// goos is runtime.GOOS; tests set it.
+var goos = runtime.GOOS
+
 // ErrUnauthorized is the endpoint refusing the token the file said was still
 // good — revoked, or rotated by a re-login elsewhere. Same fix for the reader as
 // ErrTokenExpired, so it reads the same on the row, but a different wait: this
@@ -103,6 +118,33 @@ type Entry struct {
 func (e Entry) Stale(now time.Time) bool {
 	return e.Usage != nil && now.Sub(e.FetchedAt) > 2*Every
 }
+
+// Current is the reading as it stands now. A window that has reset since the
+// reading was taken has started over, so it reads zero. A reading from before
+// the weekly window rolled over says nothing about this week, and is nil: an
+// account nobody has used for days keeps its last good reading in the cache,
+// and that number is history, not headroom.
+func (e Entry) Current(now time.Time) *Usage {
+	u := e.Usage
+	if u == nil {
+		return nil
+	}
+	if !u.SevenDayReset.IsZero() && !now.Before(u.SevenDayReset) {
+		return nil
+	}
+	if u.SevenDayReset.IsZero() && now.Sub(e.FetchedAt) > 7*24*time.Hour {
+		return nil
+	}
+	c := *u
+	if !u.FiveHourReset.IsZero() && !now.Before(u.FiveHourReset) {
+		c.FiveHourPct, c.FiveHourReset = 0, time.Time{}
+	}
+	return &c
+}
+
+// SignedOut reports an account that can't run a session until someone logs it
+// in again.
+func (e Entry) SignedOut() bool { return e.Reason == "not signed in" }
 
 // Poll returns every account's latest entry, refreshing the ones that are due.
 // Due accounts are fetched only by the one deck that holds the poll lock; any
@@ -195,7 +237,9 @@ func reasonFor(err error) string {
 		return "rate limited"
 	case errors.Is(err, ErrTokenExpired), errors.Is(err, ErrUnauthorized):
 		return "token expired"
-	case errors.Is(err, os.ErrNotExist):
+	case errors.Is(err, ErrKeychain):
+		return "usage unreadable (keychain)"
+	case errors.Is(err, os.ErrNotExist), errors.Is(err, ErrSignedOut):
 		return "not signed in"
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return "no response"
@@ -389,23 +433,32 @@ func oauthToken(configDir string) (string, error) {
 		return t, nil
 	}
 	b, err := os.ReadFile(filepath.Join(configDir, ".credentials.json"))
+	if errors.Is(err, os.ErrNotExist) && goos == "darwin" {
+		return "", ErrKeychain
+	}
 	if err != nil {
 		return "", err
 	}
 	var creds struct {
-		ClaudeAiOauth struct {
-			AccessToken string `json:"accessToken"`
-			ExpiresAt   int64  `json:"expiresAt"` // epoch milliseconds
+		ClaudeAiOauth *struct {
+			AccessToken  string `json:"accessToken"`
+			RefreshToken string `json:"refreshToken"`
+			ExpiresAt    int64  `json:"expiresAt"` // epoch milliseconds
 		} `json:"claudeAiOauth"`
 	}
 	if err := json.Unmarshal(b, &creds); err != nil {
 		return "", err
 	}
-	if creds.ClaudeAiOauth.AccessToken == "" {
+	o := creds.ClaudeAiOauth
+	if o == nil {
 		return "", fmt.Errorf("no OAuth token (API-key setup?)")
 	}
-	if exp := creds.ClaudeAiOauth.ExpiresAt; exp > 0 && time.Now().After(time.UnixMilli(exp)) {
+	expired := o.ExpiresAt > 0 && time.Now().After(time.UnixMilli(o.ExpiresAt))
+	switch {
+	case o.RefreshToken == "" && (o.AccessToken == "" || expired):
+		return "", ErrSignedOut
+	case o.AccessToken == "" || expired:
 		return "", ErrTokenExpired
 	}
-	return creds.ClaudeAiOauth.AccessToken, nil
+	return o.AccessToken, nil
 }

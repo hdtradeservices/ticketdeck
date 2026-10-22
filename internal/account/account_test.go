@@ -45,6 +45,21 @@ func mkAccountDir(t *testing.T, home, base string) string {
 	return dir
 }
 
+// ~/.claude-accounts names ~/.claude, and only ~/.claude: a config dir kept
+// somewhere else is named after itself, not mistaken for the primary.
+func TestAccountsFileNamesThePrimaryOnly(t *testing.T) {
+	home := fakeHome(t, Default, "m0")
+	if err := os.WriteFile(filepath.Join(home, ".claude-accounts"), []byte("# primary first\nmatt\nm0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := nameFor(filepath.Join(home, ".claude")); got != "matt" {
+		t.Errorf("~/.claude = %q, want matt", got)
+	}
+	if got := nameFor(filepath.Join(home, ".config", "claude-personal")); got != "personal" {
+		t.Errorf("a dir outside the family = %q, want personal", got)
+	}
+}
+
 func TestCurrentNamesTheDefaultAccount(t *testing.T) {
 	fakeHome(t, Default)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")

@@ -252,19 +252,7 @@ func (m Model) launchProject(p linear.Project) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) launchProjectNow(p linear.Project) (tea.Model, tea.Cmd) {
-	spec, err := m.backend.Plan(toProjectTicket(p), m.root)
-	if err != nil {
-		debugLog.Printf("plan error for project %s: %v", p.Key(), err)
-		m.err = err
-		return m, nil
-	}
-	if !m.dry && !spec.Foreground && !m.hideOpenHint {
-		s := spec
-		m.openHintSpec = &s
-		m.openHintLabel = truncCols(p.Name, 40)
-		return m, nil
-	}
-	return m.runSpec(spec, p.Key())
+	return m.openUnit(toProjectTicket(p), truncCols(p.Name, 40))
 }
 
 // openProjectPRs opens the PRs linked to a project's tickets — the whole

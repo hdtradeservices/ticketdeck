@@ -5,7 +5,10 @@ import (
 	"time"
 
 	"github.com/hdtradeservices/ticketdeck/internal/account"
+	"github.com/hdtradeservices/ticketdeck/internal/fleet"
+	"github.com/hdtradeservices/ticketdeck/internal/ledger"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
+	"github.com/hdtradeservices/ticketdeck/internal/quota"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
 )
 
@@ -30,6 +33,8 @@ func (demoFetcher) FetchAssignedOpen(context.Context) ([]linear.Issue, error) {
 		{Identifier: "DEMO-106", Title: "Sync seller policies and expose per-store valid values", Priority: 3, PrioLabel: "Medium", StateName: "Planned", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T15:39:03Z", ProjectID: "demo-p1", ProjectName: "Channel onboarding v2", ProjectSlugID: "demo0001"},
 		{Identifier: "DEMO-107", Title: "Support inline shipping / return policies", Priority: 3, PrioLabel: "Medium", StateName: "Todo", StateType: "unstarted", TeamKey: "DEMO", UpdatedAt: "2026-07-16T16:22:49Z", ProjectID: "demo-p1", ProjectName: "Channel onboarding v2", ProjectSlugID: "demo0001"},
 		{Identifier: "DEMO-108", Title: "Durable observability for stale-write blocks", Priority: 4, PrioLabel: "Low", StateName: "Merged", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T16:14:49Z", ProjectID: "demo-p2", ProjectName: "Platform reliability", ProjectSlugID: "demo0002", PRs: []linear.PR{{URL: "https://github.com/acme/widgets/pull/188", Title: "feat: stale-write log-based metric", State: "merged"}}},
+		{Identifier: "DEMO-110", Title: "Retry budget for the label printer client", Priority: 3, PrioLabel: "Medium", StateName: "In Progress", StateType: "started", TeamKey: "DEMO", UpdatedAt: "2026-07-16T15:10:00Z"},
+		{Identifier: "DEMO-111", Title: "Refresh the quarterly tax tables", Priority: 3, PrioLabel: "Medium", StateName: "Todo", StateType: "unstarted", TeamKey: "DEMO", UpdatedAt: "2026-07-16T14:10:00Z"},
 		// A Duplicate-typed ticket — must be filtered out of the view (BR-2a).
 		{Identifier: "DEMO-109", Title: "dup of DEMO-101 (should not appear)", Priority: 2, PrioLabel: "High", StateName: "Duplicate", StateType: "duplicate", TeamKey: "DEMO", UpdatedAt: "2026-07-16T10:00:00Z"},
 	}, nil
@@ -79,39 +84,80 @@ func (demoFetcher) FetchMyProjects(context.Context) ([]linear.Project, error) {
 	}, nil
 }
 
-// DemoSessions fabricates session statuses so --demo shows the badges without a
-// live Claude daemon matching these ticket keys.
-func (demoFetcher) DemoSessions() map[string]session.Status {
-	return map[string]session.Status{
-		"DEMO-101":      session.Working,
-		"DEMO-102":      session.NeedsInput,
-		"DEMO-106":      session.Completed,
-		"DEMO-104":      session.Stopped,
-		"DEMO-105":      session.Background,
-		"proj-demo0001": session.Working,
-		"proj-demo0003": session.Stopped,
-		// DEMO-103 is deliberately absent: its session runs on another deck, which
-		// this deck's own backend can't see. DemoOwners is what badges it.
+// DemoAccounts fabricates four subscriptions, so --demo shows the accounts line,
+// the account column and the router on a machine that has one.
+func (demoFetcher) DemoAccounts() []account.Account {
+	return []account.Account{
+		{Name: "matt", ConfigDir: "/demo/.claude"},
+		{Name: "m0", ConfigDir: "/demo/.claude-m0"},
+		{Name: "m1", ConfigDir: "/demo/.claude-m1"},
+		{Name: "support", ConfigDir: "/demo/.claude-support"},
 	}
 }
 
-// DemoOwners fabricates which subscription runs each session, so --demo shows
-// the account column on a machine that only has one Claude subscription.
-func (demoFetcher) DemoOwners() map[string]account.Owner {
-	return map[string]account.Owner{
-		"DEMO-101": {Name: "default", Status: session.Working, Live: true},
-		"DEMO-102": {Name: "support", Status: session.NeedsInput, Live: true},
-		// Only the other deck has this one, so its row is the cross-deck case: the
-		// badge is that deck's live status, colored like the deck rather than the
-		// status, and pressing ⏎ on it hits the one-deck-per-ticket gate.
-		"DEMO-103": {Name: "support", Status: session.Working, Live: true, LastActive: time.Now().Add(-11 * time.Minute)},
-		"DEMO-104": {Name: "default", Status: session.Stopped},
-		"DEMO-106": {Name: "support", Status: session.Completed},
-		// A project session held by the other deck: the row is what tells you a
-		// project is already being worked, and by whom, without switching decks.
-		"proj-demo0001": {Name: "default", Status: session.Working, Live: true},
-		"proj-demo0003": {Name: "support", Status: session.Stopped, LastActive: time.Now().Add(-3 * time.Hour)},
+// DemoQuotas fabricates usage across the range the router cares about: room
+// to spare, nearly spent, out until a reset, and unreadable.
+func (demoFetcher) DemoQuotas() map[string]quota.Entry {
+	now := time.Now()
+	use := func(fh, sd float64) *quota.Usage {
+		return &quota.Usage{FiveHourPct: fh, FiveHourReset: now.Add(2 * time.Hour), SevenDayPct: sd, SevenDayReset: now.Add(4 * 24 * time.Hour)}
 	}
+	return map[string]quota.Entry{
+		"matt":    {Usage: use(52, 42), FetchedAt: now},
+		"m0":      {Usage: use(93, 61), FetchedAt: now},
+		"m1":      {Reason: "token expired"},
+		"support": {Usage: use(12, 8), FetchedAt: now},
+	}
+}
+
+// DemoFleet fabricates sessions in every state the deck shows: working on
+// several accounts, waiting on a permission, finished and unread, cut off by
+// a usage limit, running in an old per-account deck's workspace, and ad-hoc
+// sessions both live and resumable.
+func (demoFetcher) DemoFleet(now time.Time) fleet.Snapshot {
+	dir := func(a string) string {
+		if a == "matt" {
+			return "/demo/.claude"
+		}
+		return "/demo/.claude-" + a
+	}
+	s := func(key, acct string, st session.Status) fleet.Session {
+		kind := ledger.Ticket
+		if len(key) > 5 && key[:5] == "proj-" {
+			kind = ledger.Project
+		}
+		return fleet.Session{Key: key, ID: session.DeterministicID(key), Kind: kind, Account: acct, ConfigDir: dir(acct), Status: st, Live: true, Home: true, PaneID: "w1:p1", LastActive: now.Add(-2 * time.Minute)}
+	}
+	working := s("DEMO-101", "m0", session.Working)
+	working.Activity.InFlight.Agents = 2
+	working.Activity.Tail = session.Tail{LastTool: "Agent: review the checkout fix", ContextTokens: 142000, Model: "claude-opus-5-5"}
+	asking := s("DEMO-102", "support", session.NeedsInput)
+	asking.WaitingFor = "permission to run git push"
+	elsewhere := s("DEMO-103", "support", session.Working)
+	elsewhere.Home, elsewhere.Socket, elsewhere.Workspace = false, "/demo/.config/herdr/sessions/support/herdr.sock", "support"
+	elsewhere.LastActive = now.Add(-11 * time.Minute)
+	resumable := s("DEMO-104", "matt", session.Stopped)
+	resumable.Live, resumable.Home, resumable.LastActive = false, false, now.Add(-5*time.Hour)
+	background := s("DEMO-105", "matt", session.Background)
+	background.Activity.InFlight.Tasks = 1
+	background.Activity.Tail.LastTool = "Bash: gh pr checks 912 --watch"
+	unread := s("DEMO-110", "support", session.Unread)
+	unread.Activity.Tail = session.Tail{LastTool: "Edit: policy_sync.go", ContextTokens: 61000}
+	limited := s("DEMO-111", "m0", session.Limited)
+	limited.Activity.Tail.Err = &session.APIError{Kind: "rate_limit", LimitType: "five_hour", ResetsAt: now.Add(40 * time.Minute), UUID: "demo"}
+	project := s("proj-demo0001", "matt", session.Working)
+	project.Activity.Tail.LastTool = "Read: onboarding_flow.go"
+	stoppedProj := s("proj-demo0003", "support", session.Stopped)
+	stoppedProj.Live, stoppedProj.Home, stoppedProj.LastActive = false, false, now.Add(-3*time.Hour)
+
+	notes := fleet.Session{Key: "deploy-notes", Name: "Deploy notes", Kind: ledger.Scratch, ID: "11111111-2222-4333-8444-555555555555", Account: "support", ConfigDir: dir("support"), Status: session.Idle, Live: true, Home: true, PaneID: "w1:p9"}
+	toolchain := fleet.Session{Key: "toolchain", Name: "bump the go toolchain", Kind: ledger.Scratch, ID: "22222222-2222-4333-8444-555555555555", Account: "m0", ConfigDir: dir("m0"), Status: session.Stopped, LastActive: now.Add(-20 * time.Hour)}
+	oldDeck := fleet.Session{Key: "scratch-2", Name: "flaky test triage", Kind: ledger.Scratch, Account: "m1", ConfigDir: dir("m1"), Status: session.Idle, Live: true, Socket: "/demo/.config/herdr/sessions/m1/herdr.sock", Workspace: "m1", PaneID: "w1:p4"}
+	offList := s("DEMO-090", "matt", session.Idle)
+
+	return fleet.Snapshot{At: now, Sessions: []fleet.Session{
+		working, asking, elsewhere, resumable, background, unread, limited, project, stoppedProj, notes, toolchain, oldDeck, offList,
+	}}
 }
 
 // FetchComments fabricates the /investigate and /plan write-ups for DEMO-101, so
@@ -148,13 +194,4 @@ Expected the coupon to be rejected. The reprice path skips the expiry check.
 <!-- implementation-plan -->`,
 		},
 	}, nil
-}
-
-// DemoOtherSessions fabricates sessions not tied to a visible ticket (an off-list
-// done ticket + an ad-hoc scratch session) so --demo shows the bottom section.
-func (demoFetcher) DemoOtherSessions() []session.SessionRef {
-	return []session.SessionRef{
-		{Name: "DEMO-090", Status: session.Idle},
-		{Name: "scratch-1", Status: session.Working},
-	}
 }

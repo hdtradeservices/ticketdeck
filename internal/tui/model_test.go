@@ -17,6 +17,8 @@ import (
 
 	"github.com/hdtradeservices/ticketdeck/internal/account"
 	"github.com/hdtradeservices/ticketdeck/internal/cache"
+	"github.com/hdtradeservices/ticketdeck/internal/fleet"
+	"github.com/hdtradeservices/ticketdeck/internal/ledger"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/quota"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
@@ -68,9 +70,10 @@ func (fakeBackend) Statuses(keys []string, cwd string) (map[string]session.Statu
 
 func (fakeBackend) Plan(t session.Ticket, cwd string) (session.LaunchSpec, error) {
 	return session.LaunchSpec{
-		Args:   append([]string{"--session-id", session.DeterministicID(t.Key), "--name", t.Key}, session.LaunchArgs(t)...),
+		Args:   session.ClaudeArgs(t),
 		Cwd:    cwd,
 		Action: "new",
+		Name:   t.Key, Account: t.Account, ConfigDir: t.ConfigDir, SessionID: t.ID(),
 	}, nil
 }
 
@@ -80,9 +83,15 @@ func (fakeBackend) RunDetached(session.LaunchSpec) (string, error) {
 
 func (fakeBackend) Sessions() ([]session.SessionRef, error) { return nil, nil }
 
-func (fakeBackend) ScratchSpec(cwd string) session.LaunchSpec {
-	return session.LaunchSpec{Name: "scratch-1", Label: "scratch-1", Cwd: cwd, Action: "scratch"}
+func (fakeBackend) Herdr() bool { return true }
+
+func (fakeBackend) ScratchSpec(t session.Ticket, cwd string) session.LaunchSpec {
+	return session.LaunchSpec{Name: "scratch-1", Label: "scratch-1", Cwd: cwd, Action: "scratch", SessionID: t.SessionID, Account: t.Account, ConfigDir: t.ConfigDir}
 }
+
+func (fakeBackend) Move(Move) (string, error)                       { return "", nil }
+func (fakeBackend) Rename(session.SessionRef, string, string) error { return nil }
+func (fakeBackend) Keys(string, ...string) error                    { return nil }
 
 func (fakeBackend) FocusSpec(ref session.SessionRef) session.LaunchSpec {
 	return session.LaunchSpec{Args: []string{"agent", "focus", ref.Name}, Name: ref.Name, Action: "focus"}
@@ -452,6 +461,18 @@ type recBackend struct {
 	sent         string // "name:text"
 	closedByName string
 	triaged      string // ticket key
+	moves        []Move
+	keys         []string // "name:keys"
+}
+
+func (r *recBackend) Keys(name string, keys ...string) error {
+	r.keys = append(r.keys, name+":"+strings.Join(keys, " "))
+	return nil
+}
+
+func (r *recBackend) Move(mv Move) (string, error) {
+	r.moves = append(r.moves, mv)
+	return "", nil
 }
 
 func (r *recBackend) Triage(t session.Ticket, cwd string) (string, error) {
@@ -700,6 +721,8 @@ func TestOpenHintGatingAndDismiss(t *testing.T) {
 	if m.openHintSpec != nil || cmd == nil || m.hideOpenHint {
 		t.Fatal("Enter should launch and keep the hint enabled")
 	}
+	next, _ = m.Update(cmd()) // the launch finishes
+	m = next.(Model)
 	// It shows again next open.
 	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = next.(Model)
@@ -707,11 +730,13 @@ func TestOpenHintGatingAndDismiss(t *testing.T) {
 		t.Fatal("hint should reappear on the next open")
 	}
 	// 'd' dismisses permanently.
-	next, _ = m.Update(runes("d"))
+	next, cmd = m.Update(runes("d"))
 	m = next.(Model)
 	if !m.hideOpenHint {
 		t.Fatal("'d' should persist the dont-show flag")
 	}
+	next, _ = m.Update(cmd()) // that launch finishes too
+	m = next.(Model)
 	// After dismissal, opening launches directly.
 	next, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = next.(Model)
@@ -759,7 +784,7 @@ func TestTriageTicketInBackground(t *testing.T) {
 	m = New(fakeFetcher{fixture()}, "", true, rec)
 	next, _ = m.Update(refreshedMsg{issues: fixture()})
 	m = next.(Model)
-	next, _ = m.Update(sessionsMsg{sessions: []session.SessionRef{{Name: "ZEN-2990", Ref: "w1:p9"}}})
+	next, _ = m.Update(sessionsMsg{sessions: []session.SessionRef{{Name: "ZEN-2990", Status: session.Idle, Ref: "w1:p9"}}})
 	m = next.(Model)
 	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}}) // jump to the session row
 	m = next.(Model)
@@ -804,9 +829,25 @@ func TestOtherSessionsSectionCloseAndScratch(t *testing.T) {
 	if rec.closed != "ZEN-2990" {
 		t.Errorf("expected close of ZEN-2990, got %q", rec.closed)
 	}
-	// n plans an ad-hoc scratch session (dry → notice).
+	// n asks for a name, then plans an ad-hoc scratch session (dry → notice).
 	next, _ = m.Update(runes("n"))
-	if got := next.(Model).notice; !strings.Contains(got, "scratch") {
+	m = next.(Model)
+	if m.prompt == nil || m.prompt.kind != promptNew {
+		t.Fatal("n should open the new-session prompt")
+	}
+	for _, r := range "deploy notes" {
+		next, _ = m.Update(runes(string(r)))
+		m = next.(Model)
+	}
+	if !strings.Contains(m.View(), "deploy notes") {
+		t.Errorf("the prompt should show what was typed:\n%s", m.View())
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.prompt != nil {
+		t.Error("enter should close the prompt")
+	}
+	if got := m.notice; !strings.Contains(got, "scratch") {
 		t.Errorf("n should open a scratch session, notice=%q", got)
 	}
 }
@@ -834,7 +875,7 @@ func ownedDeck(t *testing.T) Model {
 	t.Helper()
 	m := twoAccounts(t)
 	m.owners = map[string]account.Owner{
-		"ZEN-9": {Name: "support", Status: session.Working, Live: true},
+		"ZEN-9": {Name: "support", Status: session.Working, Live: true, Workspace: "support"},
 	}
 	m.ownerCol = ownerColWidth(m.accounts, m.owners)
 	return m
@@ -936,7 +977,7 @@ func TestOpenGatedWhenAnotherDeckRunsTheTicket(t *testing.T) {
 		t.Fatal("Enter on a ticket another deck runs should gate the launch")
 	}
 	view := m.View()
-	for _, want := range []string{"ZEN-9", "support", "working right now", "deck --account support"} {
+	for _, want := range []string{"ZEN-9", "support", "working right now", "bring it here from the support deck"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("conflict overlay should mention %q:\n%s", want, view)
 		}
@@ -948,8 +989,8 @@ func TestOpenGatedWhenAnotherDeckRunsTheTicket(t *testing.T) {
 	if m.conflict != nil || cmd != nil {
 		t.Fatal("Enter in the gate should cancel, not launch")
 	}
-	if !strings.Contains(m.notice, "deck --account support") {
-		t.Errorf("canceling should point at the deck that owns it, got %q", m.notice)
+	if !strings.Contains(m.notice, "b brings it here") {
+		t.Errorf("canceling should say how to bring it here, got %q", m.notice)
 	}
 
 	// "o" is the deliberate override. This deck is dry, so the launch lands as a
@@ -1732,12 +1773,14 @@ func twoAccounts(t *testing.T) Model {
 // An unlabelled deck is indistinguishable from any other deck, so the primary
 // one must carry a badge too.
 func TestAccountBadgeAlwaysRenders(t *testing.T) {
-	m := twoAccounts(t)
-	if !strings.Contains(m.accountSegment(), "matt") {
-		t.Errorf("account badge missing the account name: %q", m.accountSegment())
+	solo := loadedSingleAccount(t)
+	if !strings.Contains(solo.accountSegment(), "matt") {
+		t.Errorf("account badge missing the account name: %q", solo.accountSegment())
 	}
-	if !strings.Contains(m.View(), "⦿ matt") {
-		t.Error("view should name the subscription this deck runs as")
+	// With several accounts the deck runs them all, and the line under the
+	// title names each one.
+	if !strings.Contains(twoAccounts(t).View(), "⦿ matt") {
+		t.Error("view should name every subscription")
 	}
 }
 
@@ -1748,23 +1791,22 @@ func TestAccountColorsDifferBetweenAccounts(t *testing.T) {
 	}
 }
 
-// The whole reason to read every account: seeing the other's headroom without
-// switching decks.
-func TestOtherAccountQuotaShownInView(t *testing.T) {
+// The whole reason to read every account: seeing each one's headroom in one
+// place, and which one a new session would open on.
+func TestEveryAccountQuotaShownInView(t *testing.T) {
 	m := twoAccounts(t)
 	m.quotas = map[string]quota.Entry{
 		"matt":    {Usage: &quota.Usage{FiveHourPct: 94, SevenDayPct: 61}, FetchedAt: time.Now()},
 		"support": {Usage: &quota.Usage{FiveHourPct: 12, SevenDayPct: 8}, FetchedAt: time.Now()},
 	}
-	line := m.otherQuotaLine()
-	if !strings.Contains(line, "support") || !strings.Contains(line, "12%") {
-		t.Errorf("other account's headroom missing: %q", line)
-	}
-	if strings.Contains(line, "matt") {
-		t.Errorf("active account belongs on the title line, not the others line: %q", line)
+	line := m.accountsLine()
+	for _, want := range []string{"matt", "94%", "support", "12%"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("accounts line missing %q: %q", want, line)
+		}
 	}
 	if !strings.Contains(m.View(), "12%") {
-		t.Error("view should show the other subscription's usage")
+		t.Error("view should show every subscription's usage")
 	}
 }
 
@@ -1786,46 +1828,72 @@ func TestQuotaMsgKeepsPriorReadingForFailedAccount(t *testing.T) {
 }
 
 // "usage unavailable" was the same words for a throttle that clears itself and
-// for a token only a re-login fixes. Whichever it is has to reach the row.
-func TestFailureReasonReachesTheOtherAccountsLine(t *testing.T) {
+// for a token only a re-login fixes. Whichever it is has to reach the line.
+func TestFailureReasonReachesTheAccountsLine(t *testing.T) {
 	m := twoAccounts(t)
 	next, _ := m.Update(quotaMsg{entries: map[string]quota.Entry{
 		"support": {Reason: "token expired"},
 	}})
 	m = next.(Model)
-	if line := m.otherQuotaLine(); !strings.Contains(line, "token expired") {
-		t.Errorf("row should say why the reading is missing: %q", line)
+	if line := m.accountsLine(); !strings.Contains(line, "token expired") {
+		t.Errorf("line should say why the reading is missing: %q", line)
 	}
 }
 
+// liveOn puts a ticket's session in this deck's workspace, running on an
+// account, the way a status poll would report it.
+func liveOn(m Model, key, acct string, st session.Status) Model {
+	a, _ := account.Find(m.accounts, acct)
+	m.fleet.Sessions = append(m.fleet.Sessions, fleet.Session{
+		Key: key, ID: session.DeterministicID(key), Account: a.Name, ConfigDir: a.ConfigDir,
+		Status: st, Live: true, Home: true, PaneID: "w1:p3", PID: 4242, Kind: ledger.Ticket,
+	})
+	m.sessions[key] = st
+	m.owners[key] = account.Owner{Name: a.Name, Status: st, Live: true, Home: true}
+	return m
+}
+
 func TestHandoffOverlayOpensAndNamesBothAccounts(t *testing.T) {
-	m := twoAccounts(t)
-	m.sessions = map[string]session.Status{"ZEN-9": session.NeedsInput}
+	m := liveOn(twoAccounts(t), "ZEN-9", "matt", session.NeedsInput)
 	next, _ := m.Update(runes("H"))
 	m = next.(Model)
 	if m.handoffKey != "ZEN-9" {
-		t.Fatalf("H should open the hand-off overlay for the cursor ticket, got %q", m.handoffKey)
+		t.Fatalf("H should open the move overlay for the cursor ticket, got %q", m.handoffKey)
+	}
+	if len(m.handoffCands) != 1 || m.handoffCands[0].Name != "support" {
+		t.Errorf("targets = %v, want just support (the session is on matt)", m.handoffCands)
 	}
 	view := m.View()
 	for _, want := range []string{"ZEN-9", "matt", "support"} {
 		if !strings.Contains(view, want) {
-			t.Errorf("hand-off overlay missing %q: %s", want, view)
+			t.Errorf("move overlay missing %q: %s", want, view)
 		}
 	}
 }
 
-// Nothing to move means the overlay must not open — it would offer an action
-// that can't do anything.
-func TestHandoffRefusedWithoutASession(t *testing.T) {
+// A ticket with no session yet: H picks the account to open it on.
+func TestHandoffWithoutASessionOpensOnTheChosenAccount(t *testing.T) {
 	m := twoAccounts(t)
-	m.sessions = map[string]session.Status{}
 	next, _ := m.Update(runes("H"))
 	m = next.(Model)
-	if m.handoffKey != "" {
-		t.Error("hand-off opened for a ticket with no session")
+	if m.handoffKey != "ZEN-9" || len(m.handoffCands) != 2 {
+		t.Fatalf("H on a ticket with no session should offer every account, got %q %v", m.handoffKey, m.handoffCands)
 	}
-	if !strings.Contains(m.notice, "no session") {
-		t.Errorf("expected an explanatory notice, got %q", m.notice)
+	if !strings.Contains(m.View(), "Open on an account") {
+		t.Error("overlay should say it opens rather than moves")
+	}
+	for i, a := range m.handoffCands {
+		if a.Name == "support" {
+			m.handoffCursor = i
+		}
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if !strings.Contains(m.notice, "⦿support") {
+		t.Errorf("the launch should run on support: %q", m.notice)
+	}
+	if m.forceAcct != nil {
+		t.Error("the chosen account must apply to that one launch only")
 	}
 }
 
@@ -1850,45 +1918,43 @@ func TestHandoffRefusedWithOnlyOneAccount(t *testing.T) {
 	}
 }
 
-// Stopping the session before copying is mandatory: two accounts appending to
-// their own copy of one transcript diverge irreconcilably.
-func TestHandoffStopsTheSessionBeforeCopying(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	for _, dir := range []string{".claude", ".claude-support"} {
-		p := filepath.Join(home, dir)
-		if err := os.MkdirAll(p, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(p, ".credentials.json"), []byte(`{}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
-	t.Setenv("TICKETDECK_ACCOUNT", "matt")
-
+// A move goes through the backend, which stops the session before copying:
+// two accounts appending to their own copy of one transcript diverge
+// irreconcilably.
+func TestHandoffMovesTheRunningSession(t *testing.T) {
+	m := twoAccounts(t)
 	rec := &recBackend{}
-	m := New(fakeFetcher{fixture()}, "", true, rec)
-	next, _ := m.Update(refreshedMsg{issues: fixture()})
-	m = next.(Model)
-	m.sessions = map[string]session.Status{"ZEN-9": session.NeedsInput}
+	m.backend = rec
+	m = liveOn(m, "ZEN-9", "matt", session.NeedsInput)
 
-	next, _ = m.Update(runes("H"))
+	next, _ := m.Update(runes("H"))
 	m = next.(Model)
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = next.(Model)
 	if m.handoffKey != "" {
 		t.Error("overlay should close on confirm")
 	}
+	if !m.moving["ZEN-9"] {
+		t.Error("the session should be marked as moving until the move lands")
+	}
 	drainCmd(cmd)
-	if rec.closedByName != "ZEN-9" {
-		t.Errorf("hand-off must stop the session first, closed %q", rec.closedByName)
+	if len(rec.moves) != 1 {
+		t.Fatalf("moves = %d, want 1", len(rec.moves))
+	}
+	mv := rec.moves[0]
+	if mv.From.Name != "matt" || mv.To.Name != "support" || mv.PaneID != "w1:p3" || mv.PID != 4242 {
+		t.Errorf("move = %+v, want matt → support stopping pane w1:p3", mv)
+	}
+	if mv.Ticket.ID() != session.DeterministicID("ZEN-9") || mv.Ticket.Title == "" {
+		t.Errorf("move must carry the ticket's identity: %+v", mv.Ticket)
+	}
+	if mv.Submit != "" {
+		t.Errorf("a hand move of a session that wasn't cut off sends nothing, sent %q", mv.Submit)
 	}
 }
 
 func TestHandoffEscCancels(t *testing.T) {
-	m := twoAccounts(t)
-	m.sessions = map[string]session.Status{"ZEN-9": session.Working}
+	m := liveOn(twoAccounts(t), "ZEN-9", "matt", session.Working)
 	next, _ := m.Update(runes("H"))
 	next, _ = next.(Model).Update(tea.KeyMsg{Type: tea.KeyEsc})
 	if next.(Model).handoffKey != "" {
@@ -1896,53 +1962,50 @@ func TestHandoffEscCancels(t *testing.T) {
 	}
 }
 
-// The footer names the destination when there's exactly one, so the two-account
-// case reads as an action rather than a menu.
-func TestFooterNamesTheHandoffTarget(t *testing.T) {
-	m := twoAccounts(t)
-	if !strings.Contains(m.View(), "H hand to ⦿support") {
-		t.Error("footer should name the single hand-off target")
+// The footer offers the account keys only when there is more than one account.
+func TestFooterOffersTheAccountKeys(t *testing.T) {
+	if !strings.Contains(twoAccounts(t).View(), "H account · A accounts") {
+		t.Error("footer should offer H and A with two accounts")
+	}
+	if strings.Contains(loadedSingleAccount(t).View(), "A accounts") {
+		t.Error("a one-account deck has no accounts to offer")
 	}
 }
 
-// The success notice must tell you how to actually open that deck. `deck
-// --account default` would look for a ~/.claude-default that doesn't exist, so
-// the command comes from the target's config dir, not its name.
-func TestHandoffNoticeUsesTheTargetsRealLaunchCommand(t *testing.T) {
+func TestMoveDoneNoticeSaysWhatHappened(t *testing.T) {
 	m := twoAccounts(t)
-	next, _ := m.Update(handoffMsg{key: "ZEN-9", to: "support", cmd: "deck --account support"})
-	if !strings.Contains(next.(Model).notice, "deck --account support") {
-		t.Errorf("notice = %q", next.(Model).notice)
+	next, _ := m.Update(moveDoneMsg{key: "ZEN-9", label: "ZEN-9", from: "matt", to: "support", auto: true, why: "⦿matt hit its 5-hour limit"})
+	n := next.(Model).notice
+	for _, want := range []string{"ZEN-9", "⦿matt", "⦿support", "carrying on", "5-hour"} {
+		if !strings.Contains(n, want) {
+			t.Errorf("notice missing %q: %q", want, n)
+		}
 	}
-	// Handing back to the primary: plain `deck`, no invented --account flag.
-	next, _ = m.Update(handoffMsg{key: "ZEN-9", to: "matt", cmd: "deck"})
-	if n := next.(Model).notice; strings.Contains(n, "--account") {
-		t.Errorf("primary target should need no --account flag: %q", n)
+	next, _ = m.Update(moveDoneMsg{key: "ZEN-9", label: "ZEN-9", from: "matt", to: "support", err: errors.New("⦿support already has newer ZEN-9 work")})
+	if e := next.(Model).err; e == nil || !strings.Contains(e.Error(), "newer") {
+		t.Errorf("a refused move must surface why: %v", e)
 	}
 }
 
-// An account whose usage can't be read must still appear. Dropping the row made
-// a rate-limited subscription look like it was never detected — which is exactly
+// An account whose usage can't be read must still appear. Dropping it made a
+// rate-limited subscription look like it was never detected — which is exactly
 // how this reads to someone checking whether their second account is wired up.
-func TestOtherAccountShownEvenWithoutUsage(t *testing.T) {
+func TestAccountShownEvenWithoutUsage(t *testing.T) {
 	m := twoAccounts(t)
 	m.quotas = map[string]quota.Entry{"matt": {Usage: &quota.Usage{FiveHourPct: 94}, FetchedAt: time.Now()}} // support failed
-	line := m.otherQuotaLine()
+	line := m.accountsLine()
 	if !strings.Contains(line, "support") {
 		t.Errorf("account vanished when its usage was unreadable: %q", line)
 	}
 	if !strings.Contains(line, "unavailable") {
 		t.Errorf("missing usage should say so: %q", line)
 	}
-	if !strings.Contains(m.View(), "support") {
-		t.Error("view should still name the other subscription")
-	}
 }
 
-// The active account's own segment must say why it's blank too — an empty slot
+// A one-account deck's own segment must say why it's blank — an empty slot
 // there reads as "still loading", which is the one thing it isn't.
 func TestActiveAccountSegmentNamesTheFailure(t *testing.T) {
-	m := twoAccounts(t)
+	m := loadedSingleAccount(t)
 	next, _ := m.Update(quotaMsg{entries: map[string]quota.Entry{"matt": {Reason: "rate limited"}}})
 	if seg := next.(Model).quotaSegment(); !strings.Contains(seg, "rate limited") {
 		t.Errorf("title segment should name the failure: %q", seg)
@@ -1950,13 +2013,13 @@ func TestActiveAccountSegmentNamesTheFailure(t *testing.T) {
 }
 
 // A reading that survived several failed rounds is still shown — but marked, so
-// a stale 12%% isn't read as live headroom to hand a session to.
+// a stale 12%% isn't read as live headroom to send a session to.
 func TestStaleReadingIsMarked(t *testing.T) {
 	m := twoAccounts(t)
 	m.quotas = map[string]quota.Entry{
 		"support": {Usage: &quota.Usage{FiveHourPct: 12}, FetchedAt: time.Now().Add(-time.Hour), Reason: "rate limited"},
 	}
-	line := m.otherQuotaLine()
+	line := m.accountsLine()
 	if !strings.Contains(line, "12%") {
 		t.Errorf("last good reading should survive a failure: %q", line)
 	}
@@ -1965,15 +2028,15 @@ func TestStaleReadingIsMarked(t *testing.T) {
 	}
 }
 
-// The other-accounts header row must be reserved in viewportHeight. It wasn't,
-// so the body ran one line too tall and pushed the footer off-screen — in
-// exactly the multi-account case the row exists to serve.
-func TestOtherQuotaLineIsReservedInViewport(t *testing.T) {
+// The accounts row must be reserved in viewportHeight, or the body runs one
+// line too tall and pushes the footer off-screen — in exactly the
+// multi-account case the row exists to serve.
+func TestAccountsLineIsReservedInViewport(t *testing.T) {
 	m := twoAccounts(t)
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 14})
 	m = next.(Model)
-	if !m.hasOtherQuotaLine() {
-		t.Fatal("fixture should render the other-accounts row")
+	if !m.hasAccountsLine() {
+		t.Fatal("fixture should render the accounts row")
 	}
 
 	// The rendered frame must fit the terminal, or the footer is off-screen.
@@ -1989,7 +2052,7 @@ func TestOtherQuotaLineIsReservedInViewport(t *testing.T) {
 	solo := loadedSingleAccount(t)
 	next, _ = solo.Update(tea.WindowSizeMsg{Width: 100, Height: 14})
 	solo = next.(Model)
-	if solo.hasOtherQuotaLine() {
+	if solo.hasAccountsLine() {
 		t.Fatal("single-account deck should not render the row")
 	}
 	if solo.viewportHeight() != m.viewportHeight()+1 {
@@ -2049,36 +2112,14 @@ func TestRowNeverOverrunsItsWidth(t *testing.T) {
 	}
 }
 
-// The other-subscriptions line sits directly under the title bar's own account,
-// so the two account names must start in the same column. The dots lining up
-// isn't enough — a missing space after the dot shifts only the name.
-func TestOtherAccountsLineAlignsWithTitleBar(t *testing.T) {
-	m := twoAccounts(t)
-	m.width = 120
-	line1 := ansiRe.ReplaceAllString("TicketDeck"+m.accountSegment(), "")
-	line2 := ansiRe.ReplaceAllString(m.otherQuotaLine(), "")
-
-	col := func(line, name string) int {
-		i := strings.Index(line, name)
-		if i < 0 {
-			t.Fatalf("account %q not found in %q", name, line)
-		}
-		return runewidth.StringWidth(line[:i])
-	}
-	if a, b := col(line1, "matt"), col(line2, "support"); a != b {
-		t.Errorf("account names start in different columns: title bar %d, other-accounts line %d\n%s\n%s",
-			a, b, line1, line2)
-	}
-}
-
 // A deck that started before an account logged in must still offer it. Logging
 // in happens in another terminal, usually hours after the decks were started,
 // so the once-at-startup scan left the new subscription invisible until every
 // deck was restarted.
 func TestNewAccountAppearsWithoutRestartingTheDeck(t *testing.T) {
 	m := twoAccounts(t)
-	if len(m.otherAccounts()) != 1 {
-		t.Fatalf("expected one other account at startup, got %d", len(m.otherAccounts()))
+	if len(m.accounts) != 2 {
+		t.Fatalf("expected two accounts at startup, got %d", len(m.accounts))
 	}
 	dir := filepath.Join(os.Getenv("HOME"), ".claude-m1")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -2089,8 +2130,8 @@ func TestNewAccountAppearsWithoutRestartingTheDeck(t *testing.T) {
 	}
 	next, _ := m.Update(tickMsg{})
 	m = next.(Model)
-	if !slices.ContainsFunc(m.otherAccounts(), func(a account.Account) bool { return a.Name == "m1" }) {
-		t.Errorf("account that logged in after startup should appear as a hand-off target, got %v", m.otherAccounts())
+	if !slices.ContainsFunc(m.accounts, func(a account.Account) bool { return a.Name == "m1" }) {
+		t.Errorf("account that logged in after startup should appear, got %v", m.accounts)
 	}
 	if _, ok := m.acctColors["m1"]; !ok {
 		t.Error("a newly discovered account should get an accent color")
@@ -2098,7 +2139,10 @@ func TestNewAccountAppearsWithoutRestartingTheDeck(t *testing.T) {
 }
 
 // The window closer to its cap is the one that binds, so it alone decides the
-// order: plenty of 5-hour room is worthless on a subscription out of 7-day.
+// order: plenty of 5-hour room is worthless on a subscription out of 7-day. An
+// account that can't be read ranks as moderate room — an account nobody has
+// used lately has an expired token and an empty window — and a nearly spent
+// one comes last.
 func TestHandoffCandidatesOrderedByTighterWindow(t *testing.T) {
 	m := twoAccounts(t)
 	m.accounts = []account.Account{
@@ -2108,19 +2152,19 @@ func TestHandoffCandidatesOrderedByTighterWindow(t *testing.T) {
 		{Name: "unread", ConfigDir: "/x/.claude-unread"},
 	}
 	m.quotas = map[string]quota.Entry{
-		"loaded": {Usage: &quota.Usage{FiveHourPct: 5, SevenDayPct: 98}},
-		"free":   {Usage: &quota.Usage{FiveHourPct: 40, SevenDayPct: 20}},
+		"loaded": {Usage: &quota.Usage{FiveHourPct: 5, SevenDayPct: 98}, FetchedAt: time.Now()},
+		"free":   {Usage: &quota.Usage{FiveHourPct: 40, SevenDayPct: 20}, FetchedAt: time.Now()},
 	}
-	m.sessions = map[string]session.Status{"ZEN-9": session.NeedsInput}
+	m = liveOn(m, "ZEN-9", "matt", session.NeedsInput)
 	next, _ := m.Update(runes("H"))
 	m = next.(Model)
 	var got []string
 	for _, a := range m.handoffCands {
 		got = append(got, a.Name)
 	}
-	want := []string{"free", "loaded", "unread"}
+	want := []string{"free", "unread", "loaded"}
 	if !slices.Equal(got, want) {
-		t.Errorf("candidates should be most-free first with unread last: got %v, want %v", got, want)
+		t.Errorf("candidates should be most-free first and nearly spent last: got %v, want %v", got, want)
 	}
 }
 

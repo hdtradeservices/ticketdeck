@@ -7,8 +7,13 @@
 # Detaching/quitting herdr leaves the server + ticket sessions running.
 #
 # Usage:
-#   deck                     # default Claude subscription (~/.claude)
-#   deck --account support   # run as a second subscription (~/.claude-support)
+#   deck                     # one deck for every Claude subscription on this machine
+#   deck --account support   # a separate deck whose own account is ~/.claude-support
+#
+# One deck runs every account: each session's pane gets its own account, picked
+# by headroom when it opens and moved when that account runs out. --account is
+# the older one-deck-per-account layout, kept so it still works; that deck runs
+# every account too, but in a workspace of its own.
 #
 # Env:
 #   TICKETDECK_ROOT     default working dir for new ticket sessions (default ~/Repos)
@@ -18,14 +23,10 @@
 set -euo pipefail
 
 # ── account selection ────────────────────────────────────────────────────────
-# --account NAME runs the deck as a second Claude subscription. Each account has
-# its own Claude config dir (~/.claude-NAME, where that subscription's
-# credentials live) and a FULLY ISOLATED herdr workspace (own server socket +
-# session.json), so its ticket sessions burn that subscription's rate limits and
-# never collide with the default deck. Both decks show the SAME Linear tickets
-# (the Linear key is shared) — only which Claude account runs the sessions
-# differs. Switching accounts is just: detach one (Ctrl+b q), run the other
-# launcher; background sessions in each keep running untouched.
+# --account NAME gives the deck ~/.claude-NAME as its own account and a FULLY
+# ISOLATED herdr workspace (own server socket + session.json). That was how a
+# second subscription used to get a deck at all; now the plain deck runs every
+# account, and M in it brings in the sessions an --account deck left running.
 ACCOUNT=""
 while [ $# -gt 0 ]; do
   case "$1" in

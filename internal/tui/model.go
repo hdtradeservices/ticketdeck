@@ -24,6 +24,7 @@ import (
 	"github.com/hdtradeservices/ticketdeck/internal/account"
 	"github.com/hdtradeservices/ticketdeck/internal/doctor"
 	"github.com/hdtradeservices/ticketdeck/internal/fleet"
+	"github.com/hdtradeservices/ticketdeck/internal/herd"
 	"github.com/hdtradeservices/ticketdeck/internal/ledger"
 	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/quota"
@@ -341,15 +342,19 @@ type Model struct {
 	settings      settings
 	forceAcct     *account.Account          // the next launch runs here, not where the router says (H on a ticket with no session)
 	moving        map[string]bool           // session keys with a move in flight
-	handled       map[string]bool           // API error ids already acted on
+	telling       map[string]bool           // session keys being told to carry on
+	stepDone      map[string]time.Time      // when the deck's last move or tell of each session finished
+	socket        string                    // this deck's herdr server: the promises it made are its to keep
 	parked        map[string]time.Time      // sessions out of usage with nowhere to move: when their limit lifts
+	stuckNoted    map[string]bool           // sessions the user was told never answered a carry-on
 	adoptQueue    map[string]bool           // sessions in other decks to bring in once their turn ends
 	pendingSend   map[string]string         // moved sessions held at a startup prompt: what to send once it's answered
 	launching     map[string]bool           // sessions whose launch is still running
 	finishedAt    map[string]time.Time      // when each session last finished a turn, as the deck saw it
 	seenAt        map[string]time.Time      // when each session was last on screen
 	rawStatus     map[string]session.Status // each session's status as herdr reported it last poll
-	retryAt       map[string]time.Time      // cut-offs whose continue failed: when to try again
+	retryAt       map[string]time.Time      // sessions whose last carry-on step failed: when to try again
+	fails         map[string]int            // and how many times in a row it has
 	acctMenu      bool                      // the accounts overlay (A) is open
 	acctCursor    int
 	bringMenu     bool // the bring-sessions-here overlay (M) is open
@@ -386,10 +391,12 @@ type demoFleeter interface {
 
 func New(f Fetcher, root string, dry bool, backend Backend) Model {
 	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, inView: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, closeOnIdle: map[string]bool{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, projExpanded: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != "", comments: map[string][]linear.Comment{}, commentsErr: map[string]error{}, commentsBusy: map[string]bool{}}
-	m.moving, m.handled, m.parked, m.adoptQueue = map[string]bool{}, map[string]bool{}, map[string]time.Time{}, map[string]bool{}
+	m.moving, m.telling, m.parked, m.adoptQueue = map[string]bool{}, map[string]bool{}, map[string]time.Time{}, map[string]bool{}
+	m.stepDone, m.stuckNoted = map[string]time.Time{}, map[string]bool{}
+	m.socket = herd.OwnSocket()
 	m.pendingSend, m.launching = map[string]string{}, map[string]bool{}
 	m.finishedAt, m.seenAt, m.rawStatus = map[string]time.Time{}, map[string]time.Time{}, map[string]session.Status{}
-	m.retryAt = map[string]time.Time{}
+	m.retryAt, m.fails = map[string]time.Time{}, map[string]int{}
 	m.ledger = ledger.Load()
 	m.settings = loadSettings()
 	// Resolved once, not per frame: All() globs the filesystem, and View runs on
@@ -852,17 +859,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleMoveDone(msg)
 
 	case continuedMsg:
+		delete(m.telling, msg.key)
+		m.stepDone[msg.key] = time.Now()
+		m.ledger = ledger.Load()
 		if msg.err != nil {
-			debugLog.Printf("continue %s after its limit reset failed: %v", msg.key, msg.err)
-			m.err = fmt.Errorf("telling %s to continue: %v — trying again in a minute", m.label(msg.key), msg.err)
-			// Not handled after all: the next poll past the wait tries again.
-			if msg.errUUID != "" {
-				delete(m.handled, msg.errUUID)
-				m.retryAt[msg.errUUID] = time.Now().Add(retryContinue)
-			}
+			debugLog.Printf("telling %s to carry on failed: %v", msg.key, msg.err)
+			wait := m.retryLater(msg.key, msg.err)
+			m.err = fmt.Errorf("telling %s to carry on: %v — trying again in %s", m.label(msg.key), msg.err, wait)
 			break
 		}
-		m.notice = fmt.Sprintf("%s: its usage limit reset — told it to carry on", m.label(msg.key))
+		delete(m.fails, msg.key)
+		debugLog.Printf("told %s to carry on (after a startup prompt: %v)", msg.key, msg.afterPrompt)
+		m.notice = fmt.Sprintf("%s: told it to carry on", m.label(msg.key))
 		if msg.afterPrompt {
 			m.notice = fmt.Sprintf("%s is past its startup prompt — told it to carry on", m.label(msg.key))
 		}
@@ -967,7 +975,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.regroup()
 			m.restoreCursor(prevID, prevRef, prevIdx)
 			m.ensureVisible()
-			cmds = append(cmds, m.autoMoves(now)...)
+			cmds = append(cmds, m.carryOn(now)...)
 			cmds = append(cmds, m.adoptQueued()...)
 			cmds = append(cmds, m.sendPending()...)
 		}
@@ -1832,7 +1840,11 @@ func (m Model) triageTicketNow(is linear.Issue) (tea.Model, tea.Cmd) {
 }
 
 // closeSession stops an "other session" (fire-and-return); the transcript stays.
+// Closing it by hand also calls off any promise to carry it on.
 func (m Model) closeSession(s session.SessionRef) (tea.Model, tea.Cmd) {
+	if s.SessionID != "" && m.ledger[s.SessionID].Carry != nil {
+		m.endPromise(s.SessionID)
+	}
 	m.notice = "closing " + s.Name + "…"
 	backend := m.backend
 	return m, func() tea.Msg {

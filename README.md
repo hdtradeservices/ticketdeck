@@ -182,10 +182,17 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   an account you set up before it's yours to use. `A` shows the ranking and why the next account is next, and pins new
   sessions to one account if you'd rather choose.
 - **It keeps going when an account runs out.** When a session's account hits its usage
-  limit, the deck moves the session to the best-placed account and tells it to carry on — on
-  its own, once per cut-off, and only after the limit has ended the turn. With nowhere to go
-  it waits, and continues where it is once the limit resets. A lapsed login is handled the
-  same way. `A` turns this off; `TICKETDECK_AUTO_MOVE=off` does too.
+  limit, the deck moves the session to the best-placed account and tells it to carry on. It
+  does this on its own, and only after the limit has ended the turn. With nowhere to go it
+  waits, then carries on where it is once the limit resets. A lapsed login is handled the same
+  way, except that it always moves. `A` turns this off; `TICKETDECK_AUTO_MOVE=off` does too.
+- **It keeps at it until the session is going again.** Each cut-off becomes a promise in
+  `~/.ticketdeck/sessions.json`, and only a reply in the session's own transcript ends it. A
+  restarted deck picks the promise up where it was. A session whose tab closed while it
+  waited (a herdr restart, say) is started again when it is due. A "carry on" has to be seen
+  to start a turn: text left sitting in the input box gets its Enter, and a prompt that went
+  unanswered is sent again. After three unanswered tries the deck stops and tells you.
+  Closing the session with `x`, or its ticket going Done, calls the promise off.
 - **`H` moves a session by hand**, in place: the tab closes, the conversation is copied to
   the other account, and it resumes in a new tab. What carries over is the conversation, not
   the process. A moved session keeps the model it was running, whatever the new account's

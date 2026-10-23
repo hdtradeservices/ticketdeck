@@ -336,10 +336,7 @@ func Poll(in Input) Snapshot {
 			} else {
 				s.Activity = activityOf(s.ConfigDir, s.ID, in.Cwd, s.ProcStart)
 			}
-			// An error a move has already answered was the old account's: the
-			// copied transcript still ends on it, but it says nothing about the
-			// account the session runs on now.
-			if e := s.Activity.Tail.Err; e != nil && e.UUID != "" && in.Ledger[s.ID].Handled == e.UUID {
+			if notTheirs(s.Activity.Tail.Err, in.Ledger[s.ID], s.Account) {
 				s.Activity.Tail.Err = nil
 			}
 			s.Status = settle(s.Status, s.Activity, in.Now)
@@ -371,9 +368,23 @@ func Poll(in Input) Snapshot {
 	return snap
 }
 
+// notTheirs reports an error a transcript ends on that says nothing about the
+// account running the session now. A move copies the conversation, cut-off and
+// all, and it was the account it left that ran out.
+func notTheirs(e *session.APIError, le ledger.Entry, acct string) bool {
+	if e == nil || e.UUID == "" {
+		return false
+	}
+	if le.Handled == e.UUID {
+		return true
+	}
+	return le.Carry != nil && le.Carry.Err == e.UUID && le.Carry.From != acct
+}
+
 // onDisk is the resumable session for an id: the account that wrote to it last.
 func onDisk(in Input, disk map[string]map[string]found, key, id string) (Session, bool) {
 	var best Session
+	path := ""
 	for _, a := range in.Accounts {
 		f, ok := disk[a.ConfigDir][id]
 		if !ok || (best.ID != "" && !f.mod.After(best.LastActive)) {
@@ -383,11 +394,20 @@ func onDisk(in Input, disk map[string]map[string]found, key, id string) (Session
 			Key: key, ID: id, Account: a.Name, ConfigDir: a.ConfigDir,
 			Status: session.Stopped, LastActive: f.mod,
 		}
+		path = f.path
 	}
 	if best.ID == "" {
 		return Session{}, false
 	}
 	best.Kind = kindOf(key, id, in.Ledger)
+	// A stopped session the deck has promised to carry on is read like a
+	// running one: its transcript is what says whether it already has.
+	if le := in.Ledger[id]; le.Carry != nil {
+		best.Activity = activityAt(path, time.Time{})
+		if notTheirs(best.Activity.Tail.Err, le, best.Account) {
+			best.Activity.Tail.Err = nil
+		}
+	}
 	return best, true
 }
 

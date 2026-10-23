@@ -220,6 +220,12 @@ func TestUnansweredTellsStopAndSaySo(t *testing.T) {
 	if note := m.carryNote(s, time.Now()); !strings.Contains(note, "open its tab") {
 		t.Errorf("note = %q", note)
 	}
+	// Nor is one that keeps stopping started again and again.
+	_, cmd := poll(t, m, stoppedOn(m, "ZEN-9", "m0"))
+	drainCmd(cmd)
+	if len(rec.moves) != 0 {
+		t.Errorf("restarted a session that never answered: %+v", rec.moves)
+	}
 }
 
 // A ticket that is done no longer wants carrying on.

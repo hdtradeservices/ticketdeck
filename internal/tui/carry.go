@@ -166,6 +166,14 @@ func (m *Model) keepPromise(e ledger.Entry, cands []route.Candidate, now time.Ti
 		return nil // just told: its answer isn't in yet
 	}
 	label := m.sessionLabel(s)
+	if c.Tells >= maxTells {
+		if !m.stuckNoted[key] {
+			m.stuckNoted[key] = true
+			debugLog.Printf("%s was told to carry on %d times and never answered", key, c.Tells)
+			notify(label+" isn't carrying on", fmt.Sprintf("Told it %d times with no answer — open its tab", c.Tells))
+		}
+		return nil
+	}
 	if s.Account == c.From && stillOut(c, now) {
 		d := route.Pick(cands, route.Request{Exclude: c.From, Now: now})
 		to, ok := m.accountByName(d.Account)
@@ -195,14 +203,6 @@ func (m *Model) keepPromise(e ledger.Entry, cands []route.Candidate, now time.Ti
 		to := m.sessionAccount(s)
 		m.notice = fmt.Sprintf("%s stopped while it waited — starting it again on ⦿%s to carry on…", label, to.Name)
 		return m.carryMove(s, to, c, "started again to carry on")
-	}
-	if c.Tells >= maxTells {
-		if !m.stuckNoted[key] {
-			m.stuckNoted[key] = true
-			debugLog.Printf("%s was told to carry on %d times and never answered", key, c.Tells)
-			notify(label+" isn't carrying on", fmt.Sprintf("Told it %d times with no answer — open its tab", c.Tells))
-		}
-		return nil
 	}
 	return m.tellCmd(s, c)
 }

@@ -42,11 +42,37 @@ type Entry struct {
 	Started   time.Time `json:"started,omitzero"`
 	Updated   time.Time `json:"updated"`
 	Moves     []Move    `json:"moves,omitempty"`
-	// Handled is the id of the API error an automatic move last acted on, so one
+	// Handled is the id of the last API error the deck is done with, so one
 	// rate limit is acted on once — across deck restarts too.
 	Handled string `json:"handled,omitempty"`
+	// Carry is the deck's promise to get the session going again after its
+	// account cut it off. It is kept until the conversation moves past the
+	// cut-off, so a failed move, a restarted deck or a closed tab only delays
+	// it.
+	Carry *Carry `json:"carry,omitempty"`
 	// Forgotten hides an ad-hoc session the user closed for good.
 	Forgotten bool `json:"forgotten,omitempty"`
+}
+
+// Carry is a cut-off the deck has promised to carry on from: on another
+// account with room, or on the same one once its limit lifts.
+type Carry struct {
+	Err       string    `json:"err"`  // the API error it answers
+	At        time.Time `json:"at"`   // when the cut-off happened
+	Kind      string    `json:"kind"` // "rate_limit" or "authentication_failed"
+	From      string    `json:"from"` // the account that cut it off
+	ResetsAt  time.Time `json:"resets_at,omitzero"`
+	LimitType string    `json:"limit_type,omitempty"`
+	// Socket is the herdr server of the deck that made the promise. Only that
+	// deck keeps it: two decks starting one stopped session would fork it.
+	Socket string `json:"socket,omitempty"`
+	// Busy: background work was running when it was cut off. A move or a
+	// restart ends that work, and the session is told so.
+	Busy bool `json:"busy,omitempty"`
+	// Told is when the session was last told to carry on, and Tells how many
+	// times that has gone unanswered.
+	Told  time.Time `json:"told,omitzero"`
+	Tells int       `json:"tells,omitempty"`
 }
 
 // Move is one hand-off between accounts.

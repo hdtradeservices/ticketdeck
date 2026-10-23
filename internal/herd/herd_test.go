@@ -1,6 +1,7 @@
 package herd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -232,6 +233,137 @@ exit 1
 	}
 	if !strings.Contains(err.Error(), "agent_blocked") {
 		t.Errorf("error %q drops herdr's reason", err)
+	}
+}
+
+// promptStub is a herdr whose agent shows the input box in the state file
+// next to the scratch log: "empty", or "typed" when the deck's text sits in
+// it unsent. stall makes `agent prompt --wait` report no turn, leaving the
+// text typed; Enter on a typed box starts the turn.
+func promptStub(t *testing.T, box string, stall bool) (log func() string) {
+	t.Helper()
+	stalled := "0"
+	if stall {
+		stalled = "1"
+	}
+	return fakeHerdrScript(t, `
+log=%[1]s
+state=$log.box
+[ -f $state ] || echo `+box+` > $state
+echo "$@" >> $log
+case "$1 $2" in
+"agent read")
+  if [ "$(cat $state)" = typed ]; then
+    printf '● Done.\n\n────\n❯ Your last turn was cut off because the account running\n  this session hit its usage limit.\n────\n  ⏵⏵ bypass permissions on\n'
+  else
+    printf '● Done.\n\n❯ an earlier message\n────\n❯ \n────\n'
+  fi ;;
+"agent prompt")
+  if [ `+stalled+` = 1 ]; then
+    echo typed > $state
+    printf '{"error":{"code":"agent_prompt_stalled","message":"no working state within 5000ms"}}'
+    exit 1
+  fi ;;
+"agent send-keys")
+  [ "$(cat $state)" = typed ] && echo started > $state ;;
+"agent wait")
+  [ "$(cat $state)" = started ] || exit 1 ;;
+esac
+`)
+}
+
+const carryOnText = "Your last turn was cut off because the account running this session hit its usage limit. Please continue."
+
+// A prompt's turn is confirmed, not assumed: herdr is asked to wait for it.
+func TestPromptWaitsToSeeTheTurnStart(t *testing.T) {
+	log := promptStub(t, "empty", false)
+	out, err := Prompt("", "ZEN-1", carryOnText)
+	if err != nil || out != "sent" {
+		t.Fatalf("Prompt = %q, %v", out, err)
+	}
+	if !strings.Contains(log(), "agent prompt zen-1 "+carryOnText+" --wait --until working --until blocked") {
+		t.Errorf("the prompt wasn't sent with a wait for its turn:\n%s", log())
+	}
+}
+
+// The 2026-10-22 failure: the Enter was dropped, the text sat in the box, and
+// no turn started. Prompt presses Enter on it and sees the turn start.
+func TestPromptPressesEnterOnTextLeftInTheBox(t *testing.T) {
+	log := promptStub(t, "empty", true)
+	out, err := Prompt("", "ZEN-1", carryOnText)
+	if err != nil || out != "sent + Enter" {
+		t.Fatalf("Prompt = %q, %v\n%s", out, err, log())
+	}
+	if n := strings.Count(log(), "agent send-keys zen-1 Enter"); n != 1 {
+		t.Errorf("Enter pressed %d times, want once:\n%s", n, log())
+	}
+}
+
+// Text a failed attempt left behind is submitted, not typed again after itself.
+func TestPromptSubmitsLeftoverTextInsteadOfRetyping(t *testing.T) {
+	log := promptStub(t, "typed", false)
+	if _, err := Prompt("", "ZEN-1", carryOnText); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	if strings.Contains(log(), "agent prompt") {
+		t.Errorf("typed the prompt again over the one still in the box:\n%s", log())
+	}
+}
+
+// Enter is only ever pressed on the deck's own text. A box holding someone's
+// draft is left alone, and the missing turn is reported.
+func TestPromptLeavesSomeoneElsesDraftAlone(t *testing.T) {
+	log := fakeHerdrScript(t, `
+echo "$@" >> %[1]s
+case "$1 $2" in
+"agent read") printf '────\n❯ half a thought of my own\n────\n' ;;
+"agent prompt") printf '{"error":{"code":"agent_prompt_stalled"}}'; exit 1 ;;
+"agent wait") exit 1 ;;
+esac
+`)
+	_, err := Prompt("", "ZEN-1", carryOnText)
+	if !errors.Is(err, ErrNoTurn) {
+		t.Errorf("err = %v, want ErrNoTurn", err)
+	}
+	if strings.Contains(log(), "send-keys") {
+		t.Errorf("pressed a key in a box holding someone's draft:\n%s", log())
+	}
+}
+
+// herdr's own refusal — a blocked agent — is an error, never an Enter.
+func TestPromptSurfacesARefusal(t *testing.T) {
+	log := fakeHerdrScript(t, `
+echo "$@" >> %[1]s
+case "$1 $2" in
+"agent read") printf '❯ 1. Yes, I trust this folder\n' ;;
+"agent prompt") printf '{"error":{"code":"agent_blocked"}}'; exit 1 ;;
+esac
+`)
+	_, err := Prompt("", "ZEN-1", carryOnText)
+	if err == nil || !strings.Contains(err.Error(), "agent_blocked") {
+		t.Errorf("err = %v, want herdr's refusal", err)
+	}
+	if strings.Contains(log(), "send-keys") {
+		t.Errorf("pressed a key at a dialog:\n%s", log())
+	}
+}
+
+func TestReadBox(t *testing.T) {
+	const text = "Please continue where you left off."
+	for _, c := range []struct {
+		screen string
+		want   boxState
+	}{
+		{"● Done.\n❯ " + text + "\n────\n", boxPending},
+		{"❯ Please continue\n  where you left off.\n", boxPending}, // wrapped
+		{"❯ " + text + "\n● Working…\n────\n❯ \n────\n", boxSubmitted},
+		{"❯ something else entirely\n", boxSubmitted},
+		{"● Thinking…\n", boxUnknown},
+		{"", boxUnknown},
+	} {
+		if got := readBox(c.screen, text); got != c.want {
+			t.Errorf("readBox(%q) = %v, want %v", c.screen, got, c.want)
+		}
 	}
 }
 

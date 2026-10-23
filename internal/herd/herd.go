@@ -28,6 +28,7 @@
 package herd
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -594,6 +595,122 @@ func submitAt(socket, name, text string) (string, error) {
 	return "sent", nil
 }
 
+// Prompting a turn. herdr types the text and presses Enter, but a Claude that
+// has only just started can drop that Enter while it paints: the text sits in
+// its input box and no turn starts. Three sessions moved in one burst sat like
+// that for 3.5 hours (2026-10-22) while the deck counted them as told.
+var (
+	turnWait      = 15 * time.Second // budget for a submitted prompt's turn to show
+	enterWait     = 5 * time.Second  // and for one after a second Enter
+	enterAttempts = 3
+)
+
+// ErrNoTurn reports a prompt that went in without a turn being seen to start.
+var ErrNoTurn = errors.New("no turn started — the prompt may still be sitting in its input box")
+
+// Prompt submits text that starts a turn and confirms the turn began. Not for a
+// slash command: one can finish before herdr ever sees it working. Text an
+// earlier attempt left in the input box is submitted with Enter rather than
+// typed in a second time after itself.
+func Prompt(socket, name, text string) (string, error) {
+	if readBox(paneText(socket, name), text) == boxPending {
+		return enterUntilWorking(socket, name, text)
+	}
+	out, err := cmdAt(socket, "agent", "prompt", agentRef(name), text,
+		"--wait", "--until", "working", "--until", "blocked", "--timeout", millis(turnWait)).CombinedOutput()
+	if err == nil {
+		return "sent", nil
+	}
+	if !bytes.Contains(out, []byte("agent_prompt_stalled")) && !bytes.Contains(out, []byte(`"timeout"`)) {
+		return string(out), fmt.Errorf("agent prompt %s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	return enterUntilWorking(socket, name, text)
+}
+
+// enterUntilWorking presses Enter on text sitting unsent in the input box
+// until a turn starts. It only ever presses it on a box holding that text: on
+// an empty one it does nothing, and on one holding someone's draft it would
+// send the draft.
+func enterUntilWorking(socket, name, text string) (string, error) {
+	for range enterAttempts {
+		if readBox(paneText(socket, name), text) != boxPending {
+			break
+		}
+		if err := SendKeys(socket, name, "Enter"); err != nil {
+			return "", err
+		}
+		if cmdAt(socket, "agent", "wait", agentRef(name), "--until", "working", "--until", "blocked", "--timeout", millis(enterWait)).Run() == nil {
+			return "sent + Enter", nil
+		}
+	}
+	return "", fmt.Errorf("%s: %w", name, ErrNoTurn)
+}
+
+func millis(d time.Duration) string { return strconv.FormatInt(d.Milliseconds(), 10) }
+
+// paneText is what an agent's pane shows, "" when it can't be read. herdr 0.9
+// prints the text as it is; older ones wrapped it in JSON.
+func paneText(socket, name string) string {
+	out, err := cmdAt(socket, "agent", "read", agentRef(name), "--source", "visible", "--format", "text").Output()
+	if err != nil {
+		return ""
+	}
+	var r struct {
+		Result struct {
+			Read struct {
+				Text string `json:"text"`
+			} `json:"read"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(out, &r) == nil {
+		return r.Result.Read.Text
+	}
+	return string(out)
+}
+
+// promptMarkerRE matches a Claude prompt line ("❯ hello", "> hello", "❯").
+var promptMarkerRE = regexp.MustCompile(`^\s*[❯>]\s?(.*)$`)
+
+// promptInput is what sits in Claude's input box, and whether a box was found.
+// The box is the last prompt line on screen; the ones above it echo messages
+// already sent.
+func promptInput(screen string) (string, bool) {
+	lines := strings.Split(screen, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if m := promptMarkerRE.FindStringSubmatch(lines[i]); m != nil {
+			return strings.TrimSpace(m[1]), true
+		}
+	}
+	return "", false
+}
+
+// boxState is what one frame says about text the deck typed. "No box in this
+// frame" has to stay apart from "the box no longer holds it": a frame read
+// mid-paint has no box, and reading that as sent is the failure Prompt exists
+// to catch.
+type boxState int
+
+const (
+	boxUnknown   boxState = iota // no input box in this frame
+	boxPending                   // the text is sitting in the box
+	boxSubmitted                 // the box is readable and doesn't hold it
+)
+
+// readBox classifies one frame. A long prompt wraps, so the box's first line
+// is a prefix of the text.
+func readBox(screen, text string) boxState {
+	input, ok := promptInput(screen)
+	switch {
+	case !ok:
+		return boxUnknown
+	case input == "":
+		return boxSubmitted
+	case strings.Contains(input, text) || strings.HasPrefix(text, input):
+		return boxPending
+	}
+	return boxSubmitted
+}
+
 // waitInteractive waits for a freshly started agent to be ready for input, and
 // reports whether it got there. herdr calls a just-spawned agent "idle" within a
 // second — long before Claude paints — so `agent wait` alone lands text in a TUI
@@ -743,10 +860,11 @@ func Start(l Launch) (paneID, out string, err error) {
 	if !waitInteractive(l.Name) {
 		return paneID, out, fmt.Errorf("%s did not finish starting within %s — open its tab, then send %q yourself", l.Name, readyTimeout, l.Submit)
 	}
-	if res, err := submit(l.Name, l.Submit); err != nil {
+	res, err := Prompt("", l.Name, l.Submit)
+	if err != nil {
 		return paneID, res, err
 	}
-	return paneID, out + " · submitted", nil
+	return paneID, out + " · " + res, nil
 }
 
 // innerArgv returns the command after the first "--" in a herd spec's args.

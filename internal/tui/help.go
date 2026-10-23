@@ -57,6 +57,7 @@ func (m Model) describe(s fleet.Session) string {
 	glyph, label, color := sessionStyle(s.Status)
 	state := glyph + " " + label
 	tail := s.Activity.Tail
+	note := m.carryNote(s, now)
 	switch {
 	case s.Status == session.Limited && tail.Err != nil:
 		state = "⊘ out of usage"
@@ -70,13 +71,14 @@ func (m Model) describe(s fleet.Session) string {
 			state += " · auto-move is off (A) — H moves it"
 		case !s.Home:
 			state += " · in the " + s.Workspace + " deck — M brings it here"
-		default:
-			if _, parked := m.parked[s.Key]; parked {
-				state += " · no account has room; it continues when the limit lifts"
-			}
+		case note != "":
+			state += " · " + note
 		}
 	case s.Status == session.Errored && tail.Err != nil:
 		state = "✗ " + firstLine(tail.Err.Text)
+		if note != "" {
+			state += " · " + note
+		}
 	case s.Status == session.NeedsInput && s.WaitingFor != "":
 		state += ": " + s.WaitingFor
 	case !s.Live:
@@ -84,6 +86,11 @@ func (m Model) describe(s fleet.Session) string {
 		if e := elapsedLabel(s.LastActive); e != "" {
 			state += ", last wrote " + e + " ago"
 		}
+		if note != "" {
+			state += " · " + note
+		}
+	case note != "":
+		state += " · " + note
 	}
 	parts = append(parts, acct+" "+lipgloss.NewStyle().Foreground(color).Render(state))
 	if s.Live && !s.Home {

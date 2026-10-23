@@ -41,6 +41,9 @@ type Backend interface {
 	// Send types text into a running session named `name` and submits it, without
 	// switching to it (fire-and-return). Used to fire a message at a session.
 	Send(name, text string) (string, error)
+	// Prompt is Send for a prompt that starts a turn: it returns once the turn
+	// is seen to start, and fails when none does (see herd.Prompt).
+	Prompt(name, text string) (string, error)
 	// Triage runs "/triage" against a ticket's session in the background —
 	// starting the session (unfocused) if it isn't running — without leaving the
 	// deck.
@@ -142,6 +145,10 @@ func (ClaudeBackend) Send(name, text string) (string, error) {
 	return "", fmt.Errorf("sending to a session requires the herdr backend")
 }
 
+func (ClaudeBackend) Prompt(name, text string) (string, error) {
+	return "", fmt.Errorf("sending to a session requires the herdr backend")
+}
+
 // CloseByName is a no-op for the built-in backend (no daemon to stop a session).
 func (ClaudeBackend) CloseByName(name string) (string, error) { return "", nil }
 
@@ -214,6 +221,19 @@ func (HerdBackend) Send(name, text string) (string, error) {
 		return "", err
 	}
 	return herd.Send(agents, name, text)
+}
+
+func (HerdBackend) Prompt(name, text string) (string, error) {
+	agents, err := herd.List()
+	if err != nil {
+		return "", err
+	}
+	for _, a := range agents {
+		if strings.EqualFold(a.Name, name) {
+			return herd.Prompt(a.Socket, a.Name, text)
+		}
+	}
+	return "", fmt.Errorf("no running session for %s", name)
 }
 
 func (HerdBackend) CloseByName(name string) (string, error) {

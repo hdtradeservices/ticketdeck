@@ -33,6 +33,9 @@ type Tail struct {
 	// window was when the session last answered.
 	ContextTokens int
 	UpdatedAt     time.Time // timestamp of the newest dated entry
+	// LastUUID is the newest assistant entry of the main conversation, reply
+	// or error. While it is a cut-off's own id, nothing has answered it.
+	LastUUID string
 }
 
 // APIError is a turn that ended on an API error instead of a reply.
@@ -139,6 +142,9 @@ func (t *Tail) apply(line []byte) (spent spend, ok bool) {
 	}
 	if l.IsSidechain {
 		return spent, ok
+	}
+	if l.UUID != "" {
+		t.LastUUID = l.UUID
 	}
 	if l.IsAPIErrorMessage {
 		e := &APIError{Kind: l.Error, At: l.Timestamp, UUID: l.UUID}

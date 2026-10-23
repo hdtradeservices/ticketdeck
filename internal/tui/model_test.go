@@ -100,6 +100,7 @@ func (fakeBackend) FocusSpec(ref session.SessionRef) session.LaunchSpec {
 func (fakeBackend) CloseSession(session.SessionRef) (string, error) { return "", nil }
 
 func (fakeBackend) Send(name, text string) (string, error)        { return "", nil }
+func (fakeBackend) Prompt(name, text string) (string, error)      { return "", nil }
 func (fakeBackend) CloseByName(name string) (string, error)       { return "", nil }
 func (fakeBackend) Triage(session.Ticket, string) (string, error) { return "", nil }
 
@@ -462,7 +463,10 @@ type recBackend struct {
 	closedByName string
 	triaged      string // ticket key
 	moves        []Move
+	moveErr      error    // what Move returns
 	keys         []string // "name:keys"
+	prompts      int
+	promptErr    error
 }
 
 func (r *recBackend) Keys(name string, keys ...string) error {
@@ -472,7 +476,7 @@ func (r *recBackend) Keys(name string, keys ...string) error {
 
 func (r *recBackend) Move(mv Move) (string, error) {
 	r.moves = append(r.moves, mv)
-	return "", nil
+	return "", r.moveErr
 }
 
 func (r *recBackend) Triage(t session.Ticket, cwd string) (string, error) {
@@ -488,6 +492,13 @@ func (r *recBackend) CloseSession(ref session.SessionRef) (string, error) {
 func (r *recBackend) Send(name, text string) (string, error) {
 	r.sent = name + ":" + text
 	return "", nil
+}
+
+// Prompt records like Send, failing with promptErr when a test sets one.
+func (r *recBackend) Prompt(name, text string) (string, error) {
+	r.sent = name + ":" + text
+	r.prompts++
+	return "", r.promptErr
 }
 
 func (r *recBackend) CloseByName(name string) (string, error) {

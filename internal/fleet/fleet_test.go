@@ -326,6 +326,52 @@ func TestAnErrorAMoveAnsweredIsTheOldAccounts(t *testing.T) {
 	}
 }
 
+// While the deck's promise to carry a session on is still open, the cut-off
+// belongs to the account named in it: copied to another account by a move,
+// it says nothing about that one; on the account that ran out it still holds.
+func TestAPromisedCutOffIsTheAccountItCameFroms(t *testing.T) {
+	a := setup(t, "matt", "m0")
+	id := session.DeterministicID("ZEN-8")
+	limit := `{"type":"assistant","timestamp":"2026-10-21T14:05:00Z","uuid":"e1","isApiErrorMessage":true,"error":"rate_limit","quotaLimits":{"resetsAt":` + strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10) + `,"rateLimitType":"five_hour"},"message":{"model":"<synthetic>","content":[{"type":"text","text":"limit"}]}}`
+	stamp(t, a.dir("matt"), id, time.Now(), limit)
+	world{
+		agents: map[string][]herd.Agent{"": {{Name: "ZEN-8", AgentStatus: "idle", PaneID: "w1:p2"}}},
+		procs:  map[string][]session.Proc{a.dir("matt"): {{PID: 7, SessionID: id, ConfigDir: a.dir("matt"), HerdrSocket: "/h/.config/herdr/herdr.sock", HerdrPane: "w1:p2"}}},
+	}.install(t)
+	for _, c := range []struct {
+		from string
+		want session.Status
+	}{{"m0", session.Idle}, {"matt", session.Limited}} {
+		in := input(a, "ZEN-8")
+		in.Ledger = map[string]ledger.Entry{id: {SessionID: id, Account: "matt", Carry: &ledger.Carry{Err: "e1", From: c.from}}}
+		snap := Poll(in)
+		if s := best(t, snap, "ZEN-8"); s.Status != c.want {
+			t.Errorf("cut off on %s, running on matt: status = %v, want %v", c.from, s.Status, c.want)
+		}
+		if until, _ := snap.Limits(time.Now()); until["matt"].IsZero() != (c.from != "matt") {
+			t.Errorf("cut off on %s: matt limited until %v", c.from, until["matt"])
+		}
+	}
+}
+
+// A stopped session the deck promised to carry on has its transcript read, so
+// the deck can tell whether it already has.
+func TestAStoppedPromisedSessionIsRead(t *testing.T) {
+	a := setup(t, "matt", "m0")
+	world{}.install(t)
+	id := session.DeterministicID("ZEN-8")
+	limit := `{"type":"assistant","timestamp":"2026-10-21T14:05:00Z","uuid":"e1","isApiErrorMessage":true,"error":"rate_limit","message":{"model":"<synthetic>","content":[{"type":"text","text":"limit"}]}}`
+	stamp(t, a.dir("m0"), id, time.Now(), limit)
+	in := input(a, "ZEN-8")
+	if s := best(t, Poll(in), "ZEN-8"); s.Live || s.Activity.Tail.LastUUID != "" {
+		t.Fatalf("without a promise a stopped session isn't read: %+v", s.Activity.Tail)
+	}
+	in.Ledger = map[string]ledger.Entry{id: {SessionID: id, Carry: &ledger.Carry{Err: "e1", From: "m0"}}}
+	if s := best(t, Poll(in), "ZEN-8"); s.Activity.Tail.LastUUID != "e1" {
+		t.Errorf("LastUUID = %q, want the cut-off it still ends on", s.Activity.Tail.LastUUID)
+	}
+}
+
 // A limit puts up Claude's what-now menu, which herdr reads as a prompt. The
 // session is cut off all the same, and the deck has to know a dialog is up
 // before it types anything there.

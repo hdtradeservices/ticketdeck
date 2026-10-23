@@ -3,7 +3,6 @@ package tui
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -26,34 +25,12 @@ import (
 // conversation when it changes account, start it again here with --resume.
 // What carries over is the conversation, not the process — a background task
 // it had running stops with it — so the deck only moves a session on its own
-// once its turn is over.
-
-// The prompts a session gets when the deck sets it going again on its own.
-// They say what happened, because the session's last memory is an error.
-const (
-	continueAfterMove  = "Your last turn was cut off because the account running this session hit its usage limit. The session has moved to another account with room. Please continue where you left off."
-	continueAfterLogin = "Your last turn was cut off because the account running this session lost its login. The session has moved to another account. Please continue where you left off."
-	continueAfterReset = "The usage limit that cut off your last turn has reset. Please continue where you left off."
-	lostBackgroundWork = " Background tasks that were still running when the session stopped did not survive the move — re-run any you still need."
-)
+// once its turn is over. The moves the deck makes on its own are steps in
+// keeping a promise (carry.go).
 
 // notify tells the user about something the deck did on its own; tests
 // replace it.
 var notify = herd.Notify
-
-// resetGrace is how long after a limit's stated reset the deck waits before
-// telling a session to continue: the reset is the server's estimate, and a
-// prompt sent a few seconds early is refused all over again. resumeWindow is
-// how long after the reset it still does it — a session cut off yesterday and
-// left alone since was left alone on purpose.
-const (
-	resetGrace   = time.Minute
-	resumeWindow = 30 * time.Minute
-)
-
-// dismissBeat is how long a dismissed menu gets to clear before a prompt is
-// typed where it was.
-var dismissBeat = time.Second
 
 // moveDoneMsg is the result of moving a session.
 type moveDoneMsg struct {
@@ -62,34 +39,39 @@ type moveDoneMsg struct {
 	from, to   string // account names
 	auto       bool   // the deck moved it on its own
 	adopt      bool   // brought in from another deck's workspace
+	carry      bool   // a step in keeping a promise, which sees the session told
 	// blocked: it moved, but stopped at a prompt of its own on the way up — a
 	// folder it hasn't trusted on that account, say — so it needs the user in
 	// its tab before anything can be sent to it. pending is what to send then.
 	blocked bool
+	// untold: it moved, but the prompt sent after it never started a turn.
+	untold  bool
 	pending string
 	why     string
 	err     error
 	out     string
 }
 
-// continuedMsg is the result of telling a session to continue in place.
+// continuedMsg is the result of telling a session to carry on.
 type continuedMsg struct {
 	key         string
 	err         error
-	afterPrompt bool   // it was held for a startup prompt the user has answered
-	errUUID     string // the cut-off it answered, to try again if it failed
+	afterPrompt bool // it was held for a startup prompt the user has answered
 }
 
-// retryContinue is how long a continue that failed waits before the next try.
-const retryContinue = time.Minute
-
 type moveOpts struct {
-	why     string
-	submit  string
-	auto    bool
-	adopt   bool
-	focus   bool
-	errUUID string // the API error this move answers, recorded so it is acted on once
+	why    string
+	submit string
+	auto   bool
+	adopt  bool
+	focus  bool
+	// start: a session that isn't running is started on the account, not only
+	// copied there.
+	start bool
+	// carry is the cut-off whose promise this move keeps; errUUID is one a move
+	// by hand answers outright, recorded so it is acted on once.
+	carry   string
+	errUUID string
 }
 
 // ticketFor rebuilds a session's identity — what its launch seeds — from the
@@ -126,20 +108,23 @@ func (m Model) sessionAccount(s fleet.Session) account.Account {
 }
 
 // moveCmd moves one session to an account. A session that isn't running is
-// only copied: the next open resumes it where it now lives, and starting it on
-// the user's behalf is not what they asked for.
+// only copied unless o.start says to start it: the next open resumes it where
+// it now lives, and starting it on the user's behalf is not what they asked
+// for.
 func (m Model) moveCmd(s fleet.Session, to account.Account, o moveOpts) tea.Cmd {
 	from := m.sessionAccount(s)
 	t := m.ticketFor(s)
-	if from.ConfigDir != to.ConfigDir {
+	if from.ConfigDir != to.ConfigDir || !s.Live {
 		// Accounts drift apart in their settings; a session halfway through a
 		// task keeps the model it started on, not the new account's default.
 		t.Model = s.Activity.Tail.Model
 	}
 	label := m.sessionLabel(s)
+	// A stopped session starts where it was first started: that is where
+	// `claude --resume` finds its conversation.
 	mv := Move{
 		Name: s.Key, From: from, To: to, Ticket: t,
-		Cwd: firstNonEmpty(s.Cwd, m.root), Focus: o.focus, Submit: o.submit,
+		Cwd: firstNonEmpty(s.Cwd, m.ledger[s.ID].Cwd, m.root), Focus: o.focus, Submit: o.submit,
 	}
 	if s.Live {
 		mv.Socket, mv.PaneID, mv.PID = s.Socket, s.PaneID, s.PID
@@ -151,10 +136,11 @@ func (m Model) moveCmd(s fleet.Session, to account.Account, o moveOpts) tea.Cmd 
 	}
 	backend := m.backend
 	key, id := s.Key, s.ID
+	start := s.Live || o.start
 	return func() tea.Msg {
 		var out string
 		var err error
-		if s.Live {
+		if start {
 			out, err = backend.Move(mv)
 		} else if from.ConfigDir != to.ConfigDir {
 			err = account.CopySession(from, to, t.ID(), label)
@@ -162,16 +148,19 @@ func (m Model) moveCmd(s fleet.Session, to account.Account, o moveOpts) tea.Cmd 
 		if errors.Is(err, account.ErrNoSession) {
 			err = nil // nothing written yet: there is nothing to carry over
 		}
-		msg := moveDoneMsg{key: key, label: label, from: from.Name, to: to.Name, auto: o.auto, adopt: o.adopt, why: o.why, out: out}
-		if errors.Is(err, herd.ErrBlockedAtStart) {
+		msg := moveDoneMsg{key: key, label: label, from: from.Name, to: to.Name, auto: o.auto, adopt: o.adopt, carry: o.carry != "", why: o.why, out: out}
+		switch {
+		case errors.Is(err, herd.ErrBlockedAtStart):
 			msg.blocked, msg.pending, err = true, o.submit, nil
+		case errors.Is(err, herd.ErrNoTurn):
+			msg.untold, msg.pending, err = true, o.submit, nil
 		}
 		msg.err = err
 		if err != nil {
 			return msg
 		}
 		msg.newKey = mv.NewName
-		if s.Live {
+		if start {
 			fleet.MarkLaunch(to.ConfigDir)
 		}
 		_ = ledger.Update(id, func(e *ledger.Entry) {
@@ -184,6 +173,9 @@ func (m Model) moveCmd(s fleet.Session, to account.Account, o moveOpts) tea.Cmd 
 			}
 			if o.errUUID != "" {
 				e.Handled = o.errUUID
+			}
+			if o.carry != "" && o.submit != "" && start && !msg.blocked && !msg.untold {
+				told(e, o.carry)
 			}
 		})
 		return msg
@@ -210,97 +202,6 @@ func (m Model) sessionLabel(s fleet.Session) string {
 	return truncCols(firstNonEmpty(s.Name, s.Key), 40)
 }
 
-// continuePrompt is what an automatically moved session is told.
-func continuePrompt(s fleet.Session) string {
-	p := continueAfterMove
-	if s.Activity.Tail.Err.AuthFailed() {
-		p = continueAfterLogin
-	}
-	if s.Activity.InFlight.Any() {
-		p += lostBackgroundWork
-	}
-	if custom := strings.TrimSpace(os.Getenv("TICKETDECK_CONTINUE_PROMPT")); custom != "" {
-		p = custom
-	}
-	return p
-}
-
-// autoMoves acts on the sessions in this workspace that their account's usage
-// limit cut off: each moves to the account the router ranks best and is told to
-// continue. When no account has room it waits, and once the limit lifts it is
-// told to continue where it is. Each cut-off is acted on once — recorded here
-// and in the ledger, so a restarted deck doesn't act on it again.
-//
-// Only a session whose turn is over is touched: the limit ended the turn, so
-// nothing is in flight to lose. A session someone has since typed into is
-// working again and is left alone.
-func (m *Model) autoMoves(now time.Time) []tea.Cmd {
-	if !m.settings.autoMove() || m.demo || !m.backend.Herdr() || m.dry {
-		return nil
-	}
-	var cmds []tea.Cmd
-	cands := m.candidates()
-	for _, s := range m.fleet.Sessions {
-		tail := s.Activity.Tail
-		e := tail.Err
-		// Claude's what-now menu after a limit reads as a prompt; the turn is
-		// over all the same.
-		over := s.Status.Waiting() || (s.Status == session.NeedsInput && e.RateLimited())
-		if !s.Live || !s.Home || m.moving[s.Key] || !over {
-			continue
-		}
-		cutOff := e.RateLimited() || e.AuthFailed()
-		if !cutOff || e.UUID == "" || m.handled[e.UUID] || m.ledger[s.ID].Handled == e.UUID {
-			continue
-		}
-		if now.Before(m.retryAt[e.UUID]) {
-			continue
-		}
-		// A lapsed login has no reset to wait for: only a move gets it going.
-		if e.RateLimited() && !tail.Limited(now) {
-			// The limit lifted while it waited.
-			if !e.ResetsAt.IsZero() && now.Before(e.ResetsAt.Add(resetGrace)) {
-				continue
-			}
-			if !e.ResetsAt.IsZero() && now.Sub(e.ResetsAt) > resumeWindow {
-				m.handled[e.UUID] = true // too old to revive on its own
-				continue
-			}
-			m.handled[e.UUID] = true
-			cmds = append(cmds, m.continueCmd(s, e.UUID))
-			continue
-		}
-		d := route.Pick(cands, route.Request{Exclude: s.Account, Now: now})
-		to, ok := m.accountByName(d.Account)
-		if !ok {
-			if _, noted := m.parked[s.Key]; !noted {
-				m.notice = fmt.Sprintf("%s is out on ⦿%s — %s; it continues when the limit lifts", m.sessionLabel(s), s.Account, d.Why)
-				notify(m.sessionLabel(s)+" is waiting on a usage limit", d.Why)
-			}
-			m.parked[s.Key] = e.ResetsAt
-			continue
-		}
-		delete(m.parked, s.Key)
-		m.handled[e.UUID] = true
-		m.moving[s.Key] = true
-		for i := range cands {
-			if cands[i].Name == to.Name {
-				// Spread a burst of cut-offs instead of piling them on one account:
-				// each is told to carry on, so it lands busy.
-				cands[i].Live++
-				cands[i].Load++
-			}
-		}
-		why := fmt.Sprintf("⦿%s hit its %s limit", s.Account, limitName(e.LimitType))
-		if e.AuthFailed() {
-			why = fmt.Sprintf("⦿%s's login expired", s.Account)
-		}
-		m.notice = fmt.Sprintf("%s: %s — moving it to ⦿%s and carrying on…", m.sessionLabel(s), why, to.Name)
-		cmds = append(cmds, m.moveCmd(s, to, moveOpts{auto: true, why: why, submit: continuePrompt(s), errUUID: e.UUID}))
-	}
-	return cmds
-}
-
 // limitName turns a rate-limit type into words.
 func limitName(t string) string {
 	switch t {
@@ -314,52 +215,54 @@ func limitName(t string) string {
 	return strings.ReplaceAll(t, "_", " ")
 }
 
-// continueCmd tells a session whose limit has lifted to carry on, where it is.
-// The menu Claude put up when the limit hit is dismissed first: herdr won't
-// type into a session showing one, and it shouldn't.
-func (m Model) continueCmd(s fleet.Session, errUUID string) tea.Cmd {
-	backend, key, id, prompting := m.backend, s.Key, s.ID, s.Prompting
-	return func() tea.Msg {
-		if prompting {
-			if err := backend.Keys(key, "esc"); err != nil {
-				return continuedMsg{key: key, err: err, errUUID: errUUID}
-			}
-			time.Sleep(dismissBeat)
-		}
-		_, err := backend.Send(key, continueAfterReset)
-		if err == nil {
-			_ = ledger.Update(id, func(e *ledger.Entry) { e.Handled = errUUID })
-		}
-		return continuedMsg{key: key, err: err, errUUID: errUUID}
-	}
-}
-
 // handleMoveDone reports a finished move and refreshes the picture.
 func (m Model) handleMoveDone(msg moveDoneMsg) (tea.Model, tea.Cmd) {
 	delete(m.moving, msg.key)
+	now := time.Now()
+	m.stepDone[msg.key] = now
+	if msg.newKey != "" {
+		m.stepDone[msg.newKey] = now
+	}
 	m.ledger = ledger.Load()
 	if msg.err != nil {
 		debugLog.Printf("move %s %s → %s failed: %v (%s)", msg.label, msg.from, msg.to, msg.err, msg.out)
 		m.err = fmt.Errorf("moving %s: %v", msg.label, msg.err)
 		m.notice = ""
-		if msg.auto {
+		switch {
+		case msg.carry:
+			// Whatever it got through, the promise picks up from there.
+			wait := m.retryLater(msg.key, msg.err)
+			m.err = fmt.Errorf("moving %s: %v — trying again in %s", msg.label, msg.err, wait)
+		case msg.auto:
 			notify("Couldn't move "+msg.label, msg.err.Error())
 		}
 		return m, m.refreshStatuses()
 	}
 	debugLog.Printf("move %s %s → %s ok (auto=%v adopt=%v blocked=%v): %s", msg.label, msg.from, msg.to, msg.auto, msg.adopt, msg.blocked, msg.out)
 	m.err = nil
+	delete(m.fails, msg.key)
 	if msg.blocked {
 		// It is running on the new account but stopped at a prompt of its own.
-		// What it was to be told waits until someone answers that.
-		if msg.pending != "" {
+		// What it was to be told waits until someone answers that — and a
+		// promise tells it then on its own.
+		if msg.pending != "" && !msg.carry {
 			m.pendingSend[firstNonEmpty(msg.newKey, msg.key)] = msg.pending
 		}
 		m.notice = fmt.Sprintf("%s moved ⦿%s → ⦿%s but stopped at a prompt in its tab — answer it there and it carries on", msg.label, msg.from, msg.to)
 		notify(msg.label+" needs you in its tab", "It moved to ⦿"+msg.to+" and stopped at a startup prompt")
 		return m, m.refreshStatuses()
 	}
+	if msg.untold {
+		if msg.pending != "" && !msg.carry {
+			m.pendingSend[firstNonEmpty(msg.newKey, msg.key)] = msg.pending
+		}
+		m.notice = fmt.Sprintf("%s moved ⦿%s → ⦿%s, but telling it to carry on didn't start a turn — trying again", msg.label, msg.from, msg.to)
+		return m, m.refreshStatuses()
+	}
 	switch {
+	case msg.auto && msg.from == msg.to:
+		m.notice = fmt.Sprintf("%s started again on ⦿%s and is carrying on", msg.label, msg.to)
+		notify(msg.label+" is carrying on", "It had stopped while it waited on ⦿"+msg.to+"'s limit")
 	case msg.auto:
 		m.notice = fmt.Sprintf("%s moved ⦿%s → ⦿%s and is carrying on (%s)", msg.label, msg.from, msg.to, msg.why)
 		notify(msg.label+" moved to ⦿"+msg.to, msg.why+" — it is carrying on there")
@@ -425,9 +328,15 @@ func (m Model) confirmHandoff(i int) (tea.Model, tea.Cmd) {
 	m.notice = fmt.Sprintf("moving %s to ⦿%s…", m.sessionLabel(s), to.Name)
 	o := moveOpts{why: "moved by hand", adopt: s.Live && !s.Home}
 	// A session parked on a limit was cut off mid-task: moving it is the
-	// whole point, and it should pick the task back up.
-	if s.Activity.Tail.Err.RateLimited() {
-		o.submit, o.errUUID = continuePrompt(s), s.Activity.Tail.Err.UUID
+	// whole point, and it should pick the task back up. When the deck has
+	// promised that already, the promise sees it through.
+	if e := s.Activity.Tail.Err; e.RateLimited() {
+		o.submit = continuePrompt(s)
+		if c := m.ledger[s.ID].Carry; c != nil && c.Err == e.UUID {
+			o.carry = c.Err
+		} else {
+			o.errUUID = e.UUID
+		}
 	}
 	return m, m.moveCmd(s, to, o)
 }
@@ -559,7 +468,7 @@ func (m *Model) sendPending() []tea.Cmd {
 		delete(m.pendingSend, key)
 		backend := m.backend
 		cmds = append(cmds, func() tea.Msg {
-			_, err := backend.Send(key, text)
+			_, err := backend.Prompt(key, text)
 			return continuedMsg{key: key, err: err, afterPrompt: true}
 		})
 	}

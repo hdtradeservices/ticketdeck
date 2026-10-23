@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/hdtradeservices/ticketdeck/internal/account"
 	"github.com/hdtradeservices/ticketdeck/internal/fleet"
+	"github.com/hdtradeservices/ticketdeck/internal/herd"
 	"github.com/hdtradeservices/ticketdeck/internal/ledger"
 	"github.com/hdtradeservices/ticketdeck/internal/quota"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
@@ -97,8 +97,8 @@ func TestAutoMoveCarriesALimitedSessionOn(t *testing.T) {
 	if mv.Focus {
 		t.Error("an automatic move must not steal focus")
 	}
-	if e := ledger.Load()[s.ID]; e.Handled != "err-ZEN-9" || e.Account != "support" {
-		t.Errorf("ledger = %+v, want the error recorded as handled and the new account", e)
+	if e := ledger.Load()[s.ID]; e.Carry == nil || e.Carry.Err != "err-ZEN-9" || e.Carry.Told.IsZero() || e.Account != "support" {
+		t.Errorf("ledger = %+v, want the promise, told, and the new account", e)
 	}
 
 	// The same cut-off seen again — the next poll, or a restarted deck — is
@@ -153,11 +153,12 @@ func TestAutoMoveWaitsThenContinuesInPlace(t *testing.T) {
 	if len(rec.moves) != 0 {
 		t.Fatalf("moved with nowhere to go: %+v", rec.moves)
 	}
-	if _, parked := m.parked["ZEN-9"]; !parked || !strings.Contains(m.notice, "continues when the limit lifts") {
+	if _, parked := m.parked["ZEN-9"]; !parked || !strings.Contains(m.notice, "carries on when the limit lifts") {
 		t.Errorf("parked=%v notice=%q", m.parked, m.notice)
 	}
 
 	// The limit lifted a few minutes ago: carry on, in place.
+	m = lapse(t, m, s.ID, -5*time.Minute)
 	s.Activity.Tail.Err.ResetsAt = time.Now().Add(-5 * time.Minute)
 	s.Status = session.Idle
 	_, cmd = poll(t, m, s)
@@ -165,6 +166,35 @@ func TestAutoMoveWaitsThenContinuesInPlace(t *testing.T) {
 	if rec.sent != "ZEN-9:"+continueAfterReset {
 		t.Errorf("sent %q, want the continue prompt", rec.sent)
 	}
+}
+
+// finish runs a poll's commands and hands the deck back the moves and tells
+// they finished, the way the program loop would.
+func finish(t *testing.T, m Model, cmd tea.Cmd) Model {
+	t.Helper()
+	for _, msg := range drainCmd(cmd) {
+		switch msg.(type) {
+		case moveDoneMsg, continuedMsg:
+			next, _ := m.Update(msg)
+			m = next.(Model)
+		}
+	}
+	return m
+}
+
+// lapse moves a promise's reset to `by` from now, the way the clock would.
+func lapse(t *testing.T, m Model, id string, by time.Duration) Model {
+	t.Helper()
+	if err := ledger.Update(id, func(e *ledger.Entry) {
+		if e.Carry == nil {
+			t.Fatalf("no promise for %s", id)
+		}
+		e.Carry.ResetsAt = time.Now().Add(by)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.ledger = ledger.Load()
+	return m
 }
 
 // A cut-off from yesterday that someone left alone was left alone on purpose.
@@ -639,22 +669,22 @@ func TestAFailedContinueIsRetried(t *testing.T) {
 	}
 	s := limitedOn(m, "ZEN-9", "m0", time.Now().Add(-5*time.Minute))
 	s.Status = session.Idle
-	m, _ = poll(t, m, s)
-	if !m.handled[s.Activity.Tail.Err.UUID] {
+	rec.promptErr = herd.ErrNoTurn
+	m, cmd := poll(t, m, s)
+	if !m.telling["ZEN-9"] {
 		t.Fatal("the reset should have been acted on")
 	}
-	next, _ := m.Update(continuedMsg{key: "ZEN-9", err: errors.New("agent_prompt_stalled"), errUUID: s.Activity.Tail.Err.UUID})
-	m = next.(Model)
-	if m.handled[s.Activity.Tail.Err.UUID] {
-		t.Fatal("a failed continue must not count as handled")
+	m = finish(t, m, cmd)
+	if e := m.ledger[s.ID]; e.Carry == nil || !e.Carry.Told.IsZero() {
+		t.Fatalf("a failed continue must leave the promise open and untold: %+v", e.Carry)
 	}
-	rec.sent = ""
-	m, cmd := poll(t, m, s)
+	rec.sent, rec.promptErr = "", nil
+	m, cmd = poll(t, m, s)
 	drainCmd(cmd)
 	if rec.sent != "" {
 		t.Error("retried before the wait was up")
 	}
-	m.retryAt[s.Activity.Tail.Err.UUID] = time.Now().Add(-time.Second)
+	m.retryAt["ZEN-9"] = time.Now().Add(-time.Second)
 	_, cmd = poll(t, m, s)
 	drainCmd(cmd)
 	if rec.sent != "ZEN-9:"+continueAfterReset {

@@ -52,6 +52,9 @@ func TestTailSeesARateLimitAndItsReset(t *testing.T) {
 	if tail.Err.LimitType != "five_hour" || tail.Err.UUID != "e1" {
 		t.Errorf("limit = %+v", tail.Err)
 	}
+	if tail.LastUUID != "e1" {
+		t.Errorf("LastUUID = %q, want the cut-off's own id while nothing has answered it", tail.LastUUID)
+	}
 	if !tail.Limited(time.Unix(1792630200-60, 0)) {
 		t.Error("a limit that resets in a minute is still in force")
 	}
@@ -71,8 +74,12 @@ func TestTailSeesARateLimitAndItsReset(t *testing.T) {
 
 	// A real reply after the limit means the session got going again.
 	writeLines(t, path, strings.Replace(replyLine, "r1", "r2", 1))
-	if tail := TailOf(cfg, id); tail.Err != nil {
+	tail = TailOf(cfg, id)
+	if tail.Err != nil {
 		t.Errorf("a reply after the error must clear it, got %+v", tail.Err)
+	}
+	if tail.LastUUID != "r2" {
+		t.Errorf("LastUUID = %q, want the reply that answered the cut-off", tail.LastUUID)
 	}
 }
 

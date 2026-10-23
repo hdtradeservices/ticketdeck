@@ -1051,6 +1051,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			debugLog.Printf("%s ok — output: %s", msg.action, msg.output)
 			m.notice = msg.action + " ✓"
 		}
+		m.ledger = ledger.Load()
 		return m, m.refreshStatuses()
 
 	case statusWriteMsg:
@@ -1847,8 +1848,14 @@ func (m Model) closeSession(s session.SessionRef) (tea.Model, tea.Cmd) {
 	}
 	m.notice = "closing " + s.Name + "…"
 	backend := m.backend
+	// An ad-hoc session stays listed as stopped while the ledger remembers it,
+	// so one x would only dim the row. Closing it forgets it too.
+	scratch := s.SessionID != "" && m.ledger[s.SessionID].Kind == ledger.Scratch
 	return m, func() tea.Msg {
 		out, err := backend.CloseSession(s)
+		if err == nil && scratch {
+			_ = ledger.Update(s.SessionID, func(e *ledger.Entry) { e.Forgotten = true })
+		}
 		return detachedDoneMsg{action: "closed " + s.Name, err: err, output: strings.TrimSpace(out)}
 	}
 }

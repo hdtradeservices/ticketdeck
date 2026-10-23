@@ -863,6 +863,41 @@ func TestOtherSessionsSectionCloseAndScratch(t *testing.T) {
 	}
 }
 
+// One x on a live ad-hoc session removes its row: closing it forgets it, so
+// the deck doesn't list it again as a stopped session.
+func TestCloseScratchSessionForgetsIt(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	const id = "11111111-2222-3333-4444-555555555555"
+	if err := ledger.Update(id, func(e *ledger.Entry) { e.Kind = ledger.Scratch; e.Key = "scratch-notes" }); err != nil {
+		t.Fatal(err)
+	}
+	rec := &recBackend{}
+	m := New(fakeFetcher{fixture()}, "", true, rec)
+	m.ledger = ledger.Load()
+	next, _ := m.Update(refreshedMsg{issues: fixture()})
+	m = next.(Model)
+	next, _ = m.Update(sessionsMsg{sessions: []session.SessionRef{{Name: "scratch-notes", Status: session.Idle, Ref: "w1:p9", SessionID: id}}})
+	m = next.(Model)
+	next, _ = m.Update(runes("G"))
+	m = next.(Model)
+	next, cmd := m.Update(runes("x"))
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("x should return a close command")
+	}
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	if rec.closed != "scratch-notes" {
+		t.Errorf("expected close of scratch-notes, got %q", rec.closed)
+	}
+	if !ledger.Load()[id].Forgotten {
+		t.Error("closing an ad-hoc session should forget it")
+	}
+	if !m.ledger[id].Forgotten {
+		t.Error("the deck should reload the ledger after a close")
+	}
+}
+
 func TestWorkingTicketDeEmphasized(t *testing.T) {
 	m := loaded(t)
 	is := linear.Issue{Identifier: "ZEN-9", Title: "thing", Priority: 1}

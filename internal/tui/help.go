@@ -188,7 +188,7 @@ var helpText = []struct{ key, what string }{
 	{"M", "bring in sessions still running in the old per-account decks"},
 	{"n", "new ad-hoc session — name it, pick its account with tab"},
 	{"R", "rename an ad-hoc session (Other sessions rows)"},
-	{"x", "close an Other sessions row (its conversation stays resumable)"},
+	{"x", "close an Other sessions row (an ad-hoc one drops off; its conversation stays on disk)"},
 	{"C", "compact the session's conversation now, with an optional focus (it must be idle)"},
 	{"] [", "jump to the next / previous session waiting on you"},
 	{"", "Badges"},

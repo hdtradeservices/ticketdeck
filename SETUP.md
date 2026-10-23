@@ -100,8 +100,8 @@ An **"Other sessions"** section at the bottom lists live Claude sessions not sho
 ticket badge — ad-hoc `n` sessions and sessions for tickets that dropped off the list
 (Done/Cancelled) — plus sessions in older decks' workspaces, and the ad-hoc sessions the
 deck remembers that aren't running. With the cursor on one: `Enter` switches to it (brings
-it in, or resumes it), **`x` closes it** (its transcript persists, so it stays resumable;
-`x` on a stopped one forgets it), **`R` renames it**, `H` moves it to another account.
+it in, or resumes it), **`x` closes it** (its transcript persists; an ad-hoc one also drops off
+the deck, running or stopped), **`R` renames it**, `H` moves it to another account.
 | quit | `q` (standalone) — **under the `deck` launcher `q` is disabled** so it can't orphan the deck; leave herdr with `Ctrl+b q` (detach, keeps sessions running), or `Ctrl+c` as a hard exit |
 
 **Icons / badges:**
@@ -307,8 +307,8 @@ then opens the session under its own id. The deck remembers it in
 restart it is listed under Other sessions as resumable, by name, on the
 account it ran on. `R` renames one: the deck's name for it, its herdr agent
 name and tab, and Claude's own title (so `/resume` lists it the same way). `x`
-closes a running one; `x` on a stopped one forgets it (its conversation stays on
-disk).
+closes it and the deck forgets it, running or stopped (its conversation stays on
+disk for `claude --resume`).
 
 An ad-hoc session Claude has titled shows that title until you name it.
 

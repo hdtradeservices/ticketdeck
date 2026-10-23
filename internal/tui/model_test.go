@@ -868,12 +868,12 @@ func TestOtherSessionsSectionCloseAndScratch(t *testing.T) {
 func TestCloseScratchSessionForgetsIt(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	const id = "11111111-2222-3333-4444-555555555555"
+	rec := &recBackend{}
+	m := New(fakeFetcher{fixture()}, "", true, rec)
+	// Written after the deck loaded its ledger, as another deck would.
 	if err := ledger.Update(id, func(e *ledger.Entry) { e.Kind = ledger.Scratch; e.Key = "scratch-notes" }); err != nil {
 		t.Fatal(err)
 	}
-	rec := &recBackend{}
-	m := New(fakeFetcher{fixture()}, "", true, rec)
-	m.ledger = ledger.Load()
 	next, _ := m.Update(refreshedMsg{issues: fixture()})
 	m = next.(Model)
 	next, _ = m.Update(sessionsMsg{sessions: []session.SessionRef{{Name: "scratch-notes", Status: session.Idle, Ref: "w1:p9", SessionID: id}}})

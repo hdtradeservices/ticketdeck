@@ -1051,6 +1051,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			debugLog.Printf("%s ok — output: %s", msg.action, msg.output)
 			m.notice = msg.action + " ✓"
 		}
+		if !m.demo {
+			m.ledger = ledger.Load()
+		}
 		return m, m.refreshStatuses()
 
 	case statusWriteMsg:
@@ -1539,10 +1542,15 @@ func (m Model) forgetSession(ref session.SessionRef) (tea.Model, tea.Cmd) {
 	if ref.SessionID == "" {
 		return m, nil
 	}
-	_ = ledger.Update(ref.SessionID, func(e *ledger.Entry) { e.Forgotten = true })
+	_ = forget(ref.SessionID)
 	m.ledger = ledger.Load()
 	m.notice = "forgot " + firstNonEmpty(ref.Title, ref.Name) + " (its conversation stays on disk)"
 	return m, m.refreshStatuses()
+}
+
+// forget hides an ad-hoc session from the deck until it is launched again.
+func forget(id string) error {
+	return ledger.Update(id, func(e *ledger.Entry) { e.Forgotten = true })
 }
 
 // updateConflict handles the "another deck is running this" gate. Cancel is the
@@ -1777,6 +1785,7 @@ func recordLaunch(spec session.LaunchSpec) {
 			e.Account, e.ConfigDir = spec.Account, spec.ConfigDir
 		}
 		e.Cwd = firstNonEmpty(e.Cwd, spec.Cwd)
+		e.Forgotten = false
 		if e.Started.IsZero() {
 			e.Started = time.Now()
 		}
@@ -1846,9 +1855,17 @@ func (m Model) closeSession(s session.SessionRef) (tea.Model, tea.Cmd) {
 		m.endPromise(s.SessionID)
 	}
 	m.notice = "closing " + s.Name + "…"
-	backend := m.backend
+	backend, demo := m.backend, m.demo
 	return m, func() tea.Msg {
 		out, err := backend.CloseSession(s)
+		// An ad-hoc session stays listed as stopped while the ledger remembers
+		// it, so one x would only dim the row. Closing it forgets it too. Read
+		// the kind from disk: another deck may have started it.
+		if err == nil && !demo && s.SessionID != "" && ledger.Load()[s.SessionID].Kind == ledger.Scratch {
+			if ferr := forget(s.SessionID); ferr != nil {
+				debugLog.Printf("forgetting closed %s failed: %v", s.Name, ferr)
+			}
+		}
 		return detachedDoneMsg{action: "closed " + s.Name, err: err, output: strings.TrimSpace(out)}
 	}
 }

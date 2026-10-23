@@ -79,7 +79,7 @@ ticketdeck --demo --dump        # plain-text grouped list
 | accounts: usage, sessions, pin new sessions to one, auto-move on/off | `A` |
 | bring in the sessions still running in older per-account decks | `M` |
 | open an ad-hoc (non-ticket) session — name it, pick its account with `Tab` | `n` |
-| rename an ad-hoc session · close it (`x` again on a stopped one forgets it) | `R` · `x` |
+| rename an ad-hoc session · close it (an ad-hoc one also drops off the deck) | `R` · `x` |
 | jump to the next / previous session waiting on you (unfolds what hides it) | `]` · `[` |
 | fold/unfold a priority section, the **Projects** section, or one project's tickets | `Space` · `←`/`→` |
 | every key · refresh · quit | `?` · `r` · `q` |

@@ -98,6 +98,9 @@ type Snapshot struct {
 	// session its registry lists — the deck's or not, interactive or
 	// background — plus launches too recent to be listed yet.
 	Load map[string]float64
+	// Refused is when each account's usage limit lifts, as the ledger
+	// remembers it from cut-offs whose sessions may have moved on since.
+	Refused map[string]time.Time
 }
 
 // The outside world, in vars so tests can drive a poll without herdr, without
@@ -119,7 +122,14 @@ func Poll(in Input) Snapshot {
 	if in.Now.IsZero() {
 		in.Now = time.Now()
 	}
-	snap := Snapshot{At: in.Now, Load: map[string]float64{}}
+	snap := Snapshot{At: in.Now, Load: map[string]float64{}, Refused: map[string]time.Time{}}
+	for _, e := range in.Ledger {
+		for _, r := range e.Refused {
+			if in.Now.Before(r.Until) && r.Until.After(snap.Refused[r.Account]) {
+				snap.Refused[r.Account] = r.Until
+			}
+		}
+	}
 
 	// Registries first: they are what ties a pane to an account.
 	type paneKey struct{ socket, pane string }
@@ -435,6 +445,18 @@ func settle(st session.Status, a session.Activity, now time.Time) session.Status
 	if st == session.NeedsInput && a.Tail.Limited(now) {
 		return session.Limited
 	}
+	// "Working" can be nothing but agents winding down: a lead stopped on its
+	// cut-off is stopped all the same, and its agents share the account. Read
+	// as working, a session with a dozen of them sat out a limit for minutes
+	// with another account free (2026-10-28).
+	if st == session.Working && a.Tail.Stopped() {
+		switch {
+		case a.Tail.Limited(now):
+			return session.Limited
+		case a.Tail.Err.AuthFailed():
+			return session.Errored
+		}
+	}
 	if st != session.Idle && st != session.Unread {
 		return st
 	}
@@ -617,9 +639,15 @@ func (s Snapshot) LiveOn() map[string]int {
 }
 
 // Limits is what the running sessions say about their accounts: when a usage
-// limit that refused one lifts, and which accounts' logins have lapsed.
+// limit that refused one lifts, and which accounts' logins have lapsed. A
+// session that has moved on still says so through the ledger.
 func (s Snapshot) Limits(now time.Time) (until map[string]time.Time, authFailed map[string]bool) {
 	until, authFailed = map[string]time.Time{}, map[string]bool{}
+	for a, t := range s.Refused {
+		if now.Before(t) {
+			until[a] = t
+		}
+	}
 	for _, c := range s.Sessions {
 		e := c.Activity.Tail.Err
 		switch {

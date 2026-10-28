@@ -83,6 +83,58 @@ func TestTailSeesARateLimitAndItsReset(t *testing.T) {
 	}
 }
 
+// request is the record Claude Code 2.1.308 writes as it sends a request,
+// trimmed; agent is "" for the lead.
+func request(at, source, agent string) string {
+	extra := ""
+	if agent != "" {
+		extra = `,"agentId":"` + agent + `"`
+	}
+	return fmt.Sprintf(`{"type":"api-request","sessionId":"s"%s,"id":"q","timestamp":"%s","version":"2.1.308","querySource":"%s","params":{"model":"claude-opus-5-5"}}`, extra, at, source)
+}
+
+// herdr and Claude call a session busy while agents it started are running,
+// so after a cut-off only the transcript says whether the lead stopped there
+// or has asked again since.
+func TestTailSaysWhetherTheLeadAskedSinceItsCutOff(t *testing.T) {
+	cfg := t.TempDir()
+	id := DeterministicID("ZEN-3")
+	path := TranscriptPathIn(cfg, id, "/r")
+	writeLines(t, path, replyLine, limitLine)
+	if TailOf(cfg, id).Stopped() {
+		t.Fatal("a transcript that records no requests can't say the lead stopped")
+	}
+
+	// The request the cut-off answered can land in the file after it.
+	writeLines(t, path, request("2026-10-21T14:04:59Z", "repl_main_thread", ""))
+	if tail := TailOf(cfg, id); !tail.Stopped() || !tail.LastAt.Equal(time.Date(2026, 10, 21, 14, 5, 0, 0, time.UTC)) {
+		t.Fatalf("Stopped = %v, LastAt = %v: the cut-off answered the lead's last request", tail.Stopped(), tail.LastAt)
+	}
+	writeLines(t, path,
+		request("2026-10-21T14:06:00Z", "agent:builtin:general-purpose", "a1"),
+		request("2026-10-21T14:06:00Z", "repl_main_thread", "a2"),
+		`{"type":"api-request-blob","timestamp":"2026-10-21T14:06:00Z","querySource":"repl_main_thread"}`,
+	)
+	if !TailOf(cfg, id).Stopped() {
+		t.Error("an agent's request, or a request's body, is not the lead asking")
+	}
+
+	writeLines(t, path, request("2026-10-21T14:06:00Z", "repl_main_thread", ""))
+	if TailOf(cfg, id).Stopped() {
+		t.Error("the lead asked again after its cut-off: it is mid-turn")
+	}
+	writeLines(t, path, strings.Replace(strings.Replace(replyLine, "r1", "r3", 1), "14:00:00", "14:06:05", 1))
+	if tail := TailOf(cfg, id); tail.Stopped() || tail.Err != nil {
+		t.Errorf("Stopped = %v, Err = %+v: a reply ends the cut-off", tail.Stopped(), tail.Err)
+	}
+
+	// A reply whose tool input happens to hold the record's marker is a reply.
+	writeLines(t, path, `{"type":"assistant","timestamp":"2026-10-21T14:07:00Z","uuid":"r4","message":{"model":"claude-opus-5-5","content":[{"type":"tool_use","id":"t2","name":"Grep","input":{"pattern":"x","filter":{"type":"api-request"}}}]}}`)
+	if tail := TailOf(cfg, id); tail.LastUUID != "r4" {
+		t.Errorf("LastUUID = %q, want the reply that mentions a request record", tail.LastUUID)
+	}
+}
+
 func TestTailKeepsTheLatestErrorKind(t *testing.T) {
 	cfg := t.TempDir()
 	id := DeterministicID("ZEN-2")

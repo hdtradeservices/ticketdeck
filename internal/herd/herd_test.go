@@ -348,6 +348,47 @@ esac
 	}
 }
 
+// Screens trimmed from Claude Code 2.1.308 on the workbench (2026-10-28).
+func TestLimitMenu(t *testing.T) {
+	const menu = `● Artifact comment monitor for https://claude.ai/artifact/AL9toA6bLiVKqx7f19mJFh didn't resume: it couldn't restart in this session.
+  replies back on.
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+   ❯ 1. Stop and wait for limit to reset
+     2. Wait here, then continue automatically at Oct 30, 8am
+     3. Ask your admin for more usage
+   Enter to confirm · Esc to cancel
+`
+	const trust = ` Do you trust the files in this folder?
+ /home/x/Repos
+ ❯ 1. Yes, proceed
+   2. No, exit
+ Enter to confirm · Esc to exit
+`
+	const permission = ` Bash command
+   rm -rf build
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No, and tell Claude what to do differently (esc)
+`
+	quoted := "● It asked: What do you want to do? 1. Stop and wait for limit to reset · Esc to cancel\n" +
+		strings.Repeat("  more of the reply\n", 12) + "───\n❯ \n───\n  ⏵⏵ bypass permissions on\n"
+	for _, c := range []struct {
+		name, screen string
+		want         bool
+	}{
+		{"the limit menu", menu, true},
+		{"a trust dialog", trust, false},
+		{"a permission prompt", permission, false},
+		{"the menu quoted further up", quoted, false},
+		{"an unreadable screen", "", false},
+	} {
+		if got := limitMenu(c.screen); got != c.want {
+			t.Errorf("%s: limitMenu = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 func TestReadBox(t *testing.T) {
 	const text = "Please continue where you left off."
 	for _, c := range []struct {

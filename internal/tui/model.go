@@ -347,6 +347,7 @@ type Model struct {
 	socket        string                    // this deck's herdr server: the promises it made are its to keep
 	parked        map[string]time.Time      // sessions out of usage with nowhere to move: when their limit lifts
 	stuckNoted    map[string]bool           // sessions the user was told never answered a carry-on
+	heldNoted     map[string]string         // session → the cut-off last logged as waiting for its turn to end
 	adoptQueue    map[string]bool           // sessions in other decks to bring in once their turn ends
 	pendingSend   map[string]string         // moved sessions held at a startup prompt: what to send once it's answered
 	launching     map[string]bool           // sessions whose launch is still running
@@ -392,7 +393,7 @@ type demoFleeter interface {
 func New(f Fetcher, root string, dry bool, backend Backend) Model {
 	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, inView: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, closeOnIdle: map[string]bool{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, projExpanded: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != "", comments: map[string][]linear.Comment{}, commentsErr: map[string]error{}, commentsBusy: map[string]bool{}}
 	m.moving, m.telling, m.parked, m.adoptQueue = map[string]bool{}, map[string]bool{}, map[string]time.Time{}, map[string]bool{}
-	m.stepDone, m.stuckNoted = map[string]time.Time{}, map[string]bool{}
+	m.stepDone, m.stuckNoted, m.heldNoted = map[string]time.Time{}, map[string]bool{}, map[string]string{}
 	m.socket = herd.OwnSocket()
 	m.pendingSend, m.launching = map[string]string{}, map[string]bool{}
 	m.finishedAt, m.seenAt, m.rawStatus = map[string]time.Time{}, map[string]time.Time{}, map[string]session.Status{}
@@ -860,6 +861,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case continuedMsg:
 		delete(m.telling, msg.key)
+		if msg.held {
+			if m.heldNoted[msg.key] != "dialog" {
+				m.heldNoted[msg.key] = "dialog"
+				debugLog.Printf("%s is on a dialog that isn't Claude's limit menu: it waits for someone", msg.key)
+			}
+			m.retryAt[msg.key] = time.Now().Add(dialogRecheck)
+			break
+		}
 		m.stepDone[msg.key] = time.Now()
 		m.ledger = ledger.Load()
 		if msg.err != nil {

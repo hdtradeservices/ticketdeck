@@ -52,6 +52,30 @@ type Entry struct {
 	Carry *Carry `json:"carry,omitempty"`
 	// Forgotten hides an ad-hoc session the user closed for good.
 	Forgotten bool `json:"forgotten,omitempty"`
+	// Refused remembers each account whose usage limit cut this session off,
+	// until the limit lifts. The session moves on and its cut-off goes with
+	// it, but the account is still out: forgetting that sent six sessions to
+	// an account out for the week (2026-10-28).
+	Refused []Refusal `json:"refused,omitempty"`
+}
+
+// Refusal is an account's usage limit as a cut-off reported it.
+type Refusal struct {
+	Account string    `json:"account"`
+	Until   time.Time `json:"until"`
+	Limit   string    `json:"limit,omitempty"` // "five_hour", "seven_day", …
+}
+
+// Refuse records an account's limit, keeping the newest per account and
+// dropping those that have lifted.
+func (e *Entry) Refuse(r Refusal, now time.Time) {
+	var kept []Refusal
+	for _, x := range e.Refused {
+		if x.Account != r.Account && now.Before(x.Until) {
+			kept = append(kept, x)
+		}
+	}
+	e.Refused = append(kept, r)
 }
 
 // Carry is a cut-off the deck has promised to carry on from: on another

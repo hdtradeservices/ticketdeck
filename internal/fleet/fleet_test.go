@@ -390,6 +390,65 @@ func TestALimitMenuReadsAsLimited(t *testing.T) {
 	}
 }
 
+// Claude and herdr call a session busy while agents it started run. After a
+// cut-off those run until their slowest tool call returns into the same
+// limit; a lead that has asked nothing since is cut off all the same.
+func TestABusySessionWhoseLeadStoppedOnItsCutOff(t *testing.T) {
+	ask := func(at, agent string) string {
+		extra := ""
+		if agent != "" {
+			extra = `,"agentId":"` + agent + `"`
+		}
+		return `{"type":"api-request","timestamp":"` + at + `","querySource":"repl_main_thread"` + extra + `}`
+	}
+	limit := `{"type":"assistant","timestamp":"2026-10-21T14:05:00Z","uuid":"e1","isApiErrorMessage":true,"error":"rate_limit","quotaLimits":{"resetsAt":` + strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10) + `,"rateLimitType":"five_hour"},"message":{"model":"<synthetic>","content":[{"type":"text","text":"limit"}]}}`
+	login := `{"type":"assistant","timestamp":"2026-10-21T14:05:00Z","uuid":"e2","isApiErrorMessage":true,"error":"authentication_failed","message":{"model":"<synthetic>","content":[{"type":"text","text":"Login expired"}]}}`
+	for _, c := range []struct {
+		name  string
+		lines []string
+		want  session.Status
+	}{
+		{"stopped on its limit", []string{ask("2026-10-21T14:04:59Z", ""), limit}, session.Limited},
+		{"an agent asked since, not the lead", []string{ask("2026-10-21T14:04:59Z", ""), limit, ask("2026-10-21T14:06:00Z", "a1")}, session.Limited},
+		{"the lead asked again", []string{ask("2026-10-21T14:04:59Z", ""), limit, ask("2026-10-21T14:06:00Z", "")}, session.Working},
+		{"no request records", []string{limit}, session.Working},
+		{"stopped on a lapsed login", []string{ask("2026-10-21T14:04:59Z", ""), login}, session.Errored},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			a := setup(t, "matt", "m0")
+			id := session.DeterministicID("ZEN-8")
+			stamp(t, a.dir("m0"), id, time.Now(), c.lines...)
+			world{
+				agents: map[string][]herd.Agent{"": {{Name: "ZEN-8", AgentStatus: "working", PaneID: "w1:p2"}}},
+				procs:  map[string][]session.Proc{a.dir("m0"): {{PID: 7, SessionID: id, ConfigDir: a.dir("m0"), Status: "busy", HerdrSocket: "/h/.config/herdr/herdr.sock", HerdrPane: "w1:p2"}}},
+			}.install(t)
+			if s := best(t, Poll(input(a, "ZEN-8")), "ZEN-8"); s.Status != c.want {
+				t.Errorf("status = %v, want %v", s.Status, c.want)
+			}
+		})
+	}
+}
+
+// An account a usage limit refused stays out after the session it refused has
+// moved on: nothing running there says so any more, but the ledger does.
+func TestARefusedAccountStaysOutAfterItsSessionMovesOn(t *testing.T) {
+	a := setup(t, "matt", "m0")
+	world{}.install(t)
+	week := time.Now().Add(40 * time.Hour).Truncate(time.Second)
+	in := input(a)
+	in.Ledger = map[string]ledger.Entry{
+		"s1": {SessionID: "s1", Refused: []ledger.Refusal{{Account: "m0", Until: week, Limit: "seven_day"}}},
+		"s2": {SessionID: "s2", Refused: []ledger.Refusal{{Account: "matt", Until: time.Now().Add(-time.Minute)}}},
+	}
+	until, _ := Poll(in).Limits(time.Now())
+	if !until["m0"].Equal(week) {
+		t.Errorf("m0 out until %v, want %v", until["m0"], week)
+	}
+	if !until["matt"].IsZero() {
+		t.Errorf("matt out until %v: its limit lifted a minute ago", until["matt"])
+	}
+}
+
 // A session herdr already listed is not listed again from the registry when
 // the two couldn't be tied together (no /proc on macOS, no herdr hook).
 func TestASessionIsListedOnce(t *testing.T) {

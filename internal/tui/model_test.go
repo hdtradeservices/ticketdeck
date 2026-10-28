@@ -92,6 +92,7 @@ func (fakeBackend) ScratchSpec(t session.Ticket, cwd string) session.LaunchSpec 
 func (fakeBackend) Move(Move) (string, error)                       { return "", nil }
 func (fakeBackend) Rename(session.SessionRef, string, string) error { return nil }
 func (fakeBackend) Keys(string, ...string) error                    { return nil }
+func (fakeBackend) LimitMenu(string) bool                           { return false }
 
 func (fakeBackend) FocusSpec(ref session.SessionRef) session.LaunchSpec {
 	return session.LaunchSpec{Args: []string{"agent", "focus", ref.Name}, Name: ref.Name, Action: "focus"}
@@ -467,7 +468,10 @@ type recBackend struct {
 	keys         []string // "name:keys"
 	prompts      int
 	promptErr    error
+	limitMenu    bool // what LimitMenu reads off every screen
 }
+
+func (r *recBackend) LimitMenu(string) bool { return r.limitMenu }
 
 func (r *recBackend) Keys(name string, keys ...string) error {
 	r.keys = append(r.keys, name+":"+strings.Join(keys, " "))

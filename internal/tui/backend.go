@@ -61,6 +61,9 @@ type Backend interface {
 	Rename(ref session.SessionRef, name, label string) error
 	// Keys presses keys in a running session, e.g. Esc to dismiss a dialog.
 	Keys(name string, keys ...string) error
+	// LimitMenu reports whether a running session shows Claude's own menu at
+	// a usage limit, the one dialog the deck may dismiss for it.
+	LimitMenu(name string) bool
 }
 
 // Move is one session changing account, workspace, or both.
@@ -181,6 +184,8 @@ func (ClaudeBackend) Keys(string, ...string) error {
 	return errors.New("pressing keys in a session requires the herdr backend")
 }
 
+func (ClaudeBackend) LimitMenu(string) bool { return false }
+
 // HerdBackend drives herdr (agent multiplexer) — start/attach/list.
 type HerdBackend struct{}
 
@@ -288,6 +293,8 @@ func (HerdBackend) Move(mv Move) (string, error) {
 func (HerdBackend) Keys(name string, keys ...string) error {
 	return herd.SendKeys("", name, keys...)
 }
+
+func (HerdBackend) LimitMenu(name string) bool { return herd.LimitMenu("", name) }
 
 func (HerdBackend) Rename(ref session.SessionRef, name, label string) error {
 	tab := ""

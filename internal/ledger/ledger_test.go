@@ -43,6 +43,23 @@ func TestUpdateCreatesAndAmends(t *testing.T) {
 	}
 }
 
+// A session keeps one refusal per account, the newest, and only until the
+// limit lifts.
+func TestRefuseKeepsTheNewestPerAccountUntilItLifts(t *testing.T) {
+	now := time.Now()
+	var e Entry
+	e.Refuse(Refusal{Account: "k1", Until: now.Add(40 * time.Hour), Limit: "seven_day"}, now)
+	e.Refuse(Refusal{Account: "m2", Until: now.Add(-time.Minute), Limit: "five_hour"}, now)
+	e.Refuse(Refusal{Account: "support", Until: now.Add(2 * time.Hour), Limit: "five_hour"}, now)
+	if len(e.Refused) != 2 || e.Refused[0].Account != "k1" || e.Refused[1].Account != "support" {
+		t.Fatalf("refused = %+v, want k1 and support: m2's lifted before support's came in", e.Refused)
+	}
+	e.Refuse(Refusal{Account: "k1", Until: now.Add(50 * time.Hour), Limit: "seven_day"}, now)
+	if len(e.Refused) != 2 || !e.Refused[1].Until.Equal(now.Add(50*time.Hour)) {
+		t.Errorf("refused = %+v, want k1's newer refusal in place of its old one", e.Refused)
+	}
+}
+
 func TestOldEntriesArePruned(t *testing.T) {
 	tempDir(t)
 	old := now

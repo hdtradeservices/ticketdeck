@@ -13,6 +13,7 @@ import (
 	"github.com/hdtradeservices/ticketdeck/internal/fleet"
 	"github.com/hdtradeservices/ticketdeck/internal/herd"
 	"github.com/hdtradeservices/ticketdeck/internal/ledger"
+	"github.com/hdtradeservices/ticketdeck/internal/linear"
 	"github.com/hdtradeservices/ticketdeck/internal/quota"
 	"github.com/hdtradeservices/ticketdeck/internal/session"
 )
@@ -55,6 +56,21 @@ func idleOn(m Model, key, acct string) fleet.Session {
 		Status: session.Idle, Live: true, Home: true, PaneID: "w1:p5", PID: 77,
 	}
 	s.Activity.Tail.LastUUID = "err-" + key
+	return s
+}
+
+// busyOn is a running session on acct that herdr and Claude call working,
+// because agents it started still run, while its lead stopped on its cut-off.
+// asked: the lead has sent the API a request since.
+func busyOn(m Model, key, acct string, resets time.Time, asked bool) fleet.Session {
+	s := limitedOn(m, key, acct, resets)
+	s.Status = session.Working
+	s.Activity.InFlight.Agents = 3
+	cut := time.Now().Add(-2 * time.Minute)
+	s.Activity.Tail.LastUUID, s.Activity.Tail.LastAt, s.Activity.Tail.AskedAt = "err-"+key, cut, cut.Add(-time.Second)
+	if asked {
+		s.Activity.Tail.AskedAt = cut.Add(time.Minute)
+	}
 	return s
 }
 
@@ -225,6 +241,140 @@ func TestUnansweredTellsStopAndSaySo(t *testing.T) {
 	drainCmd(cmd)
 	if len(rec.moves) != 0 {
 		t.Errorf("restarted a session that never answered: %+v", rec.moves)
+	}
+}
+
+// The 2026-10-28 failure: sessions whose lead a limit stopped were left for
+// minutes with another account free, because the agents they started kept
+// them reading "working" until each ran into the same limit. A lead that has
+// asked nothing since its cut-off moves as soon as it is cut off.
+func TestACutOffLeadMovesWhileItsAgentsWindDown(t *testing.T) {
+	m, rec := threeAccounts(t)
+	_, cmd := poll(t, m, busyOn(m, "ZEN-9", "m0", time.Now().Add(time.Hour), false))
+	drainCmd(cmd)
+	if len(rec.moves) != 1 || rec.moves[0].To.Name != "support" {
+		t.Fatalf("moves = %+v, want one to support", rec.moves)
+	}
+	if want := continueAfterMove + lostBackgroundWork; rec.moves[0].Submit != want {
+		t.Errorf("told %q, want %q: the agents it had running don't carry over", rec.moves[0].Submit, want)
+	}
+}
+
+// A lead that has asked again since its cut-off is mid-turn — the limit may
+// have been raised — and is left to it.
+func TestALeadThatAskedAgainIsLeftToIt(t *testing.T) {
+	m, rec := threeAccounts(t)
+	s := busyOn(m, "ZEN-9", "m0", time.Now().Add(time.Hour), true)
+	m, cmd := poll(t, m, s)
+	drainCmd(cmd)
+	if len(rec.moves) != 0 || m.ledger[s.ID].Carry != nil {
+		t.Errorf("moves=%+v promise=%+v, want it left alone", rec.moves, m.ledger[s.ID].Carry)
+	}
+}
+
+// Once its limit lifts, a session whose lead stopped on it is told to carry on
+// where it is, even while background work keeps it from reading idle: a
+// monitor may run on for good. One whose own continue already went out is
+// left to answer it.
+func TestABusySessionCarriesOnInPlaceOnceItsLimitLifts(t *testing.T) {
+	reset := time.Now().Add(-5 * time.Minute)
+	for _, c := range []struct {
+		name    string
+		session func(Model) fleet.Session
+		want    string
+	}{
+		{"agents running", func(m Model) fleet.Session { return busyOn(m, "ZEN-9", "m0", reset, false) }, "ZEN-9:" + continueAfterReset},
+		{"a monitor running", func(m Model) fleet.Session {
+			s := idleOn(m, "ZEN-9", "m0")
+			s.Status = session.Background
+			s.Activity.Tail.Err = &session.APIError{Kind: "rate_limit", ResetsAt: reset, UUID: "err-ZEN-9"}
+			return s
+		}, "ZEN-9:" + continueAfterReset},
+		{"its own continue went out", func(m Model) fleet.Session { return busyOn(m, "ZEN-9", "m0", reset, true) }, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m, rec := threeAccounts(t)
+			m = promised(t, allOut(m), "ZEN-9", "m0", reset, nil)
+			_, cmd := poll(t, m, c.session(m))
+			drainCmd(cmd)
+			if len(rec.moves) != 0 || rec.sent != c.want {
+				t.Errorf("moves=%d sent=%q, want %q", len(rec.moves), rec.sent, c.want)
+			}
+		})
+	}
+}
+
+// In the minute after a limit lifts, Claude Code's own continue gets its go,
+// and agents the session started can work again: it isn't moved then, even
+// with another account free.
+func TestALiftedLimitIsNotMovedAway(t *testing.T) {
+	m, rec := threeAccounts(t)
+	reset := time.Now().Add(-10 * time.Second)
+	m = promised(t, m, "ZEN-9", "m0", reset, nil)
+	_, cmd := poll(t, m, busyOn(m, "ZEN-9", "m0", reset, false))
+	drainCmd(cmd)
+	if len(rec.moves) != 0 || rec.sent != "" {
+		t.Errorf("moves=%+v sent=%q, want it left to carry on where it is", rec.moves, rec.sent)
+	}
+}
+
+// A cut-off leaves its account's refusal in the ledger, and it outlives the
+// promise: six sessions went to an account out for the week once the one
+// that found out had moved on (2026-10-28).
+func TestACutOffRecordsItsAccountAsOut(t *testing.T) {
+	m, _ := threeAccounts(t)
+	week := time.Now().Add(40 * time.Hour)
+	s := limitedOn(m, "ZEN-9", "m0", week)
+	s.Activity.Tail.Err.LimitType = "seven_day"
+	m, cmd := poll(t, m, s)
+	m = finish(t, m, cmd)
+	m.endPromise(s.ID)
+	r := ledger.Load()[s.ID].Refused
+	if len(r) != 1 || r[0].Account != "m0" || !r[0].Until.Equal(week) || r[0].Limit != "seven_day" {
+		t.Errorf("refused = %+v, want m0 out until its weekly reset", r)
+	}
+}
+
+// A session moved onto an account that turns out to be out opens on Claude's
+// limit menu, and sat there until someone came (2026-10-28). The deck clears
+// that menu, and no other dialog, and tells it to carry on: the cut-off its
+// new account answers with moves it on.
+func TestAMovedSessionOnTheLimitMenuIsToldToCarryOn(t *testing.T) {
+	for _, menu := range []bool{true, false} {
+		m, rec := threeAccounts(t)
+		rec.limitMenu = menu
+		m = promised(t, m, "ZEN-9", "m0", time.Now().Add(time.Hour), nil)
+		s := idleOn(m, "ZEN-9", "support")
+		s.Status, s.Prompting = session.NeedsInput, true
+		m, cmd := poll(t, m, s)
+		m = finish(t, m, cmd)
+		if menu {
+			if len(rec.keys) != 1 || rec.keys[0] != "ZEN-9:esc" || rec.sent != "ZEN-9:"+continueAfterMove {
+				t.Errorf("on the limit menu: keys=%v sent=%q, want it dismissed and told", rec.keys, rec.sent)
+			}
+			continue
+		}
+		if len(rec.keys) != 0 || rec.sent != "" {
+			t.Errorf("on another dialog: keys=%v sent=%q, want it left for someone", rec.keys, rec.sent)
+		}
+		if !m.retryAt["ZEN-9"].After(time.Now()) {
+			t.Error("a dialog left for someone is read again later, not every poll")
+		}
+	}
+}
+
+// A ticket in Validate is still being worked. Linear files the state under
+// "completed", and read as done, every cut-off ZEN-6940 had was dropped
+// without a word (2026-10-28).
+func TestAPromiseStandsForATicketInValidate(t *testing.T) {
+	m, rec := threeAccounts(t)
+	issues := append(fixture(), linear.Issue{Identifier: "ZEN-8", Title: "being checked", Priority: 2, StateName: "Validate", StateType: "completed"})
+	next, _ := m.Update(refreshedMsg{issues: issues})
+	m = promised(t, next.(Model), "ZEN-8", "m0", time.Now().Add(-5*time.Minute), nil)
+	_, cmd := poll(t, m, idleOn(m, "ZEN-8", "m0"))
+	drainCmd(cmd)
+	if rec.sent != "ZEN-8:"+continueAfterReset {
+		t.Errorf("sent %q, want the Validate ticket carried on", rec.sent)
 	}
 }
 

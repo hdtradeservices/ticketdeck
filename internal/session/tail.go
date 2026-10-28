@@ -36,6 +36,21 @@ type Tail struct {
 	// LastUUID is the newest assistant entry of the main conversation, reply
 	// or error. While it is a cut-off's own id, nothing has answered it.
 	LastUUID string
+	// LastAt is when that entry was written, and AskedAt when the lead last
+	// sent the API a request. Claude Code records every request it sends from
+	// 2.1.30x on; in a transcript without those records AskedAt stays zero.
+	LastAt  time.Time
+	AskedAt time.Time
+}
+
+// Stopped reports whether the lead's last turn ended on an error and it has
+// asked the API nothing since, so it is sitting at its prompt. Claude and
+// herdr both call a session busy while agents it started are running, and
+// after a cut-off those run until their slowest tool call returns into the
+// same limit. Only a transcript that records requests can tell the two apart;
+// one that doesn't reports false.
+func (t Tail) Stopped() bool {
+	return t.Err != nil && !t.AskedAt.IsZero() && !t.AskedAt.After(t.LastAt)
 }
 
 // APIError is a turn that ended on an API error instead of a reply.
@@ -101,16 +116,20 @@ type usage struct {
 
 var (
 	assistantMark = []byte(`"type":"assistant"`)
+	requestMark   = []byte(`"type":"api-request"`)
 	titleMarks    = [][]byte{[]byte(`"type":"custom-title"`), []byte(`"type":"ai-title"`)}
 )
 
-// apply folds one transcript line into the tail. Only assistant entries and
-// title records are parsed; everything else — tool results especially, which
-// can run to megabytes — is skipped on a byte search. An API response's line
-// also returns what the response spent. Claude Code writes a line per content
-// block, each repeating the response's usage, so the caller counts each
-// response id once.
+// apply folds one transcript line into the tail. Only assistant entries,
+// request records and title records are parsed; everything else — tool
+// results especially, which can run to megabytes — is skipped on a byte
+// search. An API response's line also returns what the response spent. Claude
+// Code writes a line per content block, each repeating the response's usage,
+// so the caller counts each response id once.
 func (t *Tail) apply(line []byte) (spent spend, ok bool) {
+	if bytes.Contains(line, requestMark) && t.asked(line) {
+		return spend{}, false
+	}
 	isTitle := bytes.Contains(line, titleMarks[0]) || bytes.Contains(line, titleMarks[1])
 	if !isTitle && !bytes.Contains(line, assistantMark) {
 		return spend{}, false
@@ -144,7 +163,7 @@ func (t *Tail) apply(line []byte) (spent spend, ok bool) {
 		return spent, ok
 	}
 	if l.UUID != "" {
-		t.LastUUID = l.UUID
+		t.LastUUID, t.LastAt = l.UUID, l.Timestamp
 	}
 	if l.IsAPIErrorMessage {
 		e := &APIError{Kind: l.Error, At: l.Timestamp, UUID: l.UUID}
@@ -181,6 +200,26 @@ func (t *Tail) apply(line []byte) (spent spend, ok bool) {
 		}
 	}
 	return spent, ok
+}
+
+// asked notes a request the lead sent, and reports whether line records one.
+// A line that only holds the marker — in a tool call's input, say — is not
+// one. Its agents' requests go to their own transcripts; agentId keeps one
+// that turns up here from counting as the lead's.
+func (t *Tail) asked(line []byte) bool {
+	var r struct {
+		Type        string    `json:"type"`
+		Timestamp   time.Time `json:"timestamp"`
+		QuerySource string    `json:"querySource"`
+		AgentID     string    `json:"agentId"`
+	}
+	if json.Unmarshal(line, &r) != nil || r.Type != "api-request" {
+		return false
+	}
+	if r.QuerySource == "repl_main_thread" && r.AgentID == "" && r.Timestamp.After(t.AskedAt) {
+		t.AskedAt = r.Timestamp
+	}
+	return true
 }
 
 // summarizeTool renders a tool call as a few words: the tool, and the one input

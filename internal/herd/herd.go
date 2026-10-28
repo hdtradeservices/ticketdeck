@@ -668,6 +668,37 @@ func paneText(socket, name string) string {
 	return string(out)
 }
 
+// LimitMenu reports whether an agent's screen ends on the menu Claude Code
+// puts up at a usage limit: "What do you want to do?", with ways to wait for
+// the reset or ask for more. A session moved onto an account that turns out
+// to be out opens on it, and sits there until someone answers.
+func LimitMenu(socket, name string) bool { return limitMenu(paneText(socket, name)) }
+
+// limitMenuWords are the menu's options as Claude Code 2.1.308 words them;
+// one is enough to tell it from a trust or permission dialog, where Esc
+// would exit the session or refuse the tool.
+var limitMenuWords = []string{"limit to reset", "continue automatically", "more usage", "usage credits", "Upgrade your plan"}
+
+func limitMenu(screen string) bool {
+	var tail []string
+	lines := strings.Split(screen, "\n")
+	for i := len(lines) - 1; i >= 0 && len(tail) < 12; i-- {
+		if s := strings.TrimSpace(lines[i]); s != "" {
+			tail = append(tail, s)
+		}
+	}
+	box := strings.Join(tail, "\n")
+	if !strings.Contains(box, "What do you want to do?") || !strings.Contains(box, "Esc to cancel") {
+		return false
+	}
+	for _, w := range limitMenuWords {
+		if strings.Contains(box, w) {
+			return true
+		}
+	}
+	return false
+}
+
 // promptMarkerRE matches a Claude prompt line ("❯ hello", "> hello", "❯").
 var promptMarkerRE = regexp.MustCompile(`^\s*[❯>]\s?(.*)$`)
 

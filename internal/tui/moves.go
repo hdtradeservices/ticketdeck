@@ -57,6 +57,7 @@ type continuedMsg struct {
 	key         string
 	err         error
 	afterPrompt bool // it was held for a startup prompt the user has answered
+	held        bool // nothing was sent: the dialog it sits on is for someone to answer
 }
 
 type moveOpts struct {

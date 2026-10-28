@@ -93,7 +93,7 @@ func (m *Model) promiseCutOffs(now time.Time) {
 	wrote := false
 	for _, s := range m.fleet.Sessions {
 		e := s.Activity.Tail.Err
-		if !s.Live || !s.Home || s.ID == "" || !turnOver(s) || m.busy(s.Key) || m.stale(s.Key) {
+		if !s.Live || !s.Home || s.ID == "" || m.busy(s.Key) || m.stale(s.Key) {
 			continue
 		}
 		if (!e.RateLimited() && !e.AuthFailed()) || e.UUID == "" {
@@ -101,6 +101,10 @@ func (m *Model) promiseCutOffs(now time.Time) {
 		}
 		le := m.ledger[s.ID]
 		if le.Handled == e.UUID || (le.Carry != nil && le.Carry.Err == e.UUID) {
+			continue
+		}
+		if !turnOver(s) {
+			m.noteHeld(s, e.UUID, s.Account)
 			continue
 		}
 		old := e.RateLimited() && !e.ResetsAt.IsZero() && now.Sub(e.ResetsAt) > resumeWindow
@@ -127,6 +131,9 @@ func (m *Model) promiseCutOffs(now time.Time) {
 				x.Handled = x.Carry.Err
 			}
 			x.Carry = c
+			if e.RateLimited() {
+				x.Refuse(ledger.Refusal{Account: s.Account, Until: liftsAt(*c), Limit: e.LimitType}, now)
+			}
 		})
 		wrote = true
 	}
@@ -139,6 +146,7 @@ func (m *Model) promiseCutOffs(now time.Time) {
 func (m *Model) keepPromise(e ledger.Entry, cands []route.Candidate, now time.Time) tea.Cmd {
 	c, key := *e.Carry, e.Key
 	if m.unwanted(e) {
+		debugLog.Printf("%s is finished, off the deck or closed for good: its cut-off on ⦿%s is not carried on", key, c.From)
 		m.endPromise(e.SessionID)
 		return nil
 	}
@@ -149,8 +157,12 @@ func (m *Model) keepPromise(e ledger.Entry, cands []route.Candidate, now time.Ti
 	if !ok || s.ID != e.SessionID {
 		return nil
 	}
-	if answered(c, s.Activity.Tail) {
-		debugLog.Printf("%s answered its cut-off on ⦿%s: promise kept", key, c.From)
+	if t := s.Activity.Tail; answered(c, t) {
+		if t.Err != nil && t.Err.UUID == t.LastUUID {
+			debugLog.Printf("%s was cut off again, on ⦿%s, before it carried on from ⦿%s", key, s.Account, c.From)
+		} else {
+			debugLog.Printf("%s answered its cut-off on ⦿%s: promise kept", key, c.From)
+		}
 		m.endPromise(e.SessionID)
 		delete(m.parked, key)
 		return nil
@@ -158,8 +170,9 @@ func (m *Model) keepPromise(e ledger.Entry, cands []route.Candidate, now time.Ti
 	switch {
 	case s.Live && !s.Home:
 		return nil // another deck runs it now
-	case s.Live && !turnOver(s):
-		return nil // working again, or waiting on someone
+	case s.Live && !turnOver(s) && !onDialog(s):
+		m.noteHeld(s, c.Err, c.From) // working again, or waiting on someone
+		return nil
 	case !s.Live && m.fleet.OwnErr != nil:
 		return nil // this workspace didn't answer: it may be running there
 	case !c.Told.IsZero() && now.Sub(c.Told) < tellWait:
@@ -175,6 +188,11 @@ func (m *Model) keepPromise(e ledger.Entry, cands []route.Candidate, now time.Ti
 		return nil
 	}
 	if s.Account == c.From && stillOut(c, now) {
+		if lifted(c, now) {
+			// Its agents can work again, and a move would end them. It carries
+			// on here once Claude Code's own continue has had its go.
+			return nil
+		}
 		d := route.Pick(cands, route.Request{Exclude: c.From, Now: now})
 		to, ok := m.accountByName(d.Account)
 		if !ok {
@@ -209,9 +227,42 @@ func (m *Model) keepPromise(e ledger.Entry, cands []route.Candidate, now time.Ti
 
 // turnOver reports whether a session's last turn has ended, so nothing in
 // flight is lost by moving or prompting it. Claude's what-now menu after a
-// limit reads as a prompt; the turn is over all the same.
+// limit reads as a prompt; the turn is over all the same. So is the turn of a
+// lead its account cut off that has asked nothing since, however busy the
+// background work it started keeps the session looking: once a limit lifts,
+// a monitor may run on for good.
 func turnOver(s fleet.Session) bool {
-	return s.Status.Waiting() || (s.Status == session.NeedsInput && s.Activity.Tail.Err.RateLimited())
+	t := s.Activity.Tail
+	switch {
+	case s.Status.Waiting():
+		return true
+	case !t.Err.RateLimited() && !t.Err.AuthFailed():
+		return false
+	case s.Status == session.NeedsInput:
+		return t.Err.RateLimited()
+	}
+	return s.Status == session.Background || t.Stopped()
+}
+
+// noteHeld logs, once per cut-off, a session the deck is leaving alone
+// because it doesn't look stopped, and why. A hold nobody can see is how a
+// cut-off sits out its limit unnoticed.
+func (m *Model) noteHeld(s fleet.Session, errID, from string) {
+	if m.heldNoted[s.Key] == errID {
+		return
+	}
+	m.heldNoted[s.Key] = errID
+	t := s.Activity.Tail
+	why := "it is mid-turn"
+	switch {
+	case s.Status == session.NeedsInput:
+		why = "a dialog is up"
+	case t.Err != nil && t.AskedAt.IsZero():
+		why = "it reads busy, and its transcript doesn't record requests"
+	case t.Err != nil:
+		why = "its lead has asked the API since"
+	}
+	debugLog.Printf("%s was cut off on ⦿%s, but %s: waiting for its turn to end", s.Key, from, why)
 }
 
 // answered reports whether a session's conversation has moved past its
@@ -224,6 +275,12 @@ func answered(c ledger.Carry, t session.Tail) bool {
 // it back. A lapsed login has no reset to wait for: only a move gets it going.
 func stillOut(c ledger.Carry, now time.Time) bool {
 	return c.Kind == authFailed || now.Before(liftsAt(c).Add(resetGrace))
+}
+
+// lifted reports whether a cut-off's usage limit has already lifted. A lapsed
+// login never does.
+func lifted(c ledger.Carry, now time.Time) bool {
+	return c.Kind != authFailed && !now.Before(liftsAt(c))
 }
 
 // liftsAt is when a cut-off's limit lifts. One that didn't say gets the hour
@@ -253,14 +310,32 @@ func (m *Model) carryMove(s fleet.Session, to account.Account, c ledger.Carry, w
 	})
 }
 
+// onDialog reports a session on a dialog its transcript doesn't explain: one
+// moved under a promise, its cut-off left behind on the account it came from.
+// Claude opens on its limit menu when the account it landed on is out too,
+// and then waits for someone who isn't coming.
+func onDialog(s fleet.Session) bool {
+	return s.Status == session.NeedsInput && s.Activity.Tail.Err == nil
+}
+
+// dialogRecheck is how long a session on some other dialog waits before its
+// screen is read again.
+const dialogRecheck = time.Minute
+
 // tellCmd tells a session that is ready to carry on to do so. A menu Claude
 // put up when the limit hit is dismissed first: herdr won't type into a
-// session showing one, and it shouldn't.
+// session showing one, and it shouldn't. A dialog the transcript doesn't
+// explain is dismissed only when its screen shows that menu: Esc on a trust
+// dialog would exit the session.
 func (m *Model) tellCmd(s fleet.Session, c ledger.Carry) tea.Cmd {
 	m.telling[s.Key] = true
 	backend, key, id, prompting := m.backend, s.Key, s.ID, s.Prompting
+	verify := onDialog(s)
 	text := carryPrompt(c, s.Account != c.From, false)
 	return func() tea.Msg {
+		if verify && !backend.LimitMenu(key) {
+			return continuedMsg{key: key, held: true}
+		}
 		if prompting {
 			if err := backend.Keys(key, "esc"); err != nil {
 				return continuedMsg{key: key, err: err}
@@ -322,8 +397,12 @@ func (m Model) unwanted(e ledger.Entry) bool {
 	case e.Forgotten:
 		return true
 	case e.Kind == ledger.Ticket && !m.lastSync.IsZero():
+		// Validate is completed-type yet still active, as everywhere else on
+		// the deck. Read as done, it silently ended every promise ZEN-6940
+		// was made, and each of its cut-offs waited for someone to type
+		// "resume" (2026-10-25 to 28).
 		is, ok := m.issueByKey(e.Key)
-		return !ok || is.IsDone()
+		return !ok || finishedTicket(is)
 	case e.Kind == ledger.Project && m.myProjects != nil:
 		p, ok := m.projectByKey(e.Key)
 		return !ok || p.StatusType == "completed" || p.StatusType == "canceled"

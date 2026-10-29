@@ -186,7 +186,10 @@ Full table (including herdr's own keys) in [`SETUP.md`](SETUP.md).
   does this on its own, as soon as the limit has ended the turn. Background agents still
   winding down don't hold it back: the transcript shows whether the lead has stopped, and
   the agents can't reach the account either. With nowhere to go it waits, then carries on
-  where it is once the limit resets. An account a limit refused stays out until the limit
+  where it is once the limit resets. If Claude's limit menu offers "Wait here, then continue
+  automatically", the deck picks it, so Claude carries on by itself at the reset. Claude
+  offers that option instead of choosing it when the limit resets more than a day out, as
+  a weekly limit does. An account a limit refused stays out until the limit
   lifts, even after its sessions have moved on. A lapsed login is handled the same way,
   except that it always moves. `A` turns this off; `TICKETDECK_AUTO_MOVE=off` does too.
 - **It keeps at it until the session is going again.** Each cut-off becomes a promise in

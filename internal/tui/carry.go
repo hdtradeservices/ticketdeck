@@ -201,6 +201,9 @@ func (m *Model) keepPromise(e ledger.Entry, cands []route.Candidate, now time.Ti
 				notify(label+" is waiting on a usage limit", d.Why)
 			}
 			m.parked[key] = liftsAt(c)
+			if s.Live && s.Status == session.NeedsInput && m.waited[key] != c.Err {
+				return m.waitCmd(s, c)
+			}
 			return nil
 		}
 		delete(m.parked, key)
@@ -347,6 +350,19 @@ func (m *Model) tellCmd(s fleet.Session, c ledger.Carry) tea.Cmd {
 			_ = ledger.Update(id, func(e *ledger.Entry) { told(e, c.Err) })
 		}
 		return continuedMsg{key: key, err: err}
+	}
+}
+
+// waitCmd answers the limit menu of a session with nowhere to move with
+// "Wait here, then continue automatically". Claude offers that, rather than
+// arming it, when the limit resets more than a day out: left alone the menu
+// sits there, and Claude doesn't carry on at the reset.
+func (m *Model) waitCmd(s fleet.Session, c ledger.Carry) tea.Cmd {
+	m.telling[s.Key] = true
+	backend, key := m.backend, s.Key
+	return func() tea.Msg {
+		ok, err := backend.WaitAtLimit(key)
+		return waitedMsg{key: key, errID: c.Err, ok: ok, err: err}
 	}
 }
 

@@ -346,6 +346,7 @@ type Model struct {
 	stepDone      map[string]time.Time      // when the deck's last move or tell of each session finished
 	socket        string                    // this deck's herdr server: the promises it made are its to keep
 	parked        map[string]time.Time      // sessions out of usage with nowhere to move: when their limit lifts
+	waited        map[string]string         // parked session → the cut-off whose limit menu the deck answered "wait here"
 	stuckNoted    map[string]bool           // sessions the user was told never answered a carry-on
 	heldNoted     map[string]string         // session → the cut-off last logged as waiting for its turn to end
 	adoptQueue    map[string]bool           // sessions in other decks to bring in once their turn ends
@@ -393,7 +394,7 @@ type demoFleeter interface {
 func New(f Fetcher, root string, dry bool, backend Backend) Model {
 	m := Model{fetch: f, root: root, dry: dry, backend: backend, loading: true, inView: true, sessions: map[string]session.Status{}, statusSince: map[string]time.Time{}, closeOnIdle: map[string]bool{}, owners: map[string]account.Owner{}, collapsed: map[string]bool{}, projExpanded: map[string]bool{}, underHerdr: os.Getenv("HERDR_PANE_ID") != "", comments: map[string][]linear.Comment{}, commentsErr: map[string]error{}, commentsBusy: map[string]bool{}}
 	m.moving, m.telling, m.parked, m.adoptQueue = map[string]bool{}, map[string]bool{}, map[string]time.Time{}, map[string]bool{}
-	m.stepDone, m.stuckNoted, m.heldNoted = map[string]time.Time{}, map[string]bool{}, map[string]string{}
+	m.stepDone, m.stuckNoted, m.heldNoted, m.waited = map[string]time.Time{}, map[string]bool{}, map[string]string{}, map[string]string{}
 	m.socket = herd.OwnSocket()
 	m.pendingSend, m.launching = map[string]string{}, map[string]bool{}
 	m.finishedAt, m.seenAt, m.rawStatus = map[string]time.Time{}, map[string]time.Time{}, map[string]session.Status{}
@@ -884,6 +885,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.notice = fmt.Sprintf("%s is past its startup prompt — told it to carry on", m.label(msg.key))
 		}
 		return m, m.refreshStatuses()
+
+	case waitedMsg:
+		delete(m.telling, msg.key)
+		m.stepDone[msg.key] = time.Now()
+		switch {
+		case msg.err != nil:
+			debugLog.Printf("choosing to wait at %s's limit menu failed: %v", msg.key, msg.err)
+			m.retryLater(msg.key, msg.err)
+		case msg.ok:
+			m.waited[msg.key] = msg.errID
+			delete(m.fails, msg.key)
+			debugLog.Printf("%s: chose \"Wait here, then continue automatically\" at its limit menu", msg.key)
+			m.notice = fmt.Sprintf("%s: told Claude to wait out its limit and carry on", m.label(msg.key))
+		default:
+			// Claude armed its own continue, or the dialog is another one: the
+			// deck carries it on at the reset as before.
+			m.waited[msg.key] = msg.errID
+		}
 
 	case quotaMsg:
 		for name, e := range msg.entries {

@@ -363,6 +363,51 @@ func TestAMovedSessionOnTheLimitMenuIsToldToCarryOn(t *testing.T) {
 	}
 }
 
+// A weekly limit resets more than a day out, so Claude offers its own wait on
+// the menu instead of arming it, and the menu sat there (2026-10-29). With
+// nowhere to move, the deck chooses it, once per cut-off. With somewhere to
+// move, it moves.
+func TestAParkedSessionWaitsAtItsLimitMenu(t *testing.T) {
+	onMenu := func(m Model) fleet.Session {
+		s := limitedOn(m, "ZEN-9", "m0", time.Now().Add(40*time.Hour))
+		s.Status, s.Prompting = session.NeedsInput, true
+		return s
+	}
+
+	m, rec := threeAccounts(t)
+	m, rec.waitOffered = allOut(m), true
+	m, cmd := poll(t, m, onMenu(m))
+	m = finishWaits(t, m, cmd)
+	if len(rec.waited) != 1 || rec.waited[0] != "ZEN-9" || len(rec.moves) != 0 || rec.sent != "" {
+		t.Fatalf("waited=%v moves=%v sent=%q, want only the wait chosen", rec.waited, rec.moves, rec.sent)
+	}
+	_, cmd = poll(t, m, onMenu(m))
+	finishWaits(t, m, cmd)
+	if len(rec.waited) != 1 {
+		t.Errorf("waited=%v, want the menu answered once per cut-off", rec.waited)
+	}
+
+	m, rec = threeAccounts(t)
+	rec.waitOffered = true
+	_, cmd = poll(t, m, onMenu(m))
+	drainCmd(cmd)
+	if len(rec.waited) != 0 || len(rec.moves) != 1 {
+		t.Errorf("waited=%v moves=%v, want a move when an account has room", rec.waited, rec.moves)
+	}
+}
+
+// finishWaits feeds a poll's step results back to the deck, as finish does.
+func finishWaits(t *testing.T, m Model, cmd tea.Cmd) Model {
+	t.Helper()
+	for _, msg := range drainCmd(cmd) {
+		if _, ok := msg.(waitedMsg); ok {
+			next, _ := m.Update(msg)
+			m = next.(Model)
+		}
+	}
+	return m
+}
+
 // A ticket in Validate is still being worked. Linear files the state under
 // "completed", and read as done, every cut-off ZEN-6940 had was dropped
 // without a word (2026-10-28).

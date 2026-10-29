@@ -389,6 +389,76 @@ func TestLimitMenu(t *testing.T) {
 	}
 }
 
+// The menu as Claude Code 2.1.308 put it up on the workbench (2026-10-28),
+// and on an account with no wait to offer (2026-10-29).
+const waitMenu = `   What do you want to do?
+   ❯ 1. Stop and wait for limit to reset
+     2. Wait here, then continue automatically at Oct 30, 8am
+     3. Ask your admin for more usage
+   Enter to confirm · Esc to cancel
+`
+
+func TestWaitOption(t *testing.T) {
+	noWait := `   What do you want to do?
+   ❯ 1. Stop and wait for limit to reset
+     2. Switch to usage credits
+     3. Upgrade your plan
+   Enter to confirm · Esc to cancel
+`
+	quoted := "● It said: 2. Wait here, then continue automatically at Oct 30, 8am\n" + strings.Repeat("  more of the reply\n", 12) + "❯ \n"
+	for _, c := range []struct{ name, screen, want string }{
+		{"the menu offering a wait", waitMenu, "2"},
+		{"the menu with no wait to offer", noWait, ""},
+		{"the option quoted further up", quoted, ""},
+		{"an unreadable screen", "", ""},
+	} {
+		if got := waitOption(c.screen); got != c.want {
+			t.Errorf("%s: waitOption = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// A number picks the option outright; Enter follows only if the menu stayed.
+func TestWaitAtLimit(t *testing.T) {
+	old := menuBeat
+	menuBeat = 0
+	t.Cleanup(func() { menuBeat = old })
+	for _, c := range []struct {
+		name     string
+		staysFor string // the keys after which the menu is still up
+		want     string
+	}{
+		{"the number answers it", "", "send-keys zen-1 2"},
+		{"the number only moves to it", "2", "send-keys zen-1 2\nagent send-keys zen-1 Enter"},
+	} {
+		log := fakeHerdrScript(t, `
+case "$1 $2" in
+"agent read")
+	last=$(grep send-keys %[1]s | tail -1 | awk '{print $NF}')
+	if [ ! -s %[1]s ] || [ "$last" = "`+c.staysFor+`" ]; then printf '`+strings.ReplaceAll(waitMenu, "\n", `\n`)+`'; else printf '❯ continue\n'; fi ;;
+"agent send-keys") echo "$@" >> %[1]s ;;
+esac
+`)
+		ok, err := WaitAtLimit("", "ZEN-1")
+		if !ok || err != nil {
+			t.Errorf("%s: WaitAtLimit = %v, %v", c.name, ok, err)
+		}
+		if got := log(); got != "agent "+c.want {
+			t.Errorf("%s: pressed\n%s\nwant\nagent %s", c.name, got, c.want)
+		}
+	}
+
+	log := fakeHerdrScript(t, `
+case "$1 $2" in
+"agent read") printf '❯ 1. Yes, I trust this folder\n' ;;
+"agent send-keys") echo "$@" >> %[1]s ;;
+esac
+`)
+	if ok, err := WaitAtLimit("", "ZEN-1"); ok || err != nil || log() != "" {
+		t.Errorf("on another dialog: WaitAtLimit = %v, %v, pressed %q; want nothing pressed", ok, err, log())
+	}
+}
+
 func TestReadBox(t *testing.T) {
 	const text = "Please continue where you left off."
 	for _, c := range []struct {

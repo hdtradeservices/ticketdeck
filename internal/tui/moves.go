@@ -60,6 +60,14 @@ type continuedMsg struct {
 	held        bool // nothing was sent: the dialog it sits on is for someone to answer
 }
 
+// waitedMsg is the deck's answer to a parked session's limit menu. ok: it
+// chose to wait there; false with no err: the screen offered no wait.
+type waitedMsg struct {
+	key, errID string
+	ok         bool
+	err        error
+}
+
 type moveOpts struct {
 	why    string
 	submit string

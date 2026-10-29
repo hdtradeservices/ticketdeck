@@ -64,6 +64,10 @@ type Backend interface {
 	// LimitMenu reports whether a running session shows Claude's own menu at
 	// a usage limit, the one dialog the deck may dismiss for it.
 	LimitMenu(name string) bool
+	// WaitAtLimit answers that menu with its "Wait here, then continue
+	// automatically" option, so Claude carries on by itself when the limit
+	// resets. false, with nothing pressed, when the screen offers no such option.
+	WaitAtLimit(name string) (bool, error)
 }
 
 // Move is one session changing account, workspace, or both.
@@ -186,6 +190,8 @@ func (ClaudeBackend) Keys(string, ...string) error {
 
 func (ClaudeBackend) LimitMenu(string) bool { return false }
 
+func (ClaudeBackend) WaitAtLimit(string) (bool, error) { return false, nil }
+
 // HerdBackend drives herdr (agent multiplexer) — start/attach/list.
 type HerdBackend struct{}
 
@@ -295,6 +301,8 @@ func (HerdBackend) Keys(name string, keys ...string) error {
 }
 
 func (HerdBackend) LimitMenu(name string) bool { return herd.LimitMenu("", name) }
+
+func (HerdBackend) WaitAtLimit(name string) (bool, error) { return herd.WaitAtLimit("", name) }
 
 func (HerdBackend) Rename(ref session.SessionRef, name, label string) error {
 	tab := ""

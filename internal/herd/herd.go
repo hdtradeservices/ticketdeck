@@ -679,7 +679,10 @@ func LimitMenu(socket, name string) bool { return limitMenu(paneText(socket, nam
 // would exit the session or refuse the tool.
 var limitMenuWords = []string{"limit to reset", "continue automatically", "more usage", "usage credits", "Upgrade your plan"}
 
-func limitMenu(screen string) bool {
+func limitMenu(screen string) bool { return menuBox(screen) != nil }
+
+// menuBox is the limit menu's lines, bottom first, when the screen ends on it.
+func menuBox(screen string) []string {
 	var tail []string
 	lines := strings.Split(screen, "\n")
 	for i := len(lines) - 1; i >= 0 && len(tail) < 12; i-- {
@@ -689,14 +692,60 @@ func limitMenu(screen string) bool {
 	}
 	box := strings.Join(tail, "\n")
 	if !strings.Contains(box, "What do you want to do?") || !strings.Contains(box, "Esc to cancel") {
-		return false
+		return nil
 	}
 	for _, w := range limitMenuWords {
 		if strings.Contains(box, w) {
-			return true
+			return tail
 		}
 	}
-	return false
+	return nil
+}
+
+// menuOptionRE matches one numbered option of a Claude menu: "❯ 2. Wait here…".
+var menuOptionRE = regexp.MustCompile(`^(?:❯\s*)?(\d)\.\s+(.*)$`)
+
+// waitOption is the number of the limit menu's "Wait here, then continue
+// automatically" option, or "" when the screen isn't on that menu or the menu
+// doesn't offer it. Claude only offers it when its own continue didn't arm,
+// as when the limit resets more than a day out.
+func waitOption(screen string) string {
+	for _, l := range menuBox(screen) {
+		if m := menuOptionRE.FindStringSubmatch(l); m != nil && strings.HasPrefix(m[2], "Wait here, then continue automatically") {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// menuBeat is how long Claude gets to redraw after a key on its menu.
+var menuBeat = time.Second
+
+// WaitAtLimit answers the limit menu on an agent's screen with "Wait here,
+// then continue automatically", so Claude carries on by itself once the limit
+// resets. It reports false, pressing nothing, when the screen offers no such
+// option. A number picks an option outright in Claude Code 2.1.308; Enter
+// follows only if the menu is still up.
+func WaitAtLimit(socket, name string) (bool, error) {
+	n := waitOption(paneText(socket, name))
+	if n == "" {
+		return false, nil
+	}
+	if err := SendKeys(socket, name, n); err != nil {
+		return false, err
+	}
+	time.Sleep(menuBeat)
+	if waitOption(paneText(socket, name)) == "" {
+		return true, nil
+	}
+	if err := SendKeys(socket, name, "Enter"); err != nil {
+		return false, err
+	}
+	time.Sleep(menuBeat)
+	if waitOption(paneText(socket, name)) != "" {
+		return false, fmt.Errorf("the limit menu is still up after choosing to wait at it")
+	}
+	return true, nil
 }
 
 // promptMarkerRE matches a Claude prompt line ("❯ hello", "> hello", "❯").

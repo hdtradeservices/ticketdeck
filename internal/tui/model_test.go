@@ -93,6 +93,7 @@ func (fakeBackend) Move(Move) (string, error)                       { return "",
 func (fakeBackend) Rename(session.SessionRef, string, string) error { return nil }
 func (fakeBackend) Keys(string, ...string) error                    { return nil }
 func (fakeBackend) LimitMenu(string) bool                           { return false }
+func (fakeBackend) WaitAtLimit(string) (bool, error)                { return false, nil }
 
 func (fakeBackend) FocusSpec(ref session.SessionRef) session.LaunchSpec {
 	return session.LaunchSpec{Args: []string{"agent", "focus", ref.Name}, Name: ref.Name, Action: "focus"}
@@ -469,9 +470,19 @@ type recBackend struct {
 	prompts      int
 	promptErr    error
 	limitMenu    bool // what LimitMenu reads off every screen
+	waitOffered  bool // whether every screen's limit menu offers to wait
+	waited       []string
 }
 
 func (r *recBackend) LimitMenu(string) bool { return r.limitMenu }
+
+func (r *recBackend) WaitAtLimit(name string) (bool, error) {
+	if !r.waitOffered {
+		return false, nil
+	}
+	r.waited = append(r.waited, name)
+	return true, nil
+}
 
 func (r *recBackend) Keys(name string, keys ...string) error {
 	r.keys = append(r.keys, name+":"+strings.Join(keys, " "))
